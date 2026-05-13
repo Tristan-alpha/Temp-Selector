@@ -249,10 +249,10 @@ class APIFeatureExporter:
                 pn = p / z
                 entropy -= pn * math.log(max(pn, 1e-12))
 
-            if feature_mode == "basic":
-                tk_logits = None
-            else:
+            if feature_mode in {"topk_logits", "all"}:
                 tk_logits = dist
+            else:
+                tk_logits = None
 
             features.append(
                 TokenFeature(

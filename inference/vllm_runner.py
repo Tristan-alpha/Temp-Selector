@@ -194,12 +194,12 @@ class VLLMFeatureExporter:
                 pn = p / z
                 entropy -= pn * math.log(max(pn, 1e-12))
 
-            # basic: logprob + entropy only (fast, used by PPO training)
-            # topk_logits / all: + top-16 logprob values (used by dataset gen)
-            if feature_mode == "basic":
-                tk_logits = None
-            else:
+            # basic / hidden_states: logprob + entropy only
+            # topk_logits / all: + top-16 logprob values
+            if feature_mode in {"topk_logits", "all"}:
                 tk_logits = dist
+            else:
+                tk_logits = None
 
             features.append(
                 TokenFeature(

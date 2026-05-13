@@ -134,6 +134,39 @@ def build_dataset(config_path: str, input_path: str, output_path: str, backend: 
         )
         logger.info("multi_temp done total_outputs=%d", len(exported_batch))
 
+        # --- hidden state extraction (two-pass: prefill prompt+response) ---
+        hidden_states_cache: dict = {}
+        fmode = inf_cfg.get("feature_mode", "basic")
+        if fmode in {"hidden_states", "all"}:
+            from inference.vllm_hidden_extractor import VLLMHiddenStateExtractor
+
+            layer_ids = inf_cfg.get("eagle_aux_hidden_state_layer_ids", [28])
+            extractor = VLLMHiddenStateExtractor(
+                model_name_or_path=inf_cfg["model_name_or_path"],
+                layer_ids=[int(x) for x in layer_ids],
+                tensor_parallel_size=exporter.tensor_parallel_size
+                    if hasattr(exporter, "tensor_parallel_size") else 1,
+                gpu_memory_utilization=0.30,
+            )
+            prompt_response_pairs = [
+                (ex["prompt"], ex["response"])
+                for ex in exported_batch
+            ]
+            logger.info("extracting hidden states for %d responses ...", len(prompt_response_pairs))
+            all_hidden = extractor.extract(
+                [p for p, _ in prompt_response_pairs],
+                [r for _, r in prompt_response_pairs],
+            )
+            # Map back: exported_batch[i] ↔ all_hidden[i] (token-level alignment)
+            for i, ex in enumerate(exported_batch):
+                hs = all_hidden[i]
+                for j, tf in enumerate(ex.get("token_features", [])):
+                    if j < len(hs):
+                        tf.hidden = hs[j]
+            extractor.cleanup()
+            logger.info("hidden state extraction done")
+            hidden_states_cache = {}  # not needed after in-place mutation
+
         # exported_batch ordering: prompt0@T0(×num_votes), prompt0@T1(×num_votes), ...
         with out_file.open("w", encoding="utf-8") as f:
             for q_idx, row_obj in enumerate(rows_prepared):
