@@ -24,6 +24,7 @@ from utils.jsonl import sample_prefix
 from mil.model import MILModel
 from ppo.model import PolicyValueNet, sample_action, compute_gae, load_mil_encoder_for_warmstart
 from utils.exp_logger import log_exception, setup_experiment_logger
+from inference.vllm_hidden_extractor import VLLMHiddenStateExtractor
 
 
 def _load_config(path: str) -> Dict[str, Any]:
@@ -47,10 +48,20 @@ def _load_prompts(path: str, logger=None) -> List[Dict[str, Any]]:
 
 
 def _extract_segment_obs(token_ids: List[int], logprobs_list: List[Any],
-                         obs_dim: int, top_k: int) -> Optional[List[float]]:
-    """Mean-pool per-token features into one segment observation vector."""
+                         obs_dim: int, top_k: int,
+                         hidden_states: Optional[List[List[float]]] = None,
+                         feature_mode: str = "basic") -> Optional[List[float]]:
+    """Mean-pool per-token features into one segment observation vector.
+
+    When hidden_states is provided (feature_mode=hidden_states or all),
+    mean-pools the hidden state vectors and concatenates with standard
+    logprob/entropy/topk_logits features (or returns hidden-only for
+    hidden_states mode).
+    """
     if not token_ids or not logprobs_list:
         return None
+
+    # Standard logprob features
     token_obs: List[List[float]] = []
     for tid, lp_item in zip(token_ids, logprobs_list):
         if lp_item is None:
@@ -68,14 +79,35 @@ def _extract_segment_obs(token_ids: List[int], logprobs_list: List[Any],
         entropy_val = compute_entropy(logprob_vals)
         obs = token_to_vec({"logprob": selected_lp, "entropy": entropy_val, "topk_logits": logprob_vals}, obs_dim)
         token_obs.append(obs)
-    if not token_obs:
-        return None
-    avg = [0.0] * obs_dim
-    for row in token_obs:
-        for i, v in enumerate(row):
-            avg[i] += v
-    denom = float(len(token_obs))
-    return [v / denom for v in avg]
+
+    std_vec: List[float] = []
+    if feature_mode != "hidden_states":
+        if not token_obs:
+            return None
+        avg = [0.0] * obs_dim
+        for row in token_obs:
+            for i, v in enumerate(row):
+                avg[i] += v
+        denom = float(len(token_obs))
+        std_vec = [v / denom for v in avg]
+
+    # Hidden state features
+    if hidden_states is not None and feature_mode in {"hidden_states", "all"}:
+        n_hs = len(hidden_states)
+        if n_hs == 0:
+            return std_vec if std_vec else None
+        hs_dim = len(hidden_states[0])
+        hs_pooled = [0.0] * hs_dim
+        for hs in hidden_states:
+            for j, v in enumerate(hs):
+                hs_pooled[j] += v
+        hs_pooled = [v / n_hs for v in hs_pooled]
+        if feature_mode == "hidden_states":
+            return hs_pooled
+        # all: concatenate
+        return std_vec + hs_pooled
+
+    return std_vec if std_vec else None
 
 
 def load_train_prompts(dataset_path: str) -> list:
@@ -126,6 +158,19 @@ def train_ppo(
     num_votes = int(cfg["inference"].get("num_votes", 1))
     system_prompt = cfg["inference"].get("system_prompt", "")
     use_math_chat = bool(cfg["inference"].get("use_math_chat_prompt", True))
+    feature_mode = cfg["inference"].get("feature_mode", "basic")
+
+    # Hidden state extractor (two-pass prefill trick)
+    hs_extractor = None
+    if feature_mode in {"hidden_states", "all"}:
+        layer_ids = cfg["inference"].get("eagle_aux_hidden_state_layer_ids", [28])
+        hs_extractor = VLLMHiddenStateExtractor(
+            model_name_or_path=cfg["inference"]["model_name_or_path"],
+            layer_ids=[int(x) for x in layer_ids],
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.30,
+        )
+        logger.info("hidden_state_extractor ready feature_mode=%s", feature_mode)
 
     max_iterations = int(cfg["ppo"]["training"]["max_iterations"])
     early_stop_patience = int(cfg["ppo"]["training"]["early_stop_patience"])
@@ -247,6 +292,7 @@ def train_ppo(
         generated: List[List[str]] = [[""] * V for _ in range(N)]
         active = [True] * N
         segment_obs: List[Optional[torch.Tensor]] = [None] * N
+        ep_prefixes: List[str] = [rendered[i] for i in range(N)]  # accumulated for HS extraction
 
         ep_obs: List[List[torch.Tensor]] = [[] for _ in range(N)]
         ep_actions: List[List[torch.Tensor]] = [[] for _ in range(N)]
@@ -315,7 +361,23 @@ def train_ppo(
                     continue
 
                 if out0.logprobs:
-                    obs = _extract_segment_obs(new_tokens, out0.logprobs, obs_dim, top_k_logits)
+                    # Accumulate prefix for hidden state extraction
+                    seg_text = req_outputs[0].text
+                    if seg_text:
+                        ep_prefixes[i] += seg_text
+
+                    # Extract hidden states for this segment's token positions
+                    seg_hidden_states = None
+                    if hs_extractor is not None and seg_text:
+                        seg_hidden_states = hs_extractor.extract(
+                            [ep_prefixes[i]], [seg_text]
+                        )[0]  # one result per (prefix, text) pair
+
+                    obs = _extract_segment_obs(
+                        new_tokens, out0.logprobs, obs_dim, top_k_logits,
+                        hidden_states=seg_hidden_states,
+                        feature_mode=feature_mode,
+                    )
                     segment_obs[i] = torch.tensor(obs, dtype=torch.float32) if obs else None
 
         for i in range(N):

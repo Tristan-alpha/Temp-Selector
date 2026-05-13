@@ -4,11 +4,11 @@
 seed: 42
 
 paths:
-  raw_input: data/math-small.jsonl
-  all_dataset: datasets/all.jsonl
-  train_dataset: datasets/train.jsonl
-  val_dataset: datasets/val.jsonl
-  test_dataset: datasets/test.jsonl
+  raw_input: data/math_small_64.jsonl
+  all_dataset: datasets/all_small.jsonl
+  train_dataset: datasets/train_small.jsonl
+  val_dataset: datasets/val_small.jsonl
+  test_dataset: datasets/test_small.jsonl
 
 logging:
   log_dir: logs
