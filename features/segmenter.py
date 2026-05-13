@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List
+from typing import Iterable, List
 
 from features.schema import Segment, clamp_segment
 
@@ -71,7 +71,7 @@ def _char_to_token(cum_char: List[int], char_pos: int) -> int:
 
 def segment_pooling(
     token_vecs: List[List[float]],
-    spans: List[Dict[str, int]],
+    spans: List[Segment],
     obs_dim: int,
     mode: str = "mean",
     segment_size: int = 32,
@@ -91,7 +91,7 @@ def segment_pooling(
     """
     out: List[List[float]] = []
     for s in spans:
-        st, ed = int(s["start"]), int(s["end"])
+        st, ed = s.start, s.end
         st = max(0, min(st, len(token_vecs)))
         ed = max(st + 1, min(ed, len(token_vecs)))
         chunk = token_vecs[st:ed]

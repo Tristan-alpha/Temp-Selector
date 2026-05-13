@@ -31,8 +31,8 @@ class VLLMHiddenStateExtractor:
         model_name_or_path: str,
         layer_ids: List[int],
         storage_dir: str | None = None,
-        tensor_parallel_size: int = 1,
-        gpu_memory_utilization: float = 0.30,
+        tensor_parallel_size: int | str = 1,
+        gpu_memory_utilization: float = 0.90,
         max_model_len: int | None = None,
     ):
         self.model_name_or_path = model_name_or_path
@@ -49,9 +49,16 @@ class VLLMHiddenStateExtractor:
             return
         from vllm import LLM
 
+        tp = self._tensor_parallel_size
+        if isinstance(tp, str) and tp == "auto":
+            import os as _os
+            visible = _os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+            tp = max(1, len([d for d in visible.split(",") if d.strip() and d.strip() != "-1"])) if visible else 1
+        self._tensor_parallel_size = tp
+
         self._llm = LLM(
             model=self.model_name_or_path,
-            tensor_parallel_size=self._tensor_parallel_size,
+            tensor_parallel_size=tp,
             max_model_len=self._max_model_len or 32768,
             gpu_memory_utilization=self._gpu_memory_utilization,
             speculative_config={
@@ -93,11 +100,7 @@ class VLLMHiddenStateExtractor:
         params = SamplingParams(max_tokens=1, temperature=0.0)
         outputs = self._llm.generate(full_texts, params)
 
-        head_dim = self._llm.llm_engine.model_config.get_head_size()
-        num_heads = self._llm.llm_engine.model_config.get_num_attention_heads(
-            self._tensor_parallel_size
-        )
-        hidden_size = head_dim * num_heads
+        hidden_size = self._llm.llm_engine.model_config.hf_config.hidden_size
 
         results: List[List[List[float]]] = []
         for prompt, _, output in zip(prompts, responses, outputs):
