@@ -1,0 +1,43 @@
+# Dataset generation config — independent of training config.
+# Usage: python scripts/build_dataset.py --config configs/dataset.yaml
+
+seed: 42
+
+paths:
+  raw_input: data/math-small.jsonl
+  all_dataset: datasets/all.jsonl
+  train_dataset: datasets/train.jsonl
+  val_dataset: datasets/val.jsonl
+  test_dataset: datasets/test.jsonl
+
+logging:
+  log_dir: logs
+  level: INFO
+
+inference:
+  model_name_or_path: /home/xuezhe/models/Qwen3-8B
+  tensor_parallel_size: auto
+  gpu_memory_utilization: 0.90
+  max_new_tokens: 8192
+  temperature_grid: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+  num_votes: 8
+  top_k_logits: 16
+  feature_mode: all        # basic | all (all = basic + topk_logits)
+  use_math_chat_prompt: true
+  system_prompt: |
+    You are a math reasoning assistant.
+
+    Formatting rules:
+    - Solve the problem step by step.
+    - Each step must be written as a separate paragraph.
+    - Separate every step with exactly two newline characters.
+    - Do not use numbering, bullets, or any markers at the start of a step.
+    - Each step must be a complete sentence that describes one reasoning move.
+    - Inline LaTeX expressions should use $...$.
+    - The final paragraph must include the final boxed answer written as \boxed{}.
+    - Do not include any explanations, headers, or summaries outside the steps.
+    - The response must end immediately after the final paragraph containing \boxed{}.
+  api:
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    max_concurrent: 16
+    max_retries: 3

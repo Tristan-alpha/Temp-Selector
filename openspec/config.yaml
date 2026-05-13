@@ -1,0 +1,47 @@
+schema: spec-driven
+
+context: |
+  Tech stack: Python 3.12+, PyTorch 2.2+, vLLM 0.5+, math-verify
+  Domain: LLM math reasoning, multiple instance learning, reinforcement learning
+  Conventions:
+    - from __future__ import annotations in every .py file
+    - Type annotations on all function signatures
+    - CPU-only tests (no GPU required for pytest)
+    - Config keys: data.{instance_dim,temp_bins}, mil.{model,training}, ppo.{model,training}
+  Key docs: PIPELINE.md, README.md, CLAUDE.md, mil/DESIGN.md, ppo/DESIGN.md, features/DESIGN.md
+
+rules:
+  proposal:
+    - Keep under one page
+    - Capabilities must be kebab-case identifiers
+    - Mark breaking changes with **BREAKING**
+  design:
+    - Focus on "why" not "what" — architectural rationale over implementation detail
+    - Each decision must include alternatives considered
+  tasks:
+    - Each task must be independently verifiable
+    - Order by dependency
+    - |
+      EVERY task list MUST end with a Verification group containing:
+
+        - [ ] N.1 Run `python -m pytest tests/ -v` — all tests must pass.
+          If new logic was added (new functions, new behavior), add
+          corresponding tests to tests/ BEFORE marking this complete.
+          Tests are CPU-only.
+
+        - [ ] N.2 Run `python -m compileall -q <modified_files>` on every
+          modified .py file to catch syntax errors.
+
+        - [ ] N.3 Check whether the following docs need updating. If yes,
+          add sub-tasks to update them before marking N.3 complete.
+
+      Docs to check and their triggers:
+        CLAUDE.md          — file moves/renames, new conventions, new pitfalls
+        PIPELINE.md        — directory structure, module paths, config schema, commands
+        README.md          — directory structure, module paths, commands
+        mil/DESIGN.md      — architecture changes, loss function, data flow
+        ppo/DESIGN.md      — reward design, generation loop, PPO mechanics
+        features/DESIGN.md — pipeline stages, segmentation, vectorizer, stage contract
+
+      Triggers: any file rename/move, config key change, module path change,
+      new or removed capability, behavior change to a documented flow.
