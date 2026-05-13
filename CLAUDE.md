@@ -9,10 +9,10 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 | `features/schema.py` | `TokenFeature`, `Segment`, `BagSample` — core data structures |
 | `features/segmenter.py` | Segmentation strategies (`fixed_window`, `step`, `punctuation`) + `segment_pooling` |
 | `features/vectorizer.py` | `token_to_vec`, `token_to_obs`, `mean_pool_obs`, `compute_entropy` — feature construction |
-| `features/build_dataset.py` | Stage 1 entry: vLLM multi-temp generation, majority voting, JSONL output |
 | `features/dataset_eval.py` | `evaluate_dataset()`, `load_temperature_labels()` — Stage 1 analysis |
 | `inference/vllm_runner.py` | `VLLMFeatureExporter` — local GPU with APC multi-temp batching |
 | `inference/api_runner.py` | `APIFeatureExporter` — Bailian DashScope API backend |
+| `inference/vllm_hidden_extractor.py` | `VLLMHiddenStateExtractor` — two-pass hidden state extraction via vLLM speculative decoding. Returns `List[torch.Tensor]` (native dtype, bf16) |
 | `mil/model.py` | `MILModel`, temp heads, smoothness_loss — all MIL model definitions |
 | `mil/training.py` | `BagDataset`, `collate_rows`, `train_mil()` — Stage 2 training |
 | `mil/eval.py` | `evaluate_mil()` + all MIL metric functions — Stage 2 evaluation |
@@ -22,9 +22,11 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 | `utils/math.py` | `safe_div` — shared one-liner |
 | `utils/answer_verifier.py` | Math-Verify wrapper for answer correctness checking |
 | `utils/exp_logger.py` | File + stream logging setup |
+| `utils/dataset_io.py` | Hybrid JSONL + safetensors I/O (`hidden_path`, `write_hidden_sidecar`, `split_hidden_sidecar`, `read_hidden_offsets`) |
 | `scripts/run_pipeline.sh` | Full pipeline orchestrator (`STAGES` env var controls which stages run) |
-| `scripts/split_jsonl.py` | Group-aware train/eval split |
-| `utils/jsonl.py` | Shared JSONL helpers (`sample_prefix`, `row_group_key`, `load_jsonl`, `write_jsonl`) |
+| `scripts/build_dataset.py` | Stage 1 entry: vLLM multi-temp gen, majority voting. For hidden_states/all mode: merged build+split writes train/val/test JSONL+safetensors directly |
+| `scripts/split_jsonl.py` | Group-aware train/eval split; propagates safetensors sidecar |
+| `utils/jsonl.py` | Shared JSONL helpers (`sample_prefix`, `row_group_key`, `load_jsonl`, `write_jsonl`, `split_by_group`) |
 | `configs/` | 5 YAML configs: `base.yaml` + 4 ablation variants |
 
 ## Key data flow
@@ -32,8 +34,11 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 ```
 Stage 1: JSONL prompts → vLLM multi-temp generation → BagSample (per prompt×temp×vote)
          BagSample = {token_features: [TokenFeature], segment_spans: [Segment], label: 0|1, ...}
+         Hidden states → dataset.jsonl.hidden.safetensors (bf16, native dtype)
+         feature_mode=hidden_states/all → merged build+split → train/val/test directly
               ↓
-Stage 2: segment_pooling(token_vecs, spans) → [K, 64] instance matrix
+Stage 2: BagDataset reads JSONL + hidden safetensors (mmap via safe_open+get_slice)
+         segment_pooling(token_vecs, spans) → [K, 64] instance matrix
          MILModel(instances) → {bag_logit, inst_logit, attn_w, encoder_out}
          Loss = bag_bce + β×top_k_instance_bce + α×temp_ce + γ×smoothness
               ↓  warm-start backbone + inst_logit as shaping reward

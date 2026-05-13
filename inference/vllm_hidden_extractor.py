@@ -11,7 +11,7 @@ Usage:
     extractor = VLLMHiddenStateExtractor(model_path, layer_ids, tmp_dir)
     hidden_states = extractor.extract(prompts=["What is x?"],
                                       responses=["x = 3"])
-    # hidden_states[0][j] = list of floats for the j-th response token
+    # hidden_states[0] = torch.Tensor of shape [n_tokens, hidden_size]
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import tempfile
 from typing import List
 
 import safetensors
+import torch
 
 
 class VLLMHiddenStateExtractor:
@@ -84,12 +85,19 @@ class VLLMHiddenStateExtractor:
         self,
         prompts: List[str],
         responses: List[str],
-    ) -> List[List[List[float]]]:
+        debug_token_check: bool = False,
+    ) -> List[torch.Tensor]:
         """Extract per-token hidden states for each response.
 
-        Returns a list of length len(prompts), where each element is a list
-        of per-token hidden state vectors (each vector is a list of floats
-        of length hidden_size).
+        Returns a list of length len(prompts), where each element is a
+        tensor of shape [n_response_tokens, hidden_size] in the model's
+        native dtype (typically bf16 for Qwen3-8B).
+
+        When ``debug_token_check=True``, checks whether tokenizing
+        ``prompt`` and ``response`` separately and then concatenating
+        produces the same token IDs as tokenizing ``prompt+response``
+        as one string.  A mismatch means there is a BPE boundary merge
+        that could cause hidden-state / token misalignment.
         """
         self._lazy_init()
 
@@ -102,16 +110,40 @@ class VLLMHiddenStateExtractor:
 
         hidden_size = self._llm.llm_engine.model_config.hf_config.hidden_size
 
-        results: List[List[List[float]]] = []
-        for prompt, _, output in zip(prompts, responses, outputs):
-            prompt_len = len(self._tokenizer.encode(prompt))
+        tokenizer = self._tokenizer  # local ref for the loop
+
+        results: List[torch.Tensor] = []
+        mismatches = 0
+        for i, (prompt, _, output) in enumerate(zip(prompts, responses, outputs)):
+            prompt_len = len(tokenizer.encode(prompt))
             hs_path = output.kv_transfer_params.get("hidden_states_path")
+
+            vllm_resp_ids = output.prompt_token_ids[prompt_len:] if output.prompt_token_ids else []
+
+            if debug_token_check:
+                # Compare: tokenize(prompt) + tokenize(response) vs tokenize(prompt+response)
+                prompt_ids = tokenizer.encode(prompt)
+                resp_ids = tokenizer.encode(responses[i])
+                separate_ids = prompt_ids + resp_ids
+                full_ids = tokenizer.encode(prompt + responses[i])
+                if separate_ids != full_ids:
+                    mismatches += 1
+                    diff_at = None
+                    for k in range(min(len(separate_ids), len(full_ids))):
+                        if separate_ids[k] != full_ids[k]:
+                            diff_at = k
+                            break
+                    print(
+                        f"[TOKEN_CHECK] boundary_merge sample={i} "
+                        f"prompt_tokens={len(prompt_ids)} resp_tokens={len(resp_ids)} "
+                        f"separate_total={len(separate_ids)} full_total={len(full_ids)} "
+                        f"first_diff_at={diff_at}"
+                    )
 
             if hs_path is None or not os.path.exists(hs_path):
                 # Fallback: return zeros for each response token
-                resp_token_ids = output.prompt_token_ids[prompt_len:] if output.prompt_token_ids else []
-                n_tokens = max(len(resp_token_ids), 1)
-                results.append([[0.0] * hidden_size for _ in range(n_tokens)])
+                n_tokens = max(len(vllm_resp_ids), 1)
+                results.append(torch.zeros(n_tokens, hidden_size, dtype=torch.float32))
                 continue
 
             with safetensors.safe_open(hs_path, framework="pt") as f:
@@ -119,9 +151,13 @@ class VLLMHiddenStateExtractor:
                 # Flatten last two dims: [num_tokens, hidden_size]
                 hidden_states = hidden_states.reshape(hidden_states.shape[0], -1)
 
-            # Slice off prompt tokens
-            response_hs = hidden_states[prompt_len:].tolist()
-            results.append(response_hs)
+            # Slice off prompt tokens; keep as tensor (native dtype)
+            results.append(hidden_states[prompt_len:])
+
+        if debug_token_check and mismatches > 0:
+            print(f"[TOKEN_CHECK] DONE: {mismatches}/{len(prompts)} samples have token mismatches")
+        elif debug_token_check:
+            print(f"[TOKEN_CHECK] DONE: all {len(prompts)} samples OK — token IDs match")
 
         return results
 

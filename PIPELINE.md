@@ -161,11 +161,13 @@ openai>=1.0.0          # API 后端需要
 
 ```bash
 # vLLM 后端（默认）
-CUDA_VISIBLE_DEVICES=0 python -m features.build_dataset --config configs/base.yaml
+CUDA_VISIBLE_DEVICES=0 python scripts/build_dataset.py --config configs/dataset.yaml
 
 # API 后端（百炼 DashScope）
-python -m features.build_dataset --config configs/base.yaml --backend api
+python scripts/build_dataset.py --config configs/dataset.yaml --backend api
 ```
+
+feature_mode=hidden_states/all 时，build 会直接输出 train/val/test 三组 JSONL + safetensors 侧车文件，无需再运行 split。
 
 路径从 config 的 `paths` 段读取；CLI 参数 `--input` / `--output` 可覆盖。
 
@@ -196,13 +198,19 @@ python -m features.build_dataset --config configs/base.yaml --backend api
 
 ### 输出
 
-`datasets/all.jsonl`：
+feature_mode=basic/topk_logits 时输出 `datasets/all.jsonl`。
+feature_mode=hidden_states/all 时直接输出三组文件：
 
 ```
-行数 = N × 15 × num_votes
-sample_id 格式: {base}_t{temp}             (num_votes=1)
-                {base}_t{temp}_v{v}        (num_votes>1)
+datasets/train.jsonl + datasets/train.jsonl.hidden.safetensors
+datasets/val.jsonl   + datasets/val.jsonl.hidden.safetensors
+datasets/test.jsonl  + datasets/test.jsonl.hidden.safetensors
 ```
+
+JSONL 行数: N × 15 × num_votes（每组 split 中按比例分配）。
+sample_id 格式: `{base}_t{temp}` 或 `{base}_t{temp}_v{v}`。
+safetensors 文件: 存储 per-token hidden states，shape `[total_tokens, hidden_dim]`，原生 dtype (bf16)。
+JSONL 行通过 `_hidden_offset` / `_hidden_count` 键索引 safetensors 文件。
 
 ### BagSample 数据结构
 
@@ -214,8 +222,8 @@ class BagSample:
     response: str                         # LLM 生成的回答文本
     label: int                            # 0=正确, 1=错误 (majority vote)
     temperature: float                    # 生成时使用的温度
-    token_features: List[TokenFeature]    # per-token 特征
-    segment_spans: List[Segment]          # 分段边界 [{start, end}, ...]
+    token_features: List[TokenFeature]    # per-token 特征 (hidden 为 None，从侧车加载)
+    segment_spans: List[Segment]          # 分段边界 (BagDataset 加载时计算)
     metadata: Dict[str, Any]              # vote_id, individual_correct, ...
 
 @dataclass
@@ -225,12 +233,7 @@ class TokenFeature:
     logprob: float                        # 该 token 的 log 概率
     entropy: float                        # 从 top-k logprobs 计算的熵
     topk_logits: Optional[List[float]]    # top-16 logprobs
-
-@dataclass
-class Segment:
-    segment_id: int
-    start: int                            # token 起始位置
-    end: int                              # token 结束位置
+    hidden: Optional[List[float]]         # hidden state (从 safetensors 侧车加载)
 ```
 
 ### 特征向量构造
@@ -259,6 +262,7 @@ class Segment:
 
 ```bash
 python scripts/split_jsonl.py --config configs/base.yaml
+# feature_mode=hidden_states/all 时 build 阶段已直接写 split，无需单独运行
 ```
 
 路径从 config `paths` 段读取；默认 `--val-ratio 0.1 --test-ratio 0.1`（两个 ratio 均以全量数据为基准），三路 group-aware 划分。
@@ -269,9 +273,11 @@ python scripts/split_jsonl.py --config configs/base.yaml
 
 ### 输出
 
-- `datasets/train.jsonl`：~80% 的 group（训练）
-- `datasets/val.jsonl`：~10% 的 group（early stopping + best-fixed temp 选择）
-- `datasets/test.jsonl`：~10% 的 group（最终评估指标）
+- `datasets/train.jsonl` + `train.jsonl.hidden.safetensors`：~80% 的 group（训练）
+- `datasets/val.jsonl` + `val.jsonl.hidden.safetensors`：~10% 的 group（early stopping + best-fixed temp 选择）
+- `datasets/test.jsonl` + `test.jsonl.hidden.safetensors`：~10% 的 group（最终评估指标）
+
+若源数据集有 safetensors 侧车，split 会自动为每个输出生成对应的侧车文件。
 
 ---
 

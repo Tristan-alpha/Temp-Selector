@@ -11,6 +11,7 @@ from typing import Dict, List
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils.jsonl import add_groupby_arg, group_rows, load_jsonl, write_jsonl
+from utils.dataset_io import split_hidden_sidecar
 
 
 def main() -> None:
@@ -56,6 +57,9 @@ def main() -> None:
         sampled = sampled[: args.max_rows]
 
     write_jsonl(args.output, sampled)
+
+    # Propagate hidden sidecar to the output
+    split_hidden_sidecar(args.input, [(args.output, sampled)])
 
     print(f"input_rows={len(rows)}")
     print(f"output_rows={len(sampled)}")

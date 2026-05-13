@@ -10,6 +10,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils.jsonl import add_groupby_arg, load_jsonl, split_by_group, write_jsonl
+from utils.dataset_io import split_hidden_sidecar
 
 
 def main() -> None:
@@ -70,6 +71,13 @@ def main() -> None:
     write_jsonl(train_out, train_rows)
     write_jsonl(val_out, val_rows)
     write_jsonl(test_out, test_rows)
+
+    # Propagate hidden sidecar to each output split
+    split_hidden_sidecar(input_path, [
+        (train_out, train_rows),
+        (val_out, val_rows),
+        (test_out, test_rows),
+    ])
 
     total = len(rows)
     print(f"input_rows={total}")

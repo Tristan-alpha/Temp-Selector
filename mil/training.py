@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
+import safetensors
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,6 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 from features.segmenter import build_segments, segment_pooling
 from features.vectorizer import token_to_vec
 from mil.model import MILModel, DynamicTempHead, GlobalTempHead, smoothness_loss
+from utils.dataset_io import hidden_path, read_hidden_offsets
 from utils.exp_logger import log_exception, setup_experiment_logger
 
 
@@ -37,12 +40,26 @@ class BagDataset(Dataset):
         self.rows: List[Tuple[torch.Tensor, int, int]] = []
         bin_map = {float(v): i for i, v in enumerate(temp_bins)}
 
-        with open(data_path, "r", encoding="utf-8") as f:
+        hpath = hidden_path(data_path)
+        has_sidecar = os.path.exists(hpath)
+
+        def _process_rows(f, hs_slice=None):
             for line in f:
                 if not line.strip():
                     continue
                 row = json.loads(line)
                 token_features = row.get("token_features", [])
+
+                # Patch hidden states from safetensors sidecar (mmap)
+                if hs_slice is not None:
+                    offset, count = read_hidden_offsets(row)
+                    if offset >= 0 and count > 0:
+                        hs_chunk = hs_slice[offset:offset + count, :]  # [count, hidden_dim]
+                        hs_list = hs_chunk.tolist()
+                        for j in range(min(count, len(token_features))):
+                            if j < len(hs_list):
+                                token_features[j]["hidden"] = hs_list[j]
+
                 # Compute segments at load time — segmentation is a Stage 2
                 # concern, not locked into the JSONL from Stage 1.
                 token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
@@ -60,6 +77,15 @@ class BagDataset(Dataset):
                 t = float(row.get("temperature", temp_bins[0]))
                 temp_idx = bin_map.get(t, 0)
                 self.rows.append((instances, label, temp_idx))
+
+        if has_sidecar:
+            with safetensors.safe_open(hpath, framework="pt") as sf:
+                hs_slice = sf.get_slice("hidden_states")
+                with open(data_path, "r", encoding="utf-8") as f:
+                    _process_rows(f, hs_slice)
+        else:
+            with open(data_path, "r", encoding="utf-8") as f:
+                _process_rows(f)
 
     def __len__(self) -> int:
         return len(self.rows)

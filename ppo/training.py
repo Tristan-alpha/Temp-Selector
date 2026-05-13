@@ -369,9 +369,10 @@ def train_ppo(
                     # Extract hidden states for this segment's token positions
                     seg_hidden_states = None
                     if hs_extractor is not None and seg_text:
-                        seg_hidden_states = hs_extractor.extract(
+                        hs_tensor = hs_extractor.extract(
                             [ep_prefixes[i]], [seg_text]
-                        )[0]  # one result per (prefix, text) pair
+                        )[0]  # torch.Tensor [n_tokens, hidden_dim]
+                        seg_hidden_states = hs_tensor.tolist()  # convert to list of lists for _extract_segment_obs
 
                     obs = _extract_segment_obs(
                         new_tokens, out0.logprobs, obs_dim, top_k_logits,
