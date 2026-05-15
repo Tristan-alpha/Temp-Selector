@@ -103,6 +103,7 @@ def build_dataset(
             max_new_tokens=inf_cfg["max_new_tokens"],
             tensor_parallel_size=inf_cfg.get("tensor_parallel_size", "auto"),
             gpu_memory_utilization=float(inf_cfg.get("gpu_memory_utilization", 0.90)),
+            feature_mode=inf_cfg.get("feature_mode", "basic"),
         )
         logger.info("backend=sglang")
 

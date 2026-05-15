@@ -37,11 +37,13 @@ class SGLangFeatureExporter:
         max_new_tokens: int = 256,
         tensor_parallel_size: int | str = "auto",
         gpu_memory_utilization: float = 0.90,
+        feature_mode: str = "basic",
     ):
         self.model_name_or_path = model_name_or_path
         self.max_new_tokens = max_new_tokens
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.feature_mode = feature_mode
         self._engine = None
         self._tokenizer = None
         self._resolve_device_count()
@@ -64,14 +66,20 @@ class SGLangFeatureExporter:
 
         self._engine = Engine(
             model_path=self.model_name_or_path,
-            tp_size=self._tp,
+            dp_size=self._tp,
+            tp_size=1,
+            cuda_graph_max_bs=512,
+            schedule_policy="lpm",
             mem_fraction_static=self.gpu_memory_utilization,
             context_length=self.max_new_tokens + 2048,  # prompt headroom + output
-            schedule_conservativeness=0.3,  # aggressive batching → higher throughput
-            enable_mixed_chunk=True,         # overlap prefill + decode in same batch
+            schedule_conservativeness=0.0,
+            enable_mixed_chunk=True,
+            enable_flashinfer_allreduce_fusion=True,
+            pre_warm_nccl=True,
+            enable_torch_compile=True,
             random_seed=42,
             log_level="info",
-            enable_return_hidden_states=True,
+            enable_return_hidden_states=self.feature_mode in {"hidden_states", "all"},
         )
         self._tokenizer = self._engine.tokenizer_manager.tokenizer
 
@@ -109,7 +117,6 @@ class SGLangFeatureExporter:
         self,
         prompts: List[str],
         temperatures: List[float],
-        feature_mode: str = "basic",
         top_k_logits: int = 16,
         use_math_chat_prompt: bool = False,
         system_prompt: Optional[str] = None,
@@ -127,8 +134,8 @@ class SGLangFeatureExporter:
                 for p in prompts
             ]
 
-        need_hidden = feature_mode in {"hidden_states", "all"}
-        need_logprobs = feature_mode in {"topk_logits", "all"}
+        need_hidden = self.feature_mode in {"hidden_states", "all"}
+        need_logprobs = self.feature_mode in {"topk_logits", "all"}
         top_k = top_k_logits if need_logprobs else 1
 
         n_temps = len(temperatures)
@@ -138,14 +145,16 @@ class SGLangFeatureExporter:
         logger.info("multi_temp start n_prompts=%d n_temps=%d total_requests=%d",
                       n_prompts, n_temps, total)
 
-        # Interleave: prompt0@T0, prompt0@T1, ..., prompt0@Tk, prompt1@T0, ...
-        # Same ordering as vLLM for radix cache prefix sharing.
+        # Interleave + replicate: prompt0@T0×V, prompt0@T1×V, ..., prompt1@T0×V, ...
+        # SGLang warns that n>1 is suboptimal for single batches; replicating
+        # requests explicitly with n=1 is faster.
         all_prompts: List[str] = []
         all_params: List[Dict[str, Any]] = []
         for rp in rendered_prompts:
             for temp in temperatures:
-                all_prompts.append(rp)
-                all_params.append({"max_new_tokens": self.max_new_tokens, "temperature": temp, "n": num_votes})
+                for _ in range(num_votes):
+                    all_prompts.append(rp)
+                    all_params.append({"max_new_tokens": self.max_new_tokens, "temperature": temp, "n": 1})
 
         outputs = self._engine.generate(
             all_prompts, all_params,
@@ -154,24 +163,22 @@ class SGLangFeatureExporter:
             return_hidden_states=need_hidden,
         )
 
-        # Parse: SGLang expands `n=num_votes` into flat list.
-        # n_reqs original requests → n_reqs × num_votes outputs.
-        n_reqs = len(all_prompts)
+        # Parse: each output is a single vote (n=1).  Ordering matches the
+        # interleave pattern above.
+        n_per_temp = num_votes
         payloads: List[Dict[str, Any]] = []
-        for req_idx in range(n_reqs):
-            prompt_idx = req_idx // n_temps
-            temp_idx = req_idx % n_temps
-            for v_idx in range(num_votes):
-                batch_output = outputs[req_idx * num_votes + v_idx]
-                payload = self._build_feature_payload(
-                    rendered_prompt=rendered_prompts[prompt_idx],
-                    output=batch_output,
-                    feature_mode=feature_mode,
-                    temperature=temperatures[temp_idx],
-                    vote_idx=0,   # each output is a single vote already
-                    num_votes=1,
-                )
-                payloads.append(payload)
+        for req_idx, batch_output in enumerate(outputs):
+            prompt_idx = req_idx // (n_temps * n_per_temp)
+            temp_idx = (req_idx // n_per_temp) % n_temps
+            payload = self._build_feature_payload(
+                rendered_prompt=rendered_prompts[prompt_idx],
+                output=batch_output,
+                feature_mode=self.feature_mode,
+                temperature=temperatures[temp_idx],
+                vote_idx=0,
+                num_votes=1,
+            )
+            payloads.append(payload)
 
         logger.info("multi_temp done total_outputs=%d", len(payloads))
         return payloads
@@ -184,7 +191,6 @@ class SGLangFeatureExporter:
         self,
         prompts: List[str],
         temperature: float,
-        feature_mode: str = "basic",
         top_k_logits: int = 16,
         use_math_chat_prompt: bool = False,
         system_prompt: Optional[str] = None,
@@ -193,7 +199,6 @@ class SGLangFeatureExporter:
         return self.export_token_features_multi_temp(
             prompts=prompts,
             temperatures=[temperature],
-            feature_mode=feature_mode,
             top_k_logits=top_k_logits,
             use_math_chat_prompt=use_math_chat_prompt,
             system_prompt=system_prompt,
@@ -208,7 +213,6 @@ class SGLangFeatureExporter:
         self,
         rendered_prompt: str,
         output: Dict[str, Any],
-        feature_mode: str,
         temperature: float,
         vote_idx: int = 0,
         num_votes: int = 1,
@@ -242,7 +246,7 @@ class SGLangFeatureExporter:
 
             # Extract top-k logprobs for this token
             topk_list: Optional[List[float]] = None
-            if top_k_num > 0 and feature_mode in {"topk_logits", "all"}:
+            if top_k_num > 0 and self.feature_mode in {"topk_logits", "all"}:
                 topk_start = global_pos * top_k_num
                 topk_end = topk_start + top_k_num
                 topk_list = top_logprob_vals[topk_start:topk_end]
