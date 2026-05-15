@@ -37,39 +37,6 @@ class BagSample:
         payload = asdict(self)
         return payload
 
-    def to_binary_dict(self, hidden_offset: int = -1) -> Dict[str, Any]:
-        """Serialize for JSONL with hidden vectors replaced by offset metadata.
-
-        Hidden state vectors are stored in a companion safetensors file.
-        ``_hidden_offset`` and ``_hidden_count`` point into that file.
-        Returns a dict with ``hidden`` set to None in every token feature.
-        """
-        d: Dict[str, Any] = {
-            "sample_id": self.sample_id,
-            "prompt": self.prompt,
-            "response": self.response,
-            "label": self.label,
-            "temperature": self.temperature,
-            "token_features": [
-                {
-                    "token_id": tf.token_id,
-                    "text": tf.text,
-                    "logprob": tf.logprob,
-                    "entropy": tf.entropy,
-                    "topk_logits": tf.topk_logits,
-                    "hidden": None,
-                }
-                for tf in self.token_features
-            ],
-            "metadata": self.metadata,
-            "segment_spans": [],
-        }
-        has_hidden = any(tf.hidden is not None for tf in self.token_features)
-        if hidden_offset >= 0 and has_hidden:
-            d["_hidden_offset"] = hidden_offset
-            d["_hidden_count"] = len(self.token_features)
-        return d
-
 
 def coerce_label(value: Any) -> int:
     if isinstance(value, bool):

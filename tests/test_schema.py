@@ -25,31 +25,3 @@ def test_sample_to_dict():
     assert len(d["token_features"]) == 1
 
 
-def test_to_binary_dict_with_hidden():
-    sample = BagSample(
-        sample_id="s1", prompt="p", response="r", label=1, temperature=0.7,
-        token_features=[
-            TokenFeature(token_id=1, text="a", logprob=-1.2, entropy=0.3, hidden=[0.1, 0.2]),
-        ],
-        segment_spans=[],
-        metadata={"k": "v"},
-    )
-    d = sample.to_binary_dict(hidden_offset=5)
-    assert d["_hidden_offset"] == 5
-    assert d["_hidden_count"] == 1
-    assert d["token_features"][0]["hidden"] is None  # hidden stripped
-    assert d["token_features"][0]["logprob"] == -1.2   # other fields intact
-
-
-def test_to_binary_dict_no_hidden():
-    sample = BagSample(
-        sample_id="s1", prompt="p", response="r", label=1, temperature=0.7,
-        token_features=[
-            TokenFeature(token_id=1, text="a", logprob=-1.2, entropy=0.3),
-        ],
-        segment_spans=[],
-        metadata={"k": "v"},
-    )
-    d = sample.to_binary_dict()
-    assert "_hidden_offset" not in d  # no hidden states → no offset keys
-    assert d["token_features"][0]["hidden"] is None

@@ -18,7 +18,7 @@ from inference.sglang_runner import SGLangFeatureExporter
 from inference.vllm_runner import DEFAULT_MATH_SYSTEM_PROMPT
 from inference.vllm_runner import VLLMFeatureExporter
 from utils.answer_verifier import verify_answer, self_consistency_correct
-from utils.dataset_io import write_hidden_sidecar, write_jsonl
+from utils.jsonl import write_jsonl
 from utils.exp_logger import log_exception, setup_experiment_logger
 from utils.jsonl import add_groupby_arg, split_by_group
 
@@ -45,32 +45,6 @@ def load_prompts(path: str, logger=None) -> List[Dict[str, Any]]:
     if skipped and logger:
         logger.warning("skipped %d malformed lines out of %d total", skipped, line_no)
     return rows
-
-
-def _write_split_with_sidecar(
-    out_path: str,
-    rows: List[Dict[str, Any]],
-    hidden_tensors: List[Any],
-) -> None:
-    """Write a JSONL file + hidden safetensors sidecar for a split.
-
-    Each row dict must have a temporary ``_idx`` key pointing into
-    ``hidden_tensors``.  The key is removed before writing.
-    Offsets are recomputed for this split.
-    """
-    tensors_for_sidecar: List[Any] = []
-    current_offset = 0
-    for row in rows:
-        idx: int = row.pop("_idx")
-        ht = hidden_tensors[idx]
-        if ht is not None:
-            row["_hidden_offset"] = current_offset
-            row["_hidden_count"] = int(ht.shape[0])
-            tensors_for_sidecar.append(ht)
-            current_offset += int(ht.shape[0])
-    write_jsonl(out_path, rows)
-    if tensors_for_sidecar:
-        write_hidden_sidecar(out_path, tensors_for_sidecar)
 
 
 def build_dataset(
@@ -226,10 +200,10 @@ def build_dataset(
         # For basic/topk_logits we write all_dataset.jsonl inline.
         # ------------------------------------------------------------------
         if fmode in {"hidden_states", "all"}:
-            # --- Merged build+split: write train/val/test + sidecars ---
+            # --- Merged build+split: write train/val/test JSONL (no safetensors sidecar).
+            #     Hidden states are extracted on-demand during MIL training via
+            #     SGLangHiddenStateExtractor. ---
             all_sample_dicts: List[Dict[str, Any]] = []
-            all_hidden_tensors: List[Any] = []
-            batch_idx = 0
 
             for q_idx, row_obj in enumerate(rows_prepared):
                 prompt_start = q_idx * n_temps * num_votes
@@ -251,14 +225,6 @@ def build_dataset(
                         n_positive += (1 - majority_label)
                         token_features = exported["token_features"]
                         vid_suffix = f"_v{v}" if num_votes > 1 else ""
-
-                        # Collect hidden tensor for this sample (native dtype, not JSONL)
-                        # SGLang: inline in the payload.  vLLM: from the two-pass extractor.
-                        if backend == "sglang":
-                            ht = exported.get("hidden_tensor")
-                        else:
-                            ht = all_hidden[batch_idx] if batch_idx < len(all_hidden) else None
-                            batch_idx += 1
 
                         sample = BagSample(
                             sample_id=f"{row_obj['sample_base']}_t{temp}{vid_suffix}",
@@ -282,10 +248,7 @@ def build_dataset(
                                 "votes_total": num_votes,
                             },
                         )
-                        d = sample.to_binary_dict()
-                        d["_idx"] = len(all_sample_dicts)
-                        all_sample_dicts.append(d)
-                        all_hidden_tensors.append(ht)
+                        all_sample_dicts.append(sample.to_dict())
 
             # Split by group (same logic as split_jsonl.py)
             if not (0.0 < val_ratio < 1.0) or not (0.0 < test_ratio < 1.0) or (val_ratio + test_ratio >= 1.0):
@@ -296,9 +259,9 @@ def build_dataset(
 
             logger.info("split train=%d val=%d test=%d", len(train_rows), len(val_rows), len(test_rows))
 
-            _write_split_with_sidecar(train_out, train_rows, all_hidden_tensors)
-            _write_split_with_sidecar(val_out, val_rows, all_hidden_tensors)
-            _write_split_with_sidecar(test_out, test_rows, all_hidden_tensors)
+            write_jsonl(train_out, train_rows)
+            write_jsonl(val_out, val_rows)
+            write_jsonl(test_out, test_rows)
         else:
             # --- Legacy flow: write all_dataset.jsonl inline (no sidecar) ---
             with out_file.open("w", encoding="utf-8") as f:

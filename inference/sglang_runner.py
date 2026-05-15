@@ -271,23 +271,11 @@ class SGLangFeatureExporter:
             ))
 
         response_text = output.get("text", "")
-        payload: Dict[str, Any] = {
+        return {
             "prompt": rendered_prompt,
             "response": response_text,
             "token_features": features,
         }
-
-        # Include hidden states tensor directly (native dtype) for binary sidecar
-        if feature_mode in {"hidden_states", "all"}:
-            hs = meta.get("hidden_states")
-            if hs is not None:
-                # hs is [n_total_tokens, hidden_dim]; slice off prompt tokens
-                prompt_len = len(self._tokenizer.encode(rendered_prompt))
-                hs_chunk = hs[prompt_len:]
-                if not isinstance(hs_chunk, torch.Tensor):
-                    hs_chunk = torch.tensor(hs_chunk)
-                payload["hidden_tensor"] = hs_chunk
-        return payload
 
     # ------------------------------------------------------------------
     # Per-sample hidden state extraction (mirrors vLLM extractor interface)

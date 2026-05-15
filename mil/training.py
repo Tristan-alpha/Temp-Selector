@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
-import safetensors
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,7 +15,6 @@ from torch.utils.data import DataLoader, Dataset
 from features.segmenter import build_segments, segment_pooling
 from features.vectorizer import token_to_vec
 from mil.model import MILModel, DynamicTempHead, GlobalTempHead, smoothness_loss
-from utils.dataset_io import hidden_path, read_hidden_offsets
 from utils.exp_logger import log_exception, setup_experiment_logger
 
 
@@ -36,32 +33,55 @@ def load_config(path: str) -> Dict[str, Any]:
 class BagDataset(Dataset):
     def __init__(self, data_path: str, temp_bins: List[float], instance_dim: int,
                  pooling_mode: str = "mean", segment_size: int = 32,
-                 segment_mode: str = "step", feature_mode: str = "basic"):
+                 segment_mode: str = "step", feature_mode: str = "basic",
+                 extractor=None, hidden_batch_size: int = 256):
         self.rows: List[Tuple[torch.Tensor, int, int]] = []
         bin_map = {float(v): i for i, v in enumerate(temp_bins)}
 
-        hpath = hidden_path(data_path)
-        has_sidecar = feature_mode in {"hidden_states", "all"} and os.path.exists(hpath)
+        need_hidden = feature_mode in {"hidden_states", "all"} and extractor is not None
 
-        def _process_rows(f, hs_slice=None):
+        # Load all rows from JSONL
+        all_rows = []
+        with open(data_path, "r", encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
                     continue
-                row = json.loads(line)
+                all_rows.append(json.loads(line))
+
+        if need_hidden:
+            # Batch extract hidden states, pool, and store
+            for batch_start in range(0, len(all_rows), hidden_batch_size):
+                batch_rows = all_rows[batch_start:batch_start + hidden_batch_size]
+                prompts = [r["metadata"]["rendered_prompt"] if "metadata" in r and "rendered_prompt" in r.get("metadata", {})
+                           else r["prompt"] for r in batch_rows]
+                responses = [r["response"] for r in batch_rows]
+                hs_tensors = extractor.extract(prompts, responses)
+
+                for row, hs in zip(batch_rows, hs_tensors):
+                    token_features = row.get("token_features", [])
+                    hs_list = hs.tolist() if hasattr(hs, "tolist") else hs
+                    for j in range(min(len(hs_list), len(token_features))):
+                        token_features[j]["hidden"] = hs_list[j]
+
+                    token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
+                                   for tf in token_features]
+                    response = row.get("response", "")
+                    spans = build_segments(
+                        tokens=token_texts, mode=segment_mode,
+                        segment_size=segment_size, response=response,
+                    )
+                    token_vecs = [token_to_vec(tf, instance_dim) for tf in token_features]
+                    inst_vecs = segment_pooling(token_vecs, spans, instance_dim,
+                                               mode=pooling_mode, segment_size=segment_size)
+                    instances = torch.tensor(inst_vecs, dtype=torch.float32)
+                    label = int(row.get("label", 0))
+                    t = float(row.get("temperature", temp_bins[0]))
+                    temp_idx = bin_map.get(t, 0)
+                    self.rows.append((instances, label, temp_idx))
+        else:
+            # Logprob-only features (no hidden states)
+            for row in all_rows:
                 token_features = row.get("token_features", [])
-
-                # Patch hidden states from safetensors sidecar (mmap)
-                if hs_slice is not None:
-                    offset, count = read_hidden_offsets(row)
-                    if offset >= 0 and count > 0:
-                        hs_chunk = hs_slice[offset:offset + count, :]  # [count, hidden_dim]
-                        hs_list = hs_chunk.tolist()
-                        for j in range(min(count, len(token_features))):
-                            if j < len(hs_list):
-                                token_features[j]["hidden"] = hs_list[j]
-
-                # Compute segments at load time — segmentation is a Stage 2
-                # concern, not locked into the JSONL from Stage 1.
                 token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
                                for tf in token_features]
                 response = row.get("response", "")
@@ -77,15 +97,6 @@ class BagDataset(Dataset):
                 t = float(row.get("temperature", temp_bins[0]))
                 temp_idx = bin_map.get(t, 0)
                 self.rows.append((instances, label, temp_idx))
-
-        if has_sidecar:
-            with safetensors.safe_open(hpath, framework="pt") as sf:
-                hs_slice = sf.get_slice("hidden_states")
-                with open(data_path, "r", encoding="utf-8") as f:
-                    _process_rows(f, hs_slice)
-        else:
-            with open(data_path, "r", encoding="utf-8") as f:
-                _process_rows(f)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -137,13 +148,46 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
     temp_bins = [float(x) for x in cfg["data"]["temp_bins"]]
     instance_dim = int(cfg["data"]["instance_dim"])
     hidden_dim = int(cfg["mil"]["model"]["hidden_dim"])
+    feature_mode = cfg["inference"].get("feature_mode", "basic")
+    hidden_batch_size = int(cfg["mil"]["training"].get("hidden_batch_size", 256))
+    backend = cfg["inference"].get("backend", "sglang")
+
+    # Create SGLang engine for online hidden state extraction
+    engine = None
+    extractor = None
+    if feature_mode in {"hidden_states", "all"} and backend == "sglang":
+        from sglang import Engine
+        gpu_mem = float(cfg["inference"].get("gpu_memory_utilization", 0.90))
+        tp_size = 1
+        tp_str = cfg["inference"].get("tensor_parallel_size", "auto")
+        if isinstance(tp_str, str) and tp_str == "auto":
+            import os as _os
+            visible = _os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+            tp_size = max(1, len([d for d in visible.split(",") if d.strip() and d.strip() != "-1"])) if visible else 1
+        else:
+            tp_size = max(1, int(tp_str))
+        max_tokens = int(cfg["inference"].get("max_new_tokens", 8192))
+        engine = Engine(
+            model_path=cfg["inference"]["model_name_or_path"],
+            tp_size=tp_size,
+            mem_fraction_static=gpu_mem,
+            context_length=max_tokens + 2048,
+            random_seed=int(cfg.get("seed", 42)),
+            log_level="error",
+            enable_return_hidden_states=True,
+        )
+        from inference.sglang_hidden_extractor import SGLangHiddenStateExtractor
+        extractor = SGLangHiddenStateExtractor(engine)
+        logger.info("SGLang engine ready for online hidden extraction")
 
     dataset = BagDataset(
         data_path=data_path, temp_bins=temp_bins, instance_dim=instance_dim,
         pooling_mode=cfg["data"].get("segment_pooling", "mean"),
         segment_size=int(cfg["data"].get("segment_size", 32)),
         segment_mode=cfg["data"].get("segment_mode", "step"),
-        feature_mode=cfg["inference"].get("feature_mode", "basic"),
+        feature_mode=feature_mode,
+        extractor=extractor,
+        hidden_batch_size=hidden_batch_size,
     )
     logger.info("dataset_size=%d", len(dataset))
 
@@ -207,8 +251,15 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         pooling_mode=cfg["data"].get("segment_pooling", "mean"),
         segment_size=int(cfg["data"].get("segment_size", 32)),
         segment_mode=cfg["data"].get("segment_mode", "step"),
-        feature_mode=cfg["inference"].get("feature_mode", "basic"),
+        feature_mode=feature_mode,
+        extractor=extractor,
+        hidden_batch_size=hidden_batch_size,
     )
+
+    # Engine no longer needed after all datasets constructed
+    if engine is not None:
+        engine.shutdown()
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(cfg["mil"]["training"]["batch_size"]),
