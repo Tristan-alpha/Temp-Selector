@@ -8,9 +8,11 @@ Usage (single-process; vLLM tensor parallelism handles multi-GPU):
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import random
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -110,6 +112,68 @@ def _extract_segment_obs(token_ids: List[int], logprobs_list: List[Any],
     return std_vec if std_vec else None
 
 
+def _extract_segment_obs_sglang(token_ids: List[int], logprob_vals: List[float],
+                                 obs_dim: int, top_k: int,
+                                 topk_logprob_vals: Optional[List[float]] = None,
+                                 hidden_states: Optional[List[List[float]]] = None,
+                                 feature_mode: str = "basic") -> Optional[List[float]]:
+    """Same as _extract_segment_obs but for SGLang's flat logprob format."""
+    if not token_ids or not logprob_vals:
+        return None
+
+    tk_num = len(token_ids)
+    logprobs_per_token = len(logprob_vals) // max(1, tk_num)
+
+    token_obs: List[List[float]] = []
+    for pos, (tid, lp) in enumerate(zip(token_ids, logprob_vals)):
+        if pos < logprobs_per_token * tk_num:
+            # Extract top-k logprobs for this token
+            if topk_logprob_vals and len(topk_logprob_vals) >= (pos + 1) * top_k:
+                topk_list = topk_logprob_vals[pos * top_k : (pos + 1) * top_k]
+            else:
+                topk_list = [lp] * top_k
+            probs = [math.exp(v) for v in topk_list]
+            z = sum(probs) + 1e-12
+            entropy_val = 0.0
+            for p in probs:
+                pn = p / z
+                entropy_val -= pn * math.log(max(pn, 1e-12))
+        else:
+            lp = -20.0
+            topk_list = [lp] * top_k
+            entropy_val = 0.0
+
+        obs = token_to_vec({"logprob": float(lp), "entropy": float(entropy_val), "topk_logits": topk_list}, obs_dim)
+        token_obs.append(obs)
+
+    std_vec: List[float] = []
+    if feature_mode != "hidden_states":
+        if not token_obs:
+            return None
+        avg = [0.0] * obs_dim
+        for row in token_obs:
+            for i, v in enumerate(row):
+                avg[i] += v
+        denom = float(len(token_obs))
+        std_vec = [v / denom for v in avg]
+
+    if hidden_states is not None and feature_mode in {"hidden_states", "all"}:
+        n_hs = len(hidden_states)
+        if n_hs == 0:
+            return std_vec if std_vec else None
+        hs_dim = len(hidden_states[0])
+        hs_pooled = [0.0] * hs_dim
+        for hs in hidden_states:
+            for j, v in enumerate(hs):
+                hs_pooled[j] += v
+        hs_pooled = [v / n_hs for v in hs_pooled]
+        if feature_mode == "hidden_states":
+            return hs_pooled
+        return std_vec + hs_pooled
+
+    return std_vec if std_vec else None
+
+
 def load_train_prompts(dataset_path: str) -> list:
     """Extract unique (question, answer) pairs from labeled train dataset JSONL."""
     seen: set = set()
@@ -138,6 +202,7 @@ def train_ppo(
     tensor_parallel_size: int | str = "auto",
     run_name: str | None = None,
     log_dir: str = "logs",
+    backend: str = "sglang",
 ) -> None:
     cfg = _load_config(config_path)
     logger, _log_path, final_run_name = setup_experiment_logger(
@@ -160,17 +225,10 @@ def train_ppo(
     use_math_chat = bool(cfg["inference"].get("use_math_chat_prompt", True))
     feature_mode = cfg["inference"].get("feature_mode", "basic")
 
-    # Hidden state extractor (two-pass prefill trick)
-    hs_extractor = None
-    if feature_mode in {"hidden_states", "all"}:
-        layer_ids = cfg["inference"].get("eagle_aux_hidden_state_layer_ids", [28])
-        hs_extractor = VLLMHiddenStateExtractor(
-            model_name_or_path=cfg["inference"]["model_name_or_path"],
-            layer_ids=[int(x) for x in layer_ids],
-            tensor_parallel_size=1,
-            gpu_memory_utilization=0.30,
-        )
-        logger.info("hidden_state_extractor ready feature_mode=%s", feature_mode)
+    # Hidden state extraction config (extractor LLM created on-demand
+    # and destroyed after each batch to avoid GPU conflict with gen LLM).
+    hs_layer_ids = [int(x) for x in cfg["inference"].get("eagle_aux_hidden_state_layer_ids", [28])]
+    hs_needed = feature_mode in {"hidden_states", "all"}
 
     max_iterations = int(cfg["ppo"]["training"]["max_iterations"])
     early_stop_patience = int(cfg["ppo"]["training"]["early_stop_patience"])
@@ -190,8 +248,9 @@ def train_ppo(
     all_prompts = load_train_prompts(train_path)
     logger.info("train_prompts=%d", len(all_prompts))
 
-    # ---- vLLM engine ----
-    from vllm import LLM
+    # ---- Inference engine ----
+    model_path = cfg["inference"]["model_name_or_path"]
+    gpu_mem = float(cfg["inference"].get("gpu_memory_utilization", 0.90))
 
     if isinstance(tensor_parallel_size, str) and tensor_parallel_size == "auto":
         import os as _os
@@ -203,15 +262,32 @@ def train_ppo(
             tp_size = 1
     else:
         tp_size = max(1, int(tensor_parallel_size))
-    max_model_len = max_new_tokens + 2048
-    gpu_mem = float(cfg["inference"].get("gpu_memory_utilization", 0.90))
-    llm = LLM(
-        model=cfg["inference"]["model_name_or_path"],
-        tensor_parallel_size=tp_size, max_model_len=max_model_len,
-        gpu_memory_utilization=gpu_mem,
-    )
-    tokenizer = llm.get_tokenizer()
-    logger.info("vLLM ready tp_size=%d max_model_len=%d", tp_size, max_model_len)
+
+    if backend == "vllm":
+        from vllm import LLM
+        max_model_len = max_new_tokens + 2048
+        llm = LLM(
+            model=model_path,
+            tensor_parallel_size=tp_size, max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_mem,
+        )
+        tokenizer = llm.get_tokenizer()
+        logger.info("vLLM ready tp_size=%d max_model_len=%d", tp_size, max_model_len)
+    else:
+        # sglang (default)
+        from sglang import Engine
+        max_model_len = max_new_tokens + 2048
+        engine = Engine(
+            model_path=model_path,
+            tp_size=tp_size,
+            mem_fraction_static=gpu_mem,
+            context_length=max_new_tokens + 2048,
+            random_seed=seed,
+            log_level="error",
+            enable_return_hidden_states=True,
+        )
+        tokenizer = engine.tokenizer_manager.tokenizer
+        logger.info("SGLang ready tp_size=%d", tp_size)
 
     device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -301,7 +377,8 @@ def train_ppo(
         ep_correct: List[int] = [-1] * N  # 1 = majority correct, 0 = majority wrong, -1 = unknown
 
         max_rounds = max_new_tokens // segment_size + 1
-        from vllm import SamplingParams
+        if backend == "vllm":
+            from vllm import SamplingParams
 
         for _seg_idx in range(max_rounds):
             round_prompts = []
@@ -335,48 +412,118 @@ def train_ppo(
                     ep_logprobs[i].append(logp.cpu())
                     ep_values[i].append(value.squeeze(0).cpu())
 
-                round_params.append(SamplingParams(
-                    n=V, temperature=temp, max_tokens=segment_size, logprobs=top_k_logits,
-                ))
+                if backend == "vllm":
+                    round_params.append(SamplingParams(
+                        n=V, temperature=temp, max_tokens=segment_size, logprobs=top_k_logits,
+                    ))
+                else:
+                    round_params.append({"max_new_tokens": segment_size, "temperature": temp, "n": V})
                 round_indices.append(i)
 
             if not round_indices:
                 break
 
-            outputs = llm.generate(round_prompts, round_params, use_tqdm=False)
+            seg_hidden_map: Dict[int, Optional[List[List[float]]]] = {}
+            hs_requests: List[Tuple[int, List[int], object, str]] = []
 
-            for j, i in enumerate(round_indices):
-                req_outputs = outputs[j].outputs
-                for v in range(min(V, len(req_outputs))):
-                    generated[i][v] += req_outputs[v].text
+            if backend == "vllm":
+                # ---- vLLM path: batch generate + two-pass hidden extraction ----
+                outputs = llm.generate(round_prompts, round_params, use_tqdm=False)
 
-                out0 = req_outputs[0]
-                new_tokens = out0.token_ids
+                for j, i in enumerate(round_indices):
+                    req_outputs = outputs[j].outputs
+                    for v in range(min(V, len(req_outputs))):
+                        generated[i][v] += req_outputs[v].text
+                    out0 = req_outputs[0]
+                    new_tokens = out0.token_ids
+                    finish_reason = getattr(out0, 'finish_reason', None)
+                    if (tokenizer.eos_token_id is not None and tokenizer.eos_token_id in new_tokens) or \
+                       finish_reason == 'stop' or not new_tokens:
+                        active[i] = False
+                        ep_correct[i] = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
+                        continue
+                    if out0.logprobs:
+                        seg_text = req_outputs[0].text
+                        if seg_text:
+                            ep_prefixes[i] += seg_text
+                        hs_requests.append((i, new_tokens, out0, seg_text))
 
-                finish_reason = getattr(out0, 'finish_reason', None)
-                if (tokenizer.eos_token_id is not None and tokenizer.eos_token_id in new_tokens) or \
-                   finish_reason == 'stop' or not new_tokens:
-                    active[i] = False
-                    ep_correct[i] = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
-                    continue
+                if hs_needed and hs_requests:
+                    del llm
+                    gc.collect(); torch.cuda.empty_cache(); time.sleep(2)
+                    hs_ext = VLLMHiddenStateExtractor(
+                        model_name_or_path=model_path, layer_ids=hs_layer_ids,
+                        tensor_parallel_size=1, gpu_memory_utilization=gpu_mem,
+                        max_model_len=max_model_len,
+                    )
+                    hs_prefixes_ = [ep_prefixes[i] for i, _, _, _ in hs_requests]
+                    hs_seg_texts_ = [st for _, _, _, st in hs_requests]
+                    all_hs = hs_ext.extract(hs_prefixes_, hs_seg_texts_)
+                    for k, (i, _, _, _) in enumerate(hs_requests):
+                        seg_hidden_map[i] = all_hs[k].tolist()
+                    hs_ext.cleanup(); del hs_ext
+                    gc.collect(); torch.cuda.empty_cache(); time.sleep(2)
+                    llm = LLM(model=model_path, tensor_parallel_size=tp_size,
+                              max_model_len=max_model_len, gpu_memory_utilization=gpu_mem)
+                    tokenizer = llm.get_tokenizer()
+            else:
+                # ---- SGLang path: per-prompt generate + inline hidden states ----
+                for j, i in enumerate(round_indices):
+                    output = engine.generate(
+                        round_prompts[j], round_params[j],
+                        return_logprob=True,
+                        top_logprobs_num=top_k_logits if feature_mode in {"topk_logits","all"} else 1,
+                        return_hidden_states=hs_needed,
+                    )
+                    output = output[0] if isinstance(output, list) else output
+                    meta = output.get("meta_info", {})
+                    out_ids = output.get("output_ids", [])
+                    lp_vals = meta.get("output_token_logprobs_val", [])
+                    tp_vals = meta.get("output_top_logprobs_val", [])
 
-                if out0.logprobs:
-                    # Accumulate prefix for hidden state extraction
-                    seg_text = req_outputs[0].text
+                    for v in range(V):
+                        n_per_vote = len(out_ids) // V if V > 0 else 1
+                        start_v = v * n_per_vote
+                        end_v = start_v + n_per_vote
+                        generated[i][v] += output.get("text", "")
+
+                    # Check finish (use first vote's tokens)
+                    first_vote_ids = out_ids[:n_per_vote] if V > 1 else out_ids
+                    if (tokenizer.eos_token_id is not None and tokenizer.eos_token_id in first_vote_ids) or \
+                       not first_vote_ids:
+                        active[i] = False
+                        ep_correct[i] = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
+                        continue
+
+                    seg_text = output.get("text", "")
                     if seg_text:
                         ep_prefixes[i] += seg_text
+                    hs_requests.append((i, first_vote_ids, lp_vals, tp_vals, seg_text))
 
-                    # Extract hidden states for this segment's token positions
-                    seg_hidden_states = None
-                    if hs_extractor is not None and seg_text:
-                        hs_tensor = hs_extractor.extract(
-                            [ep_prefixes[i]], [seg_text]
-                        )[0]  # torch.Tensor [n_tokens, hidden_dim]
-                        seg_hidden_states = hs_tensor.tolist()  # convert to list of lists for _extract_segment_obs
+                    if hs_needed:
+                        hs = meta.get("hidden_states")
+                        if hs is not None:
+                            prompt_len = len(tokenizer.encode(round_prompts[j]))
+                            hs_chunk = hs[prompt_len:]
+                            if hasattr(hs_chunk, "tolist"):
+                                hs_chunk = hs_chunk.tolist()
+                            seg_hidden_map[i] = hs_chunk
 
+            # Compute segment observations
+            if backend == "vllm":
+                for i, new_tokens, out0, _ in hs_requests:
                     obs = _extract_segment_obs(
                         new_tokens, out0.logprobs, obs_dim, top_k_logits,
-                        hidden_states=seg_hidden_states,
+                        hidden_states=seg_hidden_map.get(i),
+                        feature_mode=feature_mode,
+                    )
+                    segment_obs[i] = torch.tensor(obs, dtype=torch.float32) if obs else None
+            else:
+                for i, new_tokens, lp_vals, tp_vals, _ in hs_requests:
+                    obs = _extract_segment_obs_sglang(
+                        new_tokens, lp_vals, obs_dim, top_k_logits,
+                        topk_logprob_vals=tp_vals,
+                        hidden_states=seg_hidden_map.get(i),
                         feature_mode=feature_mode,
                     )
                     segment_obs[i] = torch.tensor(obs, dtype=torch.float32) if obs else None
@@ -515,6 +662,8 @@ def main() -> None:
     parser.add_argument("--train-data", default=None, help="Override paths.train_dataset from config")
     parser.add_argument("--mil-ckpt", default=None, help="Override paths.mil_ckpt from config")
     parser.add_argument("--tensor-parallel-size", default="auto")
+    parser.add_argument("--backend", default="sglang", choices=["sglang", "vllm"],
+                        help="Inference backend: sglang (default) or vllm (legacy)")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     args = parser.parse_args()
@@ -522,7 +671,7 @@ def main() -> None:
     train_path = args.train_data or cfg["paths"]["train_dataset"]
     mil_ckpt = args.mil_ckpt or cfg["paths"]["mil_ckpt"]
     try:
-        train_ppo(args.config, train_path, mil_ckpt=mil_ckpt, tensor_parallel_size=args.tensor_parallel_size, run_name=args.run_name, log_dir=args.log_dir)
+        train_ppo(args.config, train_path, mil_ckpt=mil_ckpt, tensor_parallel_size=args.tensor_parallel_size, run_name=args.run_name, log_dir=args.log_dir, backend=args.backend)
     except Exception as exc:
         cfg = _load_config(args.config)
         logger, _, _ = setup_experiment_logger(component="train_ppo", run_name=args.run_name, log_dir=args.log_dir, config=cfg)

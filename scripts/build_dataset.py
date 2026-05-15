@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import yaml
 
 from features.schema import BagSample
+from inference.sglang_runner import SGLangFeatureExporter
 from inference.vllm_runner import DEFAULT_MATH_SYSTEM_PROMPT
 from inference.vllm_runner import VLLMFeatureExporter
 from utils.answer_verifier import verify_answer, self_consistency_correct
@@ -113,7 +114,7 @@ def build_dataset(
             max_retries=int(api_cfg.get("max_retries", 3)),
         )
         logger.info("backend=api base_url=%s max_concurrent=%d", exporter.base_url, exporter.max_concurrent)
-    else:
+    elif backend == "vllm":
         exporter = VLLMFeatureExporter(
             model_name_or_path=inf_cfg["model_name_or_path"],
             max_new_tokens=inf_cfg["max_new_tokens"],
@@ -121,6 +122,15 @@ def build_dataset(
             gpu_memory_utilization=float(inf_cfg.get("gpu_memory_utilization", 0.90)),
         )
         logger.info("backend=vllm")
+    else:
+        # sglang (default)
+        exporter = SGLangFeatureExporter(
+            model_name_or_path=inf_cfg["model_name_or_path"],
+            max_new_tokens=inf_cfg["max_new_tokens"],
+            tensor_parallel_size=inf_cfg.get("tensor_parallel_size", "auto"),
+            gpu_memory_utilization=float(inf_cfg.get("gpu_memory_utilization", 0.90)),
+        )
+        logger.info("backend=sglang")
 
     rows_prepared: List[Dict[str, Any]] = []
     for row in prompts:
@@ -159,12 +169,12 @@ def build_dataset(
     n_individual_correct = 0
 
     # ------------------------------------------------------------------
-    # Generate all temperatures in one vLLM call (APC shares prompt KV)
-    # or per-temperature for API backend.
+    # Generate all temperatures.  vLLM uses APC for KV-cache sharing;
+    # SGLang uses radix cache; API backend uses per-temperature loop.
     # ------------------------------------------------------------------
-    if backend == "vllm":
-        logger.info("multi_temp start n_prompts=%d n_temps=%d total_requests=%d",
-                     total_rows, n_temps, total_rows * n_temps)
+    if backend in ("vllm", "sglang"):
+        logger.info("multi_temp start n_prompts=%d n_temps=%d total_requests=%d backend=%s",
+                     total_rows, n_temps, total_rows * n_temps, backend)
         exported_batch = exporter.export_token_features_multi_temp(
             prompts=all_questions,
             temperatures=all_temps,
@@ -176,10 +186,11 @@ def build_dataset(
         )
         logger.info("multi_temp done total_outputs=%d", len(exported_batch))
 
-        # --- hidden state extraction (two-pass: prefill prompt+response) ---
+        # --- hidden state extraction ---
+        # SGLang: hidden state tensors are inline in the payload (no second pass).
+        # vLLM: requires two-pass prefill trick with a separate extractor instance.
         fmode = inf_cfg.get("feature_mode", "basic")
-        if fmode in {"hidden_states", "all"}:
-            # Save TP size and free the generation LLM before creating the extractor
+        if backend == "vllm" and fmode in {"hidden_states", "all"}:
             tp_size = exporter.tensor_parallel_size if hasattr(exporter, "tensor_parallel_size") else 1
             del exporter
             import gc
@@ -242,8 +253,12 @@ def build_dataset(
                         vid_suffix = f"_v{v}" if num_votes > 1 else ""
 
                         # Collect hidden tensor for this sample (native dtype, not JSONL)
-                        ht = all_hidden[batch_idx] if batch_idx < len(all_hidden) else None
-                        batch_idx += 1
+                        # SGLang: inline in the payload.  vLLM: from the two-pass extractor.
+                        if backend == "sglang":
+                            ht = exported.get("hidden_tensor")
+                        else:
+                            ht = all_hidden[batch_idx] if batch_idx < len(all_hidden) else None
+                            batch_idx += 1
 
                         sample = BagSample(
                             sample_id=f"{row_obj['sample_base']}_t{temp}{vid_suffix}",
@@ -423,8 +438,8 @@ def main() -> None:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--split-seed", type=int, default=42)
-    parser.add_argument("--backend", default="vllm", choices=["vllm", "api"],
-                        help="Inference backend: vllm (local GPU) or api (DashScope / OpenAI-compatible)")
+    parser.add_argument("--backend", default="sglang", choices=["sglang", "vllm", "api"],
+                        help="Inference backend: sglang (default), vllm (legacy), or api")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     add_groupby_arg(parser)

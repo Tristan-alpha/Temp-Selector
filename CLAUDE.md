@@ -10,9 +10,10 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 | `features/segmenter.py` | Segmentation strategies (`fixed_window`, `step`, `punctuation`) + `segment_pooling` |
 | `features/vectorizer.py` | `token_to_vec`, `token_to_obs`, `mean_pool_obs`, `compute_entropy` — feature construction |
 | `features/dataset_eval.py` | `evaluate_dataset()`, `load_temperature_labels()` — Stage 1 analysis |
-| `inference/vllm_runner.py` | `VLLMFeatureExporter` — local GPU with APC multi-temp batching |
+| `inference/sglang_runner.py` | `SGLangFeatureExporter` — **default** backend; single engine with native `return_hidden_states=True` |
+| `inference/vllm_runner.py` | `VLLMFeatureExporter` — legacy backend (`--backend vllm`); APC multi-temp batching |
+| `inference/vllm_hidden_extractor.py` | `VLLMHiddenStateExtractor` — legacy two-pass hidden extraction via vLLM speculative decoding |
 | `inference/api_runner.py` | `APIFeatureExporter` — Bailian DashScope API backend |
-| `inference/vllm_hidden_extractor.py` | `VLLMHiddenStateExtractor` — two-pass hidden state extraction via vLLM speculative decoding. Returns `List[torch.Tensor]` (native dtype, bf16) |
 | `mil/model.py` | `MILModel`, temp heads, smoothness_loss — all MIL model definitions |
 | `mil/training.py` | `BagDataset`, `collate_rows`, `train_mil()` — Stage 2 training |
 | `mil/eval.py` | `evaluate_mil()` + all MIL metric functions — Stage 2 evaluation |

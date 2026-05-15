@@ -1,6 +1,9 @@
+# Common dependencies for both backends.
+# Install one of:
+#   pip install -r requirements-sglang.txt   (default backend)
+#   pip install -r requirements-vllm.txt    (legacy backend)
 torch>=2.2.0
 pyyaml>=6.0.1
 numpy>=1.26.0
-vllm==0.18.0
 safetensors>=0.4.0
 math-verify[antlr4_13_2]>=0.8.0

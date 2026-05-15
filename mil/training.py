@@ -36,12 +36,12 @@ def load_config(path: str) -> Dict[str, Any]:
 class BagDataset(Dataset):
     def __init__(self, data_path: str, temp_bins: List[float], instance_dim: int,
                  pooling_mode: str = "mean", segment_size: int = 32,
-                 segment_mode: str = "step"):
+                 segment_mode: str = "step", feature_mode: str = "basic"):
         self.rows: List[Tuple[torch.Tensor, int, int]] = []
         bin_map = {float(v): i for i, v in enumerate(temp_bins)}
 
         hpath = hidden_path(data_path)
-        has_sidecar = os.path.exists(hpath)
+        has_sidecar = feature_mode in {"hidden_states", "all"} and os.path.exists(hpath)
 
         def _process_rows(f, hs_slice=None):
             for line in f:
@@ -143,6 +143,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         pooling_mode=cfg["data"].get("segment_pooling", "mean"),
         segment_size=int(cfg["data"].get("segment_size", 32)),
         segment_mode=cfg["data"].get("segment_mode", "step"),
+        feature_mode=cfg["inference"].get("feature_mode", "basic"),
     )
     logger.info("dataset_size=%d", len(dataset))
 
@@ -206,6 +207,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         pooling_mode=cfg["data"].get("segment_pooling", "mean"),
         segment_size=int(cfg["data"].get("segment_size", 32)),
         segment_mode=cfg["data"].get("segment_mode", "step"),
+        feature_mode=cfg["inference"].get("feature_mode", "basic"),
     )
     val_loader = DataLoader(
         val_dataset,

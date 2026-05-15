@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import atexit
 import os
 import tempfile
 from typing import List
@@ -44,6 +45,8 @@ class VLLMHiddenStateExtractor:
         self._max_model_len = max_model_len
         self._llm = None
         self._tokenizer = None
+        self._cleaned = False
+        atexit.register(self.cleanup)
 
     def _lazy_init(self):
         if self._llm is not None:
@@ -161,8 +164,25 @@ class VLLMHiddenStateExtractor:
 
         return results
 
+    def __del__(self):
+        self.cleanup()
+
+    def sleep(self, level: int = 1):
+        """Offload model weights to CPU so another LLM can use the GPU."""
+        self._lazy_init()
+        self._llm.sleep(level=level)
+
+    def wake_up(self):
+        """Reload model weights to GPU after :meth:`sleep`."""
+        self._lazy_init()
+        self._llm.wake_up()
+
     def cleanup(self):
-        """Remove temporary storage directory."""
+        """Remove temporary storage directory.  Idempotent — safe to call
+        multiple times (including from atexit / __del__ after explicit cleanup)."""
+        if self._cleaned:
+            return
+        self._cleaned = True
         import shutil
         if os.path.exists(self._storage_dir):
             shutil.rmtree(self._storage_dir, ignore_errors=True)

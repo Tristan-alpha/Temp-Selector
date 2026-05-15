@@ -3,7 +3,7 @@ __pycache__/
 *.safetensors
 .pytest_cache/
 .venv/
-data/*.jsonl
-datasets/*.jsonl
+data/
+datasets/
 checkpoints/*.pt
 logs/

@@ -160,8 +160,11 @@ openai>=1.0.0          # API 后端需要
 ### 入口
 
 ```bash
-# vLLM 后端（默认）
+# SGLang 后端（默认，单 engine 生成 + hidden state 提取）
 CUDA_VISIBLE_DEVICES=0 python scripts/build_dataset.py --config configs/dataset.yaml
+
+# vLLM 后端（legacy，需两个 LLM 实例提取 hidden states）
+CUDA_VISIBLE_DEVICES=0 python scripts/build_dataset.py --config configs/dataset.yaml --backend vllm
 
 # API 后端（百炼 DashScope）
 python scripts/build_dataset.py --config configs/dataset.yaml --backend api
