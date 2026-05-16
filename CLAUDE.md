@@ -10,11 +10,8 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 | `features/segmenter.py` | Segmentation strategies (`fixed_window`, `step`, `punctuation`) + `segment_pooling` |
 | `features/vectorizer.py` | `token_to_vec`, `token_to_obs`, `mean_pool_obs`, `compute_entropy` — feature construction |
 | `features/dataset_eval.py` | `evaluate_dataset()`, `load_temperature_labels()` — Stage 1 analysis |
-| `inference/sglang_runner.py` | `SGLangFeatureExporter` — **default** backend; single engine with native `return_hidden_states=True` |
-| `inference/sglang_hidden_extractor.py` | `SGLangHiddenStateExtractor` — thin wrapper; online hidden state extraction for MIL training |
-| `inference/vllm_runner.py` | `VLLMFeatureExporter` — legacy backend (`--backend vllm`); APC multi-temp batching |
-| `inference/vllm_hidden_extractor.py` | `VLLMHiddenStateExtractor` — legacy two-pass hidden extraction via vLLM speculative decoding |
-| `inference/api_runner.py` | `APIFeatureExporter` — Bailian DashScope API backend |
+| `inference/sglang_runner.py` | `SGLangRunner` — **default** backend; single engine with `generate()` + `extract()` |
+| `inference/vllm_runner.py` | `VLLMFeatureExporter` — legacy backend (`--backend vllm`); raises ValueError for hidden_states mode |
 | `mil/model.py` | `MILModel`, temp heads, smoothness_loss — all MIL model definitions |
 | `mil/training.py` | `BagDataset`, `collate_rows`, `train_mil()` — Stage 2 training |
 | `mil/eval.py` | `evaluate_mil()` + all MIL metric functions — Stage 2 evaluation |
@@ -24,7 +21,7 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 | `utils/math.py` | `safe_div` — shared one-liner |
 | `utils/answer_verifier.py` | Math-Verify wrapper for answer correctness checking |
 | `utils/exp_logger.py` | File + stream logging setup |
-| `utils/dataset_io.py` | Hybrid JSONL + safetensors I/O (`hidden_path`, `write_hidden_sidecar`, `split_hidden_sidecar`, `read_hidden_offsets`) — **deleted**; online extraction via SGLang engine replaces safetensors sidecar |
+| `utils/dataset_io.py` | Hybrid JSONL + safetensors I/O — **deleted**; SGLangRunner.extract() replaces safetensors sidecar |
 | `scripts/run_pipeline.sh` | Full pipeline orchestrator (`STAGES` env var controls which stages run) |
 | `scripts/build_dataset.py` | Stage 1 entry: vLLM multi-temp gen, majority voting. For hidden_states/all mode: merged build+split writes train/val/test JSONL+safetensors directly |
 | `scripts/split_jsonl.py` | Group-aware train/eval split; propagates safetensors sidecar |

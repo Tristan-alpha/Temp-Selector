@@ -82,7 +82,7 @@ class OnlineTemperatureEvaluator:
         model_name_or_path: str,
         ppo_ckpt: str,
         config: Dict[str, Any],
-        tensor_parallel_size: int | str = "auto",
+        parallel_size: int | str = "auto",
     ):
         self.segment_size = int(config["data"]["segment_size"])
         self.max_new_tokens = int(config["inference"]["max_new_tokens"])
@@ -97,7 +97,7 @@ class OnlineTemperatureEvaluator:
 
         from vllm import LLM
 
-        tp = self._resolve_tp(tensor_parallel_size)
+        tp = self._resolve_tp(parallel_size)
         max_model_len = self.max_new_tokens + 2048
         gpu_mem = float(config.get("inference", {}).get("gpu_memory_utilization", 0.90))
         self.llm = LLM(model=model_name_or_path, tensor_parallel_size=tp, max_model_len=max_model_len, gpu_memory_utilization=gpu_mem)
@@ -110,9 +110,9 @@ class OnlineTemperatureEvaluator:
         self.policy.eval()
 
     @staticmethod
-    def _resolve_tp(tensor_parallel_size: int | str) -> int:
-        if isinstance(tensor_parallel_size, int) and tensor_parallel_size >= 1:
-            return tensor_parallel_size
+    def _resolve_tp(parallel_size: int | str) -> int:
+        if isinstance(parallel_size, int) and parallel_size >= 1:
+            return parallel_size
         import os
         visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
         if visible:
@@ -362,7 +362,7 @@ def main() -> None:
         model_name_or_path=config["inference"]["model_name_or_path"],
         ppo_ckpt=ppo_ckpt,
         config=config,
-        tensor_parallel_size=args.tensor_parallel_size,
+        parallel_size=args.parallel_size,
     )
     logger.info("Evaluator ready.  Running online evaluation ...")
     results = evaluator.evaluate(data_path=test_data_path, prompts_data=prompts_data, seed=args.seed)

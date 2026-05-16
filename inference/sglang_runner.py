@@ -30,26 +30,28 @@ DEFAULT_MATH_SYSTEM_PROMPT = (
 )
 
 
-class SGLangFeatureExporter:
+class SGLangRunner:
     def __init__(
         self,
         model_name_or_path: str,
         max_new_tokens: int = 256,
-        tensor_parallel_size: int | str = "auto",
+        parallel_size: int | str = "auto",
         gpu_memory_utilization: float = 0.90,
         feature_mode: str = "basic",
+        log_level: str = "warn",
     ):
         self.model_name_or_path = model_name_or_path
         self.max_new_tokens = max_new_tokens
-        self.tensor_parallel_size = tensor_parallel_size
+        self.parallel_size = parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.feature_mode = feature_mode
+        self.log_level = log_level
         self._engine = None
         self._tokenizer = None
         self._resolve_device_count()
 
     def _resolve_device_count(self):
-        tp = self.tensor_parallel_size
+        tp = self.parallel_size
         if isinstance(tp, int):
             self._tp = max(1, tp)
             return
@@ -58,6 +60,24 @@ class SGLangFeatureExporter:
             self._tp = max(1, len([d for d in visible.split(",") if d.strip() and d.strip() != "-1"])) if visible else 1
             return
         self._tp = max(1, int(tp))
+
+    @property
+    def tokenizer(self):
+        """The tokenizer from the engine."""
+        self._lazy_init()
+        return self._tokenizer
+
+    def generate_raw(self, prompt, sampling_params,
+                     return_logprob=False, top_logprobs_num=None,
+                     return_hidden_states=False):
+        """Forward to ``engine.generate()``.  For per-segment PPO generation."""
+        self._lazy_init()
+        return self._engine.generate(
+            prompt, sampling_params,
+            return_logprob=return_logprob,
+            top_logprobs_num=top_logprobs_num,
+            return_hidden_states=return_hidden_states,
+        )
 
     def _lazy_init(self):
         if self._engine is not None:
@@ -69,19 +89,21 @@ class SGLangFeatureExporter:
             dp_size=self._tp,
             tp_size=1,
             cuda_graph_max_bs=512,
+            max_running_requests=512,
             schedule_policy="lpm",
             mem_fraction_static=self.gpu_memory_utilization,
             context_length=self.max_new_tokens + 2048,  # prompt headroom + output
-            schedule_conservativeness=0.0,
+            schedule_conservativeness=0.3,
             enable_mixed_chunk=True,
-            enable_flashinfer_allreduce_fusion=True,
             pre_warm_nccl=True,
-            enable_torch_compile=True,
+            enable_tokenizer_batch_encode=True,
+            num_continuous_decode_steps=8,
             random_seed=42,
-            log_level="info",
+            log_level=self.log_level,
             enable_return_hidden_states=self.feature_mode in {"hidden_states", "all"},
         )
-        self._tokenizer = self._engine.tokenizer_manager.tokenizer
+        from transformers import AutoTokenizer
+        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
 
     def build_math_messages(self, question: str, system_prompt: Optional[str] = None) -> List[Dict[str, str]]:
         return [
@@ -173,7 +195,6 @@ class SGLangFeatureExporter:
             payload = self._build_feature_payload(
                 rendered_prompt=rendered_prompts[prompt_idx],
                 output=batch_output,
-                feature_mode=self.feature_mode,
                 temperature=temperatures[temp_idx],
                 vote_idx=0,
                 num_votes=1,
@@ -220,44 +241,34 @@ class SGLangFeatureExporter:
         meta = output.get("meta_info", {})
         output_ids = output.get("output_ids", [])
 
-        # SGLang stores per-token logprobs as flat lists
-        logprob_vals = meta.get("output_token_logprobs_val", [])
-        top_logprob_vals = meta.get("output_top_logprobs_val", [])
-        top_logprob_idx = meta.get("output_top_logprobs_idx", [])
+        # SGLang returns per-token logprobs as lists of (logprob, token_id, text_or_None) tuples
+        logprob_tuples = meta.get("output_token_logprobs", [])
+        top_logprob_tuples = meta.get("output_top_logprobs", [])
 
         # For multi-vote, SGLang interleaves outputs. Extract the right vote.
         n_per_vote = len(output_ids) // num_votes if num_votes > 0 else len(output_ids)
         if num_votes > 1:
             start_idx = vote_idx * n_per_vote
-            end_idx = start_idx + n_per_vote
         else:
             start_idx = 0
-            end_idx = len(output_ids)
 
-        vote_ids = output_ids[start_idx:end_idx]
-
-        # Logprob values are per-token; top-k values are grouped
-        top_k_num = len(top_logprob_vals) // max(1, len(output_ids)) if output_ids else 0
+        vote_ids = output_ids[start_idx : start_idx + n_per_vote]
 
         features: List[TokenFeature] = []
         for pos, tid in enumerate(vote_ids):
             global_pos = start_idx + pos
-            logprob = logprob_vals[global_pos] if global_pos < len(logprob_vals) else -20.0
+            lp = logprob_tuples[global_pos][0] if global_pos < len(logprob_tuples) else -20.0
 
-            # Extract top-k logprobs for this token
             topk_list: Optional[List[float]] = None
-            if top_k_num > 0 and self.feature_mode in {"topk_logits", "all"}:
-                topk_start = global_pos * top_k_num
-                topk_end = topk_start + top_k_num
-                topk_list = top_logprob_vals[topk_start:topk_end]
+            if self.feature_mode in {"topk_logits", "all"} and global_pos < len(top_logprob_tuples):
+                topk_list = [t[0] for t in top_logprob_tuples[global_pos]]
 
-            # Compute entropy from top-k probs
-            probs = [math.exp(v) for v in (topk_list or [logprob])]
+            probs = [math.exp(v) for v in (topk_list or [lp])]
             z = sum(probs) + 1e-12
-            entropy = 0.0
+            ent = 0.0
             for p in probs:
                 pn = p / z
-                entropy -= pn * math.log(max(pn, 1e-12))
+                ent -= pn * math.log(max(pn, 1e-12))
 
             token_text = ""
             if self._tokenizer is not None:
@@ -269,8 +280,8 @@ class SGLangFeatureExporter:
             features.append(TokenFeature(
                 token_id=int(tid),
                 text=token_text,
-                logprob=float(logprob),
-                entropy=float(entropy),
+                logprob=float(lp),
+                entropy=float(ent),
                 topk_logits=topk_list,
             ))
 
@@ -282,48 +293,42 @@ class SGLangFeatureExporter:
         }
 
     # ------------------------------------------------------------------
-    # Per-sample hidden state extraction (mirrors vLLM extractor interface)
+    # Hidden state extraction
     # ------------------------------------------------------------------
 
-    def extract_hidden_states(
+    def extract(
         self,
         prompts: List[str],
         responses: List[str],
     ) -> List[torch.Tensor]:
         """Return per-response hidden state tensors (native dtype).
 
-        Uses the existing engine — no second instance needed.
+        Each returned tensor has shape ``[n_response_tokens, hidden_size]``.
+        The hidden state at position ``prompt_len - 1`` produces the logits
+        for the first response token, so slices from that offset.
         """
         self._lazy_init()
 
-        results: List[torch.Tensor] = []
-        for prompt, response in zip(prompts, responses):
-            full_text = prompt + response
-            prompt_len = len(self._tokenizer.encode(prompt))
-            output = self._engine.generate(
-                full_text,
-                {"max_new_tokens": 1, "temperature": 0.0},
-                return_hidden_states=True,
-            )
-            if isinstance(output, list):
-                output = output[0]
-            hs = output.get("meta_info", {}).get("hidden_states")
-            if hs is None:
-                output_ids = output.get("output_ids", [])
-                n_tokens = prompt_len + len(output_ids)
-                results.append(torch.zeros(n_tokens, self._hidden_size(), dtype=torch.float32))
-                continue
+        full_texts = [p + r for p, r in zip(prompts, responses)]
+        batch_params = [{"max_new_tokens": 1, "temperature": 0.0}] * len(full_texts)
 
-            # Slice off prompt tokens; convert to tensor if SGLang returns a list
-            hs_chunk = hs[prompt_len:]
+        outputs = self._engine.generate(
+            full_texts, batch_params,
+            return_hidden_states=True,
+        )
+
+        results: List[torch.Tensor] = []
+        for i, (prompt, output) in enumerate(zip(prompts, outputs)):
+            meta = output.get("meta_info", {})
+            hs = meta.get("hidden_states")
+            prompt_len = len(self._tokenizer.encode(prompt))
+            # h[i] → token[i+1], so response hidden starts at prompt_len - 1
+            start = max(0, prompt_len - 1)
+            if hs is None:
+                results.append(torch.zeros(1, 4096, dtype=torch.float32))
+                continue
+            hs_chunk = hs[start : prompt_len - 1 + len(self._tokenizer.encode(responses[i]))]
             if not isinstance(hs_chunk, torch.Tensor):
                 hs_chunk = torch.tensor(hs_chunk)
             results.append(hs_chunk)
         return results
-
-    def _hidden_size(self) -> int:
-        """Return the model's hidden size."""
-        self._lazy_init()
-        if hasattr(self._engine, "model_config"):
-            return self._engine.model_config.hidden_size
-        return 4096

@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import yaml
 
 from features.schema import BagSample
-from inference.sglang_runner import SGLangFeatureExporter
+from inference.sglang_runner import SGLangRunner
 from inference.vllm_runner import DEFAULT_MATH_SYSTEM_PROMPT
 from inference.vllm_runner import VLLMFeatureExporter
 from utils.answer_verifier import verify_answer, self_consistency_correct
@@ -75,35 +75,24 @@ def build_dataset(
 
     inf_cfg = cfg["inference"]
 
-    if backend == "api":
-        from inference.api_runner import APIFeatureExporter
-
-        api_cfg = inf_cfg.get("api", {})
-        exporter = APIFeatureExporter(
-            model_name_or_path=inf_cfg["model_name_or_path"],
-            max_new_tokens=inf_cfg["max_new_tokens"],
-            base_url=api_cfg.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            api_key=api_cfg.get("api_key") or None,
-            max_concurrent=int(api_cfg.get("max_concurrent", 16)),
-            max_retries=int(api_cfg.get("max_retries", 3)),
-        )
-        logger.info("backend=api base_url=%s max_concurrent=%d", exporter.base_url, exporter.max_concurrent)
-    elif backend == "vllm":
+    if backend == "vllm":
         exporter = VLLMFeatureExporter(
             model_name_or_path=inf_cfg["model_name_or_path"],
             max_new_tokens=inf_cfg["max_new_tokens"],
-            tensor_parallel_size=inf_cfg.get("tensor_parallel_size", "auto"),
+            parallel_size=inf_cfg.get("parallel_size", "auto"),
             gpu_memory_utilization=float(inf_cfg.get("gpu_memory_utilization", 0.90)),
+            feature_mode=inf_cfg.get("feature_mode", "basic"),
         )
         logger.info("backend=vllm")
     else:
         # sglang (default)
-        exporter = SGLangFeatureExporter(
+        exporter = SGLangRunner(
             model_name_or_path=inf_cfg["model_name_or_path"],
             max_new_tokens=inf_cfg["max_new_tokens"],
-            tensor_parallel_size=inf_cfg.get("tensor_parallel_size", "auto"),
+            parallel_size=inf_cfg.get("parallel_size", "auto"),
             gpu_memory_utilization=float(inf_cfg.get("gpu_memory_utilization", 0.90)),
             feature_mode=inf_cfg.get("feature_mode", "basic"),
+            log_level="info",
         )
         logger.info("backend=sglang")
 
@@ -153,7 +142,6 @@ def build_dataset(
         exported_batch = exporter.export_token_features_multi_temp(
             prompts=all_questions,
             temperatures=all_temps,
-            feature_mode=inf_cfg["feature_mode"],
             top_k_logits=int(inf_cfg["top_k_logits"]),
             use_math_chat_prompt=bool(inf_cfg.get("use_math_chat_prompt", True)),
             system_prompt=inf_cfg.get("system_prompt", DEFAULT_MATH_SYSTEM_PROMPT),
@@ -161,41 +149,9 @@ def build_dataset(
         )
         logger.info("multi_temp done total_outputs=%d", len(exported_batch))
 
-        # --- hidden state extraction ---
-        # SGLang: hidden state tensors are inline in the payload (no second pass).
-        # vLLM: requires two-pass prefill trick with a separate extractor instance.
-        fmode = inf_cfg.get("feature_mode", "basic")
-        if backend == "vllm" and fmode in {"hidden_states", "all"}:
-            tp_size = exporter.tensor_parallel_size if hasattr(exporter, "tensor_parallel_size") else 1
-            del exporter
-            import gc
-            gc.collect()
-            import torch
-            torch.cuda.empty_cache()
-
-            from inference.vllm_hidden_extractor import VLLMHiddenStateExtractor
-
-            layer_ids = inf_cfg.get("eagle_aux_hidden_state_layer_ids", [28])
-            extractor = VLLMHiddenStateExtractor(
-                model_name_or_path=inf_cfg["model_name_or_path"],
-                layer_ids=[int(x) for x in layer_ids],
-                tensor_parallel_size=tp_size,
-            )
-            prompt_response_pairs = [
-                (ex["prompt"], ex["response"])
-                for ex in exported_batch
-            ]
-            debug_tok = bool(inf_cfg.get("debug_token_check", False))
-            logger.info("extracting hidden states for %d responses ...", len(prompt_response_pairs))
-            all_hidden = extractor.extract(
-                [p for p, _ in prompt_response_pairs],
-                [r for _, r in prompt_response_pairs],
-                debug_token_check=debug_tok,
-            )
-            extractor.cleanup()
-            logger.info("hidden state extraction done")
-
         # ------------------------------------------------------------------
+        fmode = inf_cfg.get("feature_mode", "basic")
+
         # Build sample dicts.  For hidden_states/all mode we collect them
         # in memory, split by group, and write train/val/test directly.
         # For basic/topk_logits we write all_dataset.jsonl inline.
@@ -203,7 +159,7 @@ def build_dataset(
         if fmode in {"hidden_states", "all"}:
             # --- Merged build+split: write train/val/test JSONL (no safetensors sidecar).
             #     Hidden states are extracted on-demand during MIL training via
-            #     SGLangHiddenStateExtractor. ---
+            #     SGLangRunner. ---
             all_sample_dicts: List[Dict[str, Any]] = []
 
             for q_idx, row_obj in enumerate(rows_prepared):
@@ -309,76 +265,6 @@ def build_dataset(
                                 },
                             )
                             f.write(json.dumps(sample.to_dict(), ensure_ascii=False) + "\n")
-    else:
-        # API backend: per-temperature loop (no APC benefit)
-        with out_file.open("w", encoding="utf-8") as f:
-            for t_idx, temp in enumerate(all_temps):
-                logger.info("temperature=%.4f [%d/%d] start", temp, t_idx + 1, n_temps)
-
-                exported_batch = exporter.export_token_features_batch(
-                    prompts=all_questions,
-                    temperature=temp,
-                    feature_mode=inf_cfg["feature_mode"],
-                    top_k_logits=int(inf_cfg["top_k_logits"]),
-                    use_math_chat_prompt=bool(inf_cfg.get("use_math_chat_prompt", True)),
-                    system_prompt=inf_cfg.get("system_prompt", DEFAULT_MATH_SYSTEM_PROMPT),
-                    num_votes=num_votes,
-                )
-
-                expected_size = total_rows * num_votes
-                if len(exported_batch) != expected_size:
-                    raise RuntimeError(
-                        f"Unexpected generation size at temperature={temp}: "
-                        f"got {len(exported_batch)}, expected {expected_size}"
-                    )
-
-                for q_idx, row_obj in enumerate(rows_prepared):
-                    vote_exports = exported_batch[q_idx * num_votes : (q_idx + 1) * num_votes]
-                    # Per-vote correctness (auxiliary statistic only — does NOT
-                    # determine the bag label.  Label is determined by
-                    # self-consistency majority voting below.)
-                    vote_correct = [
-                        1 if verify_answer(prediction=ex["response"], gold=row_obj["gold_answer"]) else 0
-                        for ex in vote_exports
-                    ]
-                    n_individual_correct += sum(vote_correct)
-                    n_correct = sum(vote_correct)
-                    # Self-consistency: extract answer from each response,
-                    # find modal (plurality) answer, compare to gold.
-                    responses = [ex["response"] for ex in vote_exports]
-                    majority_correct = self_consistency_correct(responses, row_obj["gold_answer"])
-                    majority_label = 0 if majority_correct else 1  # 0=correct, 1=error
-
-                    for v, exported in enumerate(vote_exports):
-                        n_samples += 1
-                        n_positive += (1 - majority_label)
-                        token_features = exported["token_features"]
-                        vid_suffix = f"_v{v}" if num_votes > 1 else ""
-                        sample = BagSample(
-                            sample_id=f"{row_obj['sample_base']}_t{temp}{vid_suffix}",
-                            prompt=row_obj["question"],
-                            response=exported["response"],
-                            label=majority_label,
-                            temperature=temp,
-                            token_features=token_features,
-                            segment_spans=[],  # computed by BagDataset at load time
-                            metadata={
-                                "feature_mode": inf_cfg["feature_mode"],
-                                "source": row_obj["source"],
-                                "subject": row_obj["subject"],
-                                "level": row_obj["level"],
-                                "gold_answer": row_obj["gold_answer"],
-                                "rendered_prompt": exported.get("prompt", row_obj["question"]),
-                                "vote_id": v,
-                                "num_votes": num_votes,
-                                "individual_correct": bool(vote_correct[v]),
-                                "votes_correct": n_correct,
-                                "votes_total": num_votes,
-                            },
-                        )
-                        f.write(json.dumps(sample.to_dict(), ensure_ascii=False) + "\n")
-
-                logger.info("temperature=%.4f [%d/%d] done emitted=%d", temp, t_idx + 1, n_temps, total_rows * num_votes)
 
     logger.info(
         "dataset_done run_name=%s n_samples=%d positive_ratio=%.6f individual_accuracy=%.4f num_votes=%d log_path=%s",
@@ -402,13 +288,14 @@ def main() -> None:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--split-seed", type=int, default=42)
-    parser.add_argument("--backend", default="sglang", choices=["sglang", "vllm", "api"],
-                        help="Inference backend: sglang (default), vllm (legacy), or api")
+    parser.add_argument("--backend", default=None, choices=["sglang", "vllm"],
+                        help="Inference backend (default: read from config, fallback sglang)")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     add_groupby_arg(parser)
     args = parser.parse_args()
     cfg = load_config(args.config)
+    backend = args.backend or cfg["inference"].get("backend", "sglang")
     input_path = args.input or cfg["paths"]["raw_input"]
     output_path = args.output or cfg["paths"]["all_dataset"]
     paths_cfg = cfg.get("paths", {})
@@ -421,7 +308,7 @@ def main() -> None:
             train_out=train_out, val_out=val_out, test_out=test_out,
             val_ratio=args.val_ratio, test_ratio=args.test_ratio,
             split_seed=args.split_seed, group_by=args.group_by,
-            backend=args.backend, run_name=args.run_name, log_dir=args.log_dir,
+            backend=backend, run_name=args.run_name, log_dir=args.log_dir,
         )
     except Exception as exc:
         cfg = load_config(args.config)

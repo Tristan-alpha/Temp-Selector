@@ -153,32 +153,17 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
     backend = cfg["inference"].get("backend", "sglang")
 
     # Create SGLang engine for online hidden state extraction
-    engine = None
-    extractor = None
+    runner = None
     if feature_mode in {"hidden_states", "all"} and backend == "sglang":
-        from sglang import Engine
-        gpu_mem = float(cfg["inference"].get("gpu_memory_utilization", 0.90))
-        tp_size = 1
-        tp_str = cfg["inference"].get("tensor_parallel_size", "auto")
-        if isinstance(tp_str, str) and tp_str == "auto":
-            import os as _os
-            visible = _os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-            tp_size = max(1, len([d for d in visible.split(",") if d.strip() and d.strip() != "-1"])) if visible else 1
-        else:
-            tp_size = max(1, int(tp_str))
-        max_tokens = int(cfg["inference"].get("max_new_tokens", 8192))
-        engine = Engine(
-            model_path=cfg["inference"]["model_name_or_path"],
-            tp_size=tp_size,
-            mem_fraction_static=gpu_mem,
-            context_length=max_tokens + 2048,
-            random_seed=int(cfg.get("seed", 42)),
-            log_level="error",
-            enable_return_hidden_states=True,
+        from inference.sglang_runner import SGLangRunner
+        runner = SGLangRunner(
+            model_name_or_path=cfg["inference"]["model_name_or_path"],
+            max_new_tokens=int(cfg["inference"].get("max_new_tokens", 8192)),
+            parallel_size=cfg["inference"].get("parallel_size", "auto"),
+            gpu_memory_utilization=float(cfg["inference"].get("gpu_memory_utilization", 0.90)),
+            feature_mode=feature_mode,
         )
-        from inference.sglang_hidden_extractor import SGLangHiddenStateExtractor
-        extractor = SGLangHiddenStateExtractor(engine)
-        logger.info("SGLang engine ready for online hidden extraction")
+        logger.info("SGLangRunner ready for online hidden extraction")
 
     dataset = BagDataset(
         data_path=data_path, temp_bins=temp_bins, instance_dim=instance_dim,
@@ -186,7 +171,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         segment_size=int(cfg["data"].get("segment_size", 32)),
         segment_mode=cfg["data"].get("segment_mode", "step"),
         feature_mode=feature_mode,
-        extractor=extractor,
+        extractor=runner,
         hidden_batch_size=hidden_batch_size,
     )
     logger.info("dataset_size=%d", len(dataset))
@@ -252,13 +237,9 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         segment_size=int(cfg["data"].get("segment_size", 32)),
         segment_mode=cfg["data"].get("segment_mode", "step"),
         feature_mode=feature_mode,
-        extractor=extractor,
+        extractor=runner,
         hidden_batch_size=hidden_batch_size,
     )
-
-    # Engine no longer needed after all datasets constructed
-    if engine is not None:
-        engine.shutdown()
 
     val_loader = DataLoader(
         val_dataset,

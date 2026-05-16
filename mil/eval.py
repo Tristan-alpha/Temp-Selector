@@ -196,31 +196,16 @@ def evaluate_mil(
     feature_mode = config["inference"].get("feature_mode", "basic")
     backend = config["inference"].get("backend", "sglang")
 
-    engine = None
-    extractor = None
+    runner = None
     if feature_mode in {"hidden_states", "all"} and backend == "sglang":
-        from sglang import Engine
-        gpu_mem = float(config["inference"].get("gpu_memory_utilization", 0.90))
-        tp_size = 1
-        tp_str = config["inference"].get("tensor_parallel_size", "auto")
-        if isinstance(tp_str, str) and tp_str == "auto":
-            import os as _os
-            visible = _os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-            tp_size = max(1, len([d for d in visible.split(",") if d.strip() and d.strip() != "-1"])) if visible else 1
-        else:
-            tp_size = max(1, int(tp_str))
-        max_tokens = int(config["inference"].get("max_new_tokens", 8192))
-        engine = Engine(
-            model_path=config["inference"]["model_name_or_path"],
-            tp_size=tp_size,
-            mem_fraction_static=gpu_mem,
-            context_length=max_tokens + 2048,
-            random_seed=int(config.get("seed", 42)),
-            log_level="error",
-            enable_return_hidden_states=True,
+        from inference.sglang_runner import SGLangRunner
+        runner = SGLangRunner(
+            model_name_or_path=config["inference"]["model_name_or_path"],
+            max_new_tokens=int(config["inference"].get("max_new_tokens", 8192)),
+            parallel_size=config["inference"].get("parallel_size", "auto"),
+            gpu_memory_utilization=float(config["inference"].get("gpu_memory_utilization", 0.90)),
+            feature_mode=feature_mode,
         )
-        from inference.sglang_hidden_extractor import SGLangHiddenStateExtractor
-        extractor = SGLangHiddenStateExtractor(engine)
 
     dataset = BagDataset(
         data_path=data_path, temp_bins=temp_bins, instance_dim=instance_dim,
@@ -228,11 +213,9 @@ def evaluate_mil(
         segment_size=int(config["data"].get("segment_size", 32)),
         segment_mode=config["data"].get("segment_mode", "step"),
         feature_mode=feature_mode,
-        extractor=extractor,
+        extractor=runner,
         hidden_batch_size=int(config["mil"]["training"].get("hidden_batch_size", 256)),
     )
-    if engine is not None:
-        engine.shutdown()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_rows)
 
     all_bag_logits: List[torch.Tensor] = []

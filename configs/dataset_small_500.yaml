@@ -4,11 +4,11 @@
 seed: 42
 
 paths:
-  raw_input: data/math_small_10.jsonl
-  all_dataset: datasets/all_small_10.jsonl
-  train_dataset: datasets/train_small_10.jsonl
-  val_dataset: datasets/val_small_10.jsonl
-  test_dataset: datasets/test_small_10.jsonl
+  raw_input: data/math_small_500.jsonl
+  all_dataset: datasets/all_small_500.jsonl
+  train_dataset: datasets/train_small_500.jsonl
+  val_dataset: datasets/val_small_500.jsonl
+  test_dataset: datasets/test_small_500.jsonl
 
 logging:
   log_dir: logs
@@ -16,10 +16,9 @@ logging:
 
 inference:
   model_name_or_path: /home/xuezhe/models/Qwen3-8B
-  backend: sglang              # sglang (default) | vllm | api
-  tensor_parallel_size: auto
-  gpu_memory_utilization: 0.80
-  eagle_aux_hidden_state_layer_ids: [28]  # Qwen3-8B last layer (1-indexed); vllm only
+  backend: sglang              # sglang (default) | vllm
+  parallel_size: auto
+  gpu_memory_utilization: 0.90
   max_new_tokens: 8192
   temperature_grid: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
   num_votes: 8
@@ -40,7 +39,3 @@ inference:
     - The final paragraph must include the final boxed answer written as \boxed{}.
     - Do not include any explanations, headers, or summaries outside the steps.
     - The response must end immediately after the final paragraph containing \boxed{}.
-  api:
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    max_concurrent: 16
-    max_retries: 3

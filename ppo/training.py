@@ -26,7 +26,7 @@ from utils.jsonl import sample_prefix
 from mil.model import MILModel
 from ppo.model import PolicyValueNet, sample_action, compute_gae, load_mil_encoder_for_warmstart
 from utils.exp_logger import log_exception, setup_experiment_logger
-from inference.vllm_hidden_extractor import VLLMHiddenStateExtractor
+from inference.sglang_runner import SGLangRunner
 
 
 def _load_config(path: str) -> Dict[str, Any]:
@@ -199,7 +199,7 @@ def train_ppo(
     config_path: str,
     train_path: str,
     mil_ckpt: str | None = None,
-    tensor_parallel_size: int | str = "auto",
+    parallel_size: int | str = "auto",
     run_name: str | None = None,
     log_dir: str = "logs",
     backend: str = "sglang",
@@ -229,6 +229,8 @@ def train_ppo(
     # and destroyed after each batch to avoid GPU conflict with gen LLM).
     hs_layer_ids = [int(x) for x in cfg["inference"].get("eagle_aux_hidden_state_layer_ids", [28])]
     hs_needed = feature_mode in {"hidden_states", "all"}
+    if hs_needed and backend == "vllm":
+        raise ValueError("vLLM does not support hidden state extraction. Use --backend sglang.")
 
     max_iterations = int(cfg["ppo"]["training"]["max_iterations"])
     early_stop_patience = int(cfg["ppo"]["training"]["early_stop_patience"])
@@ -252,7 +254,7 @@ def train_ppo(
     model_path = cfg["inference"]["model_name_or_path"]
     gpu_mem = float(cfg["inference"].get("gpu_memory_utilization", 0.90))
 
-    if isinstance(tensor_parallel_size, str) and tensor_parallel_size == "auto":
+    if isinstance(parallel_size, str) and parallel_size == "auto":
         import os as _os
         visible = _os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
         if visible:
@@ -261,33 +263,30 @@ def train_ppo(
         else:
             tp_size = 1
     else:
-        tp_size = max(1, int(tensor_parallel_size))
+        tp_size = max(1, int(parallel_size))
 
     if backend == "vllm":
-        from vllm import LLM
-        max_model_len = max_new_tokens + 2048
-        llm = LLM(
-            model=model_path,
-            tensor_parallel_size=tp_size, max_model_len=max_model_len,
+        from inference.vllm_runner import VLLMFeatureExporter
+        runner = VLLMFeatureExporter(
+            model_name_or_path=model_path,
+            max_new_tokens=max_new_tokens,
+            parallel_size=tp_size,
             gpu_memory_utilization=gpu_mem,
+            feature_mode=feature_mode,
         )
-        tokenizer = llm.get_tokenizer()
-        logger.info("vLLM ready tp_size=%d max_model_len=%d", tp_size, max_model_len)
+        tokenizer = runner.tokenizer
+        logger.info("VLLMFeatureExporter ready parallel_size=%d", tp_size)
     else:
         # sglang (default)
-        from sglang import Engine
-        max_model_len = max_new_tokens + 2048
-        engine = Engine(
-            model_path=model_path,
-            tp_size=tp_size,
-            mem_fraction_static=gpu_mem,
-            context_length=max_new_tokens + 2048,
-            random_seed=seed,
-            log_level="error",
-            enable_return_hidden_states=True,
+        runner = SGLangRunner(
+            model_name_or_path=model_path,
+            max_new_tokens=max_new_tokens,
+            parallel_size=tp_size,
+            gpu_memory_utilization=gpu_mem,
+            feature_mode=feature_mode,
         )
-        tokenizer = engine.tokenizer_manager.tokenizer
-        logger.info("SGLang ready tp_size=%d", tp_size)
+        tokenizer = runner.tokenizer
+        logger.info("SGLangRunner ready parallel_size=%d", tp_size)
 
     device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -428,7 +427,7 @@ def train_ppo(
 
             if backend == "vllm":
                 # ---- vLLM path: batch generate + two-pass hidden extraction ----
-                outputs = llm.generate(round_prompts, round_params, use_tqdm=False)
+                outputs = runner.generate_raw(round_prompts, round_params)
 
                 for j, i in enumerate(round_indices):
                     req_outputs = outputs[j].outputs
@@ -448,28 +447,10 @@ def train_ppo(
                             ep_prefixes[i] += seg_text
                         hs_requests.append((i, new_tokens, out0, seg_text))
 
-                if hs_needed and hs_requests:
-                    del llm
-                    gc.collect(); torch.cuda.empty_cache(); time.sleep(2)
-                    hs_ext = VLLMHiddenStateExtractor(
-                        model_name_or_path=model_path, layer_ids=hs_layer_ids,
-                        tensor_parallel_size=1, gpu_memory_utilization=gpu_mem,
-                        max_model_len=max_model_len,
-                    )
-                    hs_prefixes_ = [ep_prefixes[i] for i, _, _, _ in hs_requests]
-                    hs_seg_texts_ = [st for _, _, _, st in hs_requests]
-                    all_hs = hs_ext.extract(hs_prefixes_, hs_seg_texts_)
-                    for k, (i, _, _, _) in enumerate(hs_requests):
-                        seg_hidden_map[i] = all_hs[k].tolist()
-                    hs_ext.cleanup(); del hs_ext
-                    gc.collect(); torch.cuda.empty_cache(); time.sleep(2)
-                    llm = LLM(model=model_path, tensor_parallel_size=tp_size,
-                              max_model_len=max_model_len, gpu_memory_utilization=gpu_mem)
-                    tokenizer = llm.get_tokenizer()
             else:
                 # ---- SGLang path: per-prompt generate + inline hidden states ----
                 for j, i in enumerate(round_indices):
-                    output = engine.generate(
+                    output = runner.generate_raw(
                         round_prompts[j], round_params[j],
                         return_logprob=True,
                         top_logprobs_num=top_k_logits if feature_mode in {"topk_logits","all"} else 1,
@@ -671,7 +652,7 @@ def main() -> None:
     train_path = args.train_data or cfg["paths"]["train_dataset"]
     mil_ckpt = args.mil_ckpt or cfg["paths"]["mil_ckpt"]
     try:
-        train_ppo(args.config, train_path, mil_ckpt=mil_ckpt, tensor_parallel_size=args.tensor_parallel_size, run_name=args.run_name, log_dir=args.log_dir, backend=args.backend)
+        train_ppo(args.config, train_path, mil_ckpt=mil_ckpt, parallel_size=args.parallel_size, run_name=args.run_name, log_dir=args.log_dir, backend=args.backend)
     except Exception as exc:
         cfg = _load_config(args.config)
         logger, _, _ = setup_experiment_logger(component="train_ppo", run_name=args.run_name, log_dir=args.log_dir, config=cfg)

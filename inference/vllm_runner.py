@@ -36,22 +36,29 @@ class GenerationOutput:
 
 class VLLMFeatureExporter:
     def __init__(self, model_name_or_path: str, max_new_tokens: int = 256,
-                 tensor_parallel_size: int | str | None = "auto",
-                 gpu_memory_utilization: float = 0.90):
+                 parallel_size: int | str | None = "auto",
+                 gpu_memory_utilization: float = 0.90,
+                 feature_mode: str = "basic"):
+        if feature_mode in {"hidden_states", "all"}:
+            raise ValueError(
+                f"VLLMFeatureExporter does not support feature_mode={feature_mode!r}. "
+                f"Hidden state extraction requires SGLang. Use --backend sglang."
+            )
         self.model_name_or_path = model_name_or_path
         self.max_new_tokens = max_new_tokens
-        self.tensor_parallel_size = tensor_parallel_size
+        self.parallel_size = parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.feature_mode = feature_mode
         self._llm = None
         self._tokenizer = None
 
-    def _resolve_tensor_parallel_size(self) -> int:
-        if isinstance(self.tensor_parallel_size, int):
-            return max(1, self.tensor_parallel_size)
+    def _resolve_parallel_size(self) -> int:
+        if isinstance(self.parallel_size, int):
+            return max(1, self.parallel_size)
 
-        if isinstance(self.tensor_parallel_size, str) and self.tensor_parallel_size.lower() != "auto":
+        if isinstance(self.parallel_size, str) and self.parallel_size.lower() != "auto":
             try:
-                return max(1, int(self.tensor_parallel_size))
+                return max(1, int(self.parallel_size))
             except ValueError:
                 return 1
 
@@ -68,6 +75,17 @@ class VLLMFeatureExporter:
         except Exception:
             return 1
 
+    @property
+    def tokenizer(self):
+        """The tokenizer from the LLM (lazy-init)."""
+        self._lazy_init()
+        return self._tokenizer
+
+    def generate_raw(self, prompts, sampling_params):
+        """Forward to ``llm.generate()``.  For per-segment PPO generation."""
+        self._lazy_init()
+        return self._llm.generate(prompts, sampling_params, use_tqdm=False)
+
     def _lazy_init(self) -> None:
         if self._llm is not None:
             return
@@ -75,7 +93,7 @@ class VLLMFeatureExporter:
             from vllm import LLM
         except ImportError as exc:
             raise RuntimeError("vLLM is required for online feature export.") from exc
-        tp_size = self._resolve_tensor_parallel_size()
+        tp_size = self._resolve_parallel_size()
         max_model_len = self.max_new_tokens + 2048  # prompt headroom + output
         self._llm = LLM(model=self.model_name_or_path,
                         tensor_parallel_size=tp_size,
@@ -180,7 +198,6 @@ class VLLMFeatureExporter:
         self,
         rendered_prompt: str,
         gen: GenerationOutput,
-        feature_mode: str,
         temperature: float,
     ) -> Dict[str, Any]:
         features: List[TokenFeature] = []
@@ -196,7 +213,7 @@ class VLLMFeatureExporter:
 
             # basic / hidden_states: logprob + entropy only
             # topk_logits / all: + top-16 logprob values
-            if feature_mode in {"topk_logits", "all"}:
+            if self.feature_mode in {"topk_logits", "all"}:
                 tk_logits = dist
             else:
                 tk_logits = None
@@ -227,7 +244,6 @@ class VLLMFeatureExporter:
         self,
         prompts: List[str],
         temperatures: List[float],
-        feature_mode: str = "basic",
         top_k_logits: int = 16,
         use_math_chat_prompt: bool = False,
         system_prompt: Optional[str] = None,
@@ -288,7 +304,6 @@ class VLLMFeatureExporter:
             payloads.append(self._build_feature_payload(
                 rendered_prompt=rendered_prompts[prompt_idx],
                 gen=gen,
-                feature_mode=feature_mode,
                 temperature=temperatures[temp_idx],
             ))
         return payloads
@@ -301,7 +316,6 @@ class VLLMFeatureExporter:
         self,
         prompt: str,
         temperature: float,
-        feature_mode: str,
         top_k_logits: int = 16,
         use_math_chat_prompt: bool = False,
         system_prompt: Optional[str] = None,
@@ -309,7 +323,6 @@ class VLLMFeatureExporter:
         return self.export_token_features_batch(
             prompts=[prompt],
             temperature=temperature,
-            feature_mode=feature_mode,
             top_k_logits=top_k_logits,
             use_math_chat_prompt=use_math_chat_prompt,
             system_prompt=system_prompt,
@@ -319,7 +332,6 @@ class VLLMFeatureExporter:
         self,
         prompts: List[str],
         temperature: float,
-        feature_mode: str,
         top_k_logits: int = 16,
         use_math_chat_prompt: bool = False,
         system_prompt: Optional[str] = None,
@@ -343,8 +355,7 @@ class VLLMFeatureExporter:
                 self._build_feature_payload(
                     rendered_prompt=rendered_prompt,
                     gen=gen,
-                    feature_mode=feature_mode,
-                    temperature=temperature,
+                            temperature=temperature,
                 )
             )
         return payloads
