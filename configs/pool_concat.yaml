@@ -40,8 +40,8 @@ inference:
     - Do not include any explanations, headers, or summaries outside the steps.
     - The response must end immediately after the final paragraph containing \boxed{}.
   num_votes: 8
-  top_k_logits: 16
-  feature_mode: topk_logits
+  top_k_logprobs: 4096
+  feature_mode: topk_logprobs
   api:
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     max_concurrent: 16
@@ -49,7 +49,7 @@ inference:
 
 mil:
   model:
-    hidden_dim: 256
+    hidden_dim: 1024
     aggregator: attention
     use_position: true
     use_gru: true
@@ -64,7 +64,7 @@ mil:
 
 ppo:
   model:
-    hidden_dim: 256
+    hidden_dim: 1024
   training:
     max_iterations: 200
     early_stop_patience: 10

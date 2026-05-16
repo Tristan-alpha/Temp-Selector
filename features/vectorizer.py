@@ -13,13 +13,13 @@ from typing import Any, Dict, List
 def token_to_vec(token_feat: Dict[str, Any], obs_dim: int) -> List[float]:
     """Convert a dict of per-token features into a fixed-dim observation vector.
 
-    Merge order: logprob, entropy, topk_logits, hidden.  This groups
+    Merge order: logprob, entropy, topk_logprobs, hidden.  This groups
     semantically related features — logprob and entropy capture individual
     token certainty, top-k logprobs capture distribution shape, and hidden
     states (when available) add representation-level information.
 
     Defaults: logprob=-20.0 (~log(2e-9), near-zero probability — maximum
-    uncertainty), entropy=0.0.  Missing optional fields (topk_logits, hidden)
+    uncertainty), entropy=0.0.  Missing optional fields (topk_logprobs, hidden)
     are treated as empty lists.  If the merged vector exceeds ``obs_dim``,
     trailing features are truncated; if shorter, zeros are appended.
     """
@@ -27,7 +27,7 @@ def token_to_vec(token_feat: Dict[str, Any], obs_dim: int) -> List[float]:
         float(token_feat.get("logprob", -20.0)),
         float(token_feat.get("entropy", 0.0)),
     ]
-    topk = token_feat.get("topk_logits") or []
+    topk = token_feat.get("topk_logprobs") or []
     hidden = token_feat.get("hidden") or []
     merged = base + [float(x) for x in topk] + [float(x) for x in hidden]
     if len(merged) >= obs_dim:
@@ -38,12 +38,12 @@ def token_to_vec(token_feat: Dict[str, Any], obs_dim: int) -> List[float]:
 def token_to_obs(
     logprob: float,
     entropy_val: float,
-    topk_logits: List[float],
+    topk_logprobs: List[float],
     obs_dim: int,
 ) -> List[float]:
     """Convert scalar per-token features into a fixed-dim observation vector."""
     base = [float(logprob), float(entropy_val)]
-    merged = base + [float(x) for x in (topk_logits or [])]
+    merged = base + [float(x) for x in (topk_logprobs or [])]
     if len(merged) >= obs_dim:
         return merged[:obs_dim]
     return merged + [0.0] * (obs_dim - len(merged))

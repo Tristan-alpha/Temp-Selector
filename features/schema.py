@@ -10,7 +10,7 @@ class TokenFeature:
     text: str
     logprob: float
     entropy: float
-    topk_logits: Optional[List[float]] = None
+    topk_logprobs: Optional[List[float]] = None
     hidden: Optional[List[float]] = None
 
 

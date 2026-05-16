@@ -81,8 +81,8 @@ def _compute_mil_instance_loss(inst_logit, mask, y):
             continue
         if y[i].item() > 0.5:
             k = max(1, n_valid // 3)
-            topk_logits, topk_idx = torch.topk(inst_logit[i, :n_valid], k)
-            loss_pos = bce(topk_logits, torch.ones(k, device=device))
+            topk_logprobs, topk_idx = torch.topk(inst_logit[i, :n_valid], k)
+            loss_pos = bce(topk_logprobs, torch.ones(k, device=device))
             all_idx = set(range(n_valid))
             rest_idx = torch.tensor(sorted(all_idx - set(topk_idx.tolist())), device=device)
             if len(rest_idx) > 0:
@@ -146,8 +146,8 @@ def _compute_pure_instance_loss(inst_logit, mask, y):
         scores = inst_logit[i, :n_valid]
         if y[i].item() > 0.5:
             k = 1
-            topk_logits, topk_idx = torch.topk(scores, k)
-            loss_pos = bce(topk_logits, torch.ones(k, device=device))
+            topk_logprobs, topk_idx = torch.topk(scores, k)
+            loss_pos = bce(topk_logprobs, torch.ones(k, device=device))
             all_idx = set(range(n_valid))
             rest_idx = torch.tensor(sorted(all_idx - set(topk_idx.tolist())), device=device)
             if len(rest_idx) > 0:

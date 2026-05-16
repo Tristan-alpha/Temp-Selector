@@ -139,7 +139,7 @@ class SGLangRunner:
         self,
         prompts: List[str],
         temperatures: List[float],
-        top_k_logits: int = 16,
+        top_k_logprobs: int = 16,
         use_math_chat_prompt: bool = False,
         system_prompt: Optional[str] = None,
         num_votes: int = 1,
@@ -157,8 +157,8 @@ class SGLangRunner:
             ]
 
         need_hidden = self.feature_mode in {"hidden_states", "all"}
-        need_logprobs = self.feature_mode in {"topk_logits", "all"}
-        top_k = top_k_logits if need_logprobs else 1
+        need_logprobs = self.feature_mode in {"topk_logprobs", "all"}
+        top_k = top_k_logprobs if need_logprobs else 1
 
         n_temps = len(temperatures)
         n_prompts = len(rendered_prompts)
@@ -212,7 +212,7 @@ class SGLangRunner:
         self,
         prompts: List[str],
         temperature: float,
-        top_k_logits: int = 16,
+        top_k_logprobs: int = 16,
         use_math_chat_prompt: bool = False,
         system_prompt: Optional[str] = None,
         num_votes: int = 1,
@@ -220,7 +220,7 @@ class SGLangRunner:
         return self.export_token_features_multi_temp(
             prompts=prompts,
             temperatures=[temperature],
-            top_k_logits=top_k_logits,
+            top_k_logprobs=top_k_logprobs,
             use_math_chat_prompt=use_math_chat_prompt,
             system_prompt=system_prompt,
             num_votes=num_votes,
@@ -260,7 +260,7 @@ class SGLangRunner:
             lp = logprob_tuples[global_pos][0] if global_pos < len(logprob_tuples) else -20.0
 
             topk_list: Optional[List[float]] = None
-            if self.feature_mode in {"topk_logits", "all"} and global_pos < len(top_logprob_tuples):
+            if self.feature_mode in {"topk_logprobs", "all"} and global_pos < len(top_logprob_tuples):
                 topk_list = [t[0] for t in top_logprob_tuples[global_pos]]
 
             probs = [math.exp(v) for v in (topk_list or [lp])]
@@ -282,7 +282,7 @@ class SGLangRunner:
                 text=token_text,
                 logprob=float(lp),
                 entropy=float(ent),
-                topk_logits=topk_list,
+                topk_logprobs=topk_list,
             ))
 
         response_text = output.get("text", "")
@@ -293,42 +293,80 @@ class SGLangRunner:
         }
 
     # ------------------------------------------------------------------
-    # Hidden state extraction
     # ------------------------------------------------------------------
+    # Hidden state & logprob extraction
+    # ------------------------------------------------------------------
+
+    def extract_hidden(
+        self,
+        prompts: List[str],
+        responses: List[str],
+    ) -> List[torch.Tensor]:
+        """Return per-response hidden state tensors (native dtype)."""
+        self._lazy_init()
+
+        full_texts = [p + r for p, r in zip(prompts, responses)]
+        outputs = self._engine.generate(
+            full_texts,
+            [{"max_new_tokens": 1, "temperature": 0.0}] * len(full_texts),
+            return_hidden_states=True,
+        )
+
+        results: List[torch.Tensor] = []
+        for prompt, output in zip(prompts, outputs):
+            hs = output.get("meta_info", {}).get("hidden_states")
+            prompt_len = len(self._tokenizer.encode(prompt))
+            if hs is None:
+                results.append(torch.zeros(1, 4096, dtype=torch.float32))
+                continue
+            hs_chunk = hs[max(0, prompt_len - 1):]
+            if not isinstance(hs_chunk, torch.Tensor):
+                hs_chunk = torch.tensor(hs_chunk)
+            results.append(hs_chunk)
+        return results
+
+    def extract_logprobs(
+        self,
+        prompts: List[str],
+        responses: List[str],
+        temperatures: Optional[List[float]] = None,
+        top_k: int = 4096,
+    ) -> List[torch.Tensor]:
+        """Return per-response top-k logprob tensors (float32).
+
+        Each tensor has shape ``[n_response_tokens, top_k]``.
+        If ``temperatures`` is given, each sample uses its original
+        generation temperature for consistent logprob scaling.
+        """
+        self._lazy_init()
+
+        full_texts = [p + r for p, r in zip(prompts, responses)]
+        temps = temperatures or [0.0] * len(full_texts)
+        batch_params = [{"max_new_tokens": 1, "temperature": t} for t in temps]
+        outputs = self._engine.generate(
+            full_texts, batch_params,
+            return_logprob=True,
+            top_logprobs_num=top_k,
+        )
+
+        results: List[torch.Tensor] = []
+        for prompt, output in zip(prompts, outputs):
+            meta = output.get("meta_info", {})
+            prompt_len = len(self._tokenizer.encode(prompt))
+            tp_list = meta.get("output_top_logprobs", [])
+            # Slice out response portion
+            tp_slice = tp_list[prompt_len:]
+            if not tp_slice:
+                results.append(torch.zeros(1, top_k))
+                continue
+            lp_tensor = torch.tensor([[t[0] for t in row] for row in tp_slice])
+            results.append(lp_tensor)
+        return results
 
     def extract(
         self,
         prompts: List[str],
         responses: List[str],
     ) -> List[torch.Tensor]:
-        """Return per-response hidden state tensors (native dtype).
-
-        Each returned tensor has shape ``[n_response_tokens, hidden_size]``.
-        The hidden state at position ``prompt_len - 1`` produces the logits
-        for the first response token, so slices from that offset.
-        """
-        self._lazy_init()
-
-        full_texts = [p + r for p, r in zip(prompts, responses)]
-        batch_params = [{"max_new_tokens": 1, "temperature": 0.0}] * len(full_texts)
-
-        outputs = self._engine.generate(
-            full_texts, batch_params,
-            return_hidden_states=True,
-        )
-
-        results: List[torch.Tensor] = []
-        for i, (prompt, output) in enumerate(zip(prompts, outputs)):
-            meta = output.get("meta_info", {})
-            hs = meta.get("hidden_states")
-            prompt_len = len(self._tokenizer.encode(prompt))
-            # h[i] → token[i+1], so response hidden starts at prompt_len - 1
-            start = max(0, prompt_len - 1)
-            if hs is None:
-                results.append(torch.zeros(1, 4096, dtype=torch.float32))
-                continue
-            hs_chunk = hs[start : prompt_len - 1 + len(self._tokenizer.encode(responses[i]))]
-            if not isinstance(hs_chunk, torch.Tensor):
-                hs_chunk = torch.tensor(hs_chunk)
-            results.append(hs_chunk)
-        return results
+        """Alias for :meth:`extract_hidden` (backward compat)."""
+        return self.extract_hidden(prompts, responses)

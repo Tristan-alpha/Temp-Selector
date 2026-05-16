@@ -57,7 +57,7 @@ def _extract_segment_obs(token_ids: List[int], logprobs_list: List[Any],
 
     When hidden_states is provided (feature_mode=hidden_states or all),
     mean-pools the hidden state vectors and concatenates with standard
-    logprob/entropy/topk_logits features (or returns hidden-only for
+    logprob/entropy/topk_logprobs features (or returns hidden-only for
     hidden_states mode).
     """
     if not token_ids or not logprobs_list:
@@ -79,7 +79,7 @@ def _extract_segment_obs(token_ids: List[int], logprobs_list: List[Any],
             selected_lp = float(getattr(lp_item, 'logprob', -20.0))
             logprob_vals = [selected_lp] * top_k
         entropy_val = compute_entropy(logprob_vals)
-        obs = token_to_vec({"logprob": selected_lp, "entropy": entropy_val, "topk_logits": logprob_vals}, obs_dim)
+        obs = token_to_vec({"logprob": selected_lp, "entropy": entropy_val, "topk_logprobs": logprob_vals}, obs_dim)
         token_obs.append(obs)
 
     std_vec: List[float] = []
@@ -143,7 +143,7 @@ def _extract_segment_obs_sglang(token_ids: List[int], logprob_vals: List[float],
             topk_list = [lp] * top_k
             entropy_val = 0.0
 
-        obs = token_to_vec({"logprob": float(lp), "entropy": float(entropy_val), "topk_logits": topk_list}, obs_dim)
+        obs = token_to_vec({"logprob": float(lp), "entropy": float(entropy_val), "topk_logprobs": topk_list}, obs_dim)
         token_obs.append(obs)
 
     std_vec: List[float] = []
@@ -219,7 +219,7 @@ def train_ppo(
     n_actions = len(temp_bins)
     segment_size = int(cfg["data"]["segment_size"])
     max_new_tokens = int(cfg["inference"]["max_new_tokens"])
-    top_k_logits = int(cfg["inference"]["top_k_logits"])
+    top_k_logprobs = int(cfg["inference"]["top_k_logprobs"])
     num_votes = int(cfg["inference"].get("num_votes", 1))
     system_prompt = cfg["inference"].get("system_prompt", "")
     use_math_chat = bool(cfg["inference"].get("use_math_chat_prompt", True))
@@ -413,7 +413,7 @@ def train_ppo(
 
                 if backend == "vllm":
                     round_params.append(SamplingParams(
-                        n=V, temperature=temp, max_tokens=segment_size, logprobs=top_k_logits,
+                        n=V, temperature=temp, max_tokens=segment_size, logprobs=top_k_logprobs,
                     ))
                 else:
                     round_params.append({"max_new_tokens": segment_size, "temperature": temp, "n": V})
@@ -453,7 +453,7 @@ def train_ppo(
                     output = runner.generate_raw(
                         round_prompts[j], round_params[j],
                         return_logprob=True,
-                        top_logprobs_num=top_k_logits if feature_mode in {"topk_logits","all"} else 1,
+                        top_logprobs_num=top_k_logprobs if feature_mode in {"topk_logprobs","all"} else 1,
                         return_hidden_states=hs_needed,
                     )
                     output = output[0] if isinstance(output, list) else output
@@ -494,7 +494,7 @@ def train_ppo(
             if backend == "vllm":
                 for i, new_tokens, out0, _ in hs_requests:
                     obs = _extract_segment_obs(
-                        new_tokens, out0.logprobs, obs_dim, top_k_logits,
+                        new_tokens, out0.logprobs, obs_dim, top_k_logprobs,
                         hidden_states=seg_hidden_map.get(i),
                         feature_mode=feature_mode,
                     )
@@ -502,7 +502,7 @@ def train_ppo(
             else:
                 for i, new_tokens, lp_vals, tp_vals, _ in hs_requests:
                     obs = _extract_segment_obs_sglang(
-                        new_tokens, lp_vals, obs_dim, top_k_logits,
+                        new_tokens, lp_vals, obs_dim, top_k_logprobs,
                         topk_logprob_vals=tp_vals,
                         hidden_states=seg_hidden_map.get(i),
                         feature_mode=feature_mode,
@@ -642,17 +642,21 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--train-data", default=None, help="Override paths.train_dataset from config")
     parser.add_argument("--mil-ckpt", default=None, help="Override paths.mil_ckpt from config")
-    parser.add_argument("--tensor-parallel-size", default="auto")
-    parser.add_argument("--backend", default="sglang", choices=["sglang", "vllm"],
-                        help="Inference backend: sglang (default) or vllm (legacy)")
+    parser.add_argument("--parallel-size", default=None,
+                        help="Override inference.parallel_size from config")
+    parser.add_argument("--backend", default=None, choices=["sglang", "vllm"],
+                        help="Override inference.backend from config")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     args = parser.parse_args()
     cfg = _load_config(args.config)
     train_path = args.train_data or cfg["paths"]["train_dataset"]
     mil_ckpt = args.mil_ckpt or cfg["paths"]["mil_ckpt"]
+    inf = cfg.get("inference", {})
+    backend = args.backend or inf.get("backend", "sglang")
+    psize = args.parallel_size or inf.get("parallel_size", "auto")
     try:
-        train_ppo(args.config, train_path, mil_ckpt=mil_ckpt, parallel_size=args.parallel_size, run_name=args.run_name, log_dir=args.log_dir, backend=args.backend)
+        train_ppo(args.config, train_path, mil_ckpt=mil_ckpt, parallel_size=psize, run_name=args.run_name, log_dir=args.log_dir, backend=backend)
     except Exception as exc:
         cfg = _load_config(args.config)
         logger, _, _ = setup_experiment_logger(component="train_ppo", run_name=args.run_name, log_dir=args.log_dir, config=cfg)

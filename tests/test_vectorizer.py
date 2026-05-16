@@ -10,7 +10,7 @@ OBS_DIM = 64
 # ═══ token_to_vec ═══
 
 def test_token_to_vec_normal():
-    feat = {"logprob": -2.0, "entropy": 1.5, "topk_logits": [0.1] * 16}
+    feat = {"logprob": -2.0, "entropy": 1.5, "topk_logprobs": [0.1] * 16}
     v = token_to_vec(feat, OBS_DIM)
     assert len(v) == OBS_DIM
     assert v[0] == -2.0
@@ -29,7 +29,7 @@ def test_token_to_vec_missing_fields():
 
 
 def test_token_to_vec_truncation():
-    feat = {"logprob": -1.0, "entropy": 0.5, "topk_logits": list(range(100))}
+    feat = {"logprob": -1.0, "entropy": 0.5, "topk_logprobs": list(range(100))}
     v = token_to_vec(feat, 10)
     assert len(v) == 10
     assert v[0] == -1.0
@@ -37,7 +37,7 @@ def test_token_to_vec_truncation():
 
 
 def test_token_to_vec_with_hidden():
-    feat = {"logprob": -1.0, "entropy": 0.5, "topk_logits": [0.1], "hidden": [0.5] * 4}
+    feat = {"logprob": -1.0, "entropy": 0.5, "topk_logprobs": [0.1], "hidden": [0.5] * 4}
     v = token_to_vec(feat, 64)
     assert v[3] == 0.5
 
@@ -45,14 +45,14 @@ def test_token_to_vec_with_hidden():
 # ═══ token_to_obs ═══
 
 def test_token_to_obs_normal():
-    obs = token_to_obs(logprob=-1.5, entropy_val=1.2, topk_logits=[0.1] * 16, obs_dim=OBS_DIM)
+    obs = token_to_obs(logprob=-1.5, entropy_val=1.2, topk_logprobs=[0.1] * 16, obs_dim=OBS_DIM)
     assert len(obs) == OBS_DIM
     assert obs[0] == -1.5
     assert obs[1] == 1.2
 
 
 def test_token_to_obs_truncation():
-    obs = token_to_obs(logprob=-1.0, entropy_val=0.5, topk_logits=list(range(100)), obs_dim=10)
+    obs = token_to_obs(logprob=-1.0, entropy_val=0.5, topk_logprobs=list(range(100)), obs_dim=10)
     assert len(obs) == 10
 
 

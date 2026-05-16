@@ -90,7 +90,7 @@ class OnlineTemperatureEvaluator:
         self.hidden_dim = int(config["ppo"]["model"]["hidden_dim"])
         self.temp_bins = [float(x) for x in config["data"]["temp_bins"]]
         self.n_actions = len(self.temp_bins)
-        self.top_k_logits = int(config["inference"]["top_k_logits"])
+        self.top_k_logprobs = int(config["inference"]["top_k_logprobs"])
         self.num_votes = int(config["inference"].get("num_votes", 1))
         self.system_prompt = config["inference"].get("system_prompt", "")
         self.use_math_chat = bool(config["inference"].get("use_math_chat_prompt", True))
@@ -154,10 +154,10 @@ class OnlineTemperatureEvaluator:
                 logprob_vals = sorted(
                     [float(v.logprob) for v in lp_item.values()],
                     reverse=True,
-                )[:self.top_k_logits]
+                )[:self.top_k_logprobs]
             else:
                 selected_lp = float(getattr(lp_item, 'logprob', -20.0))
-                logprob_vals = [selected_lp] * self.top_k_logits
+                logprob_vals = [selected_lp] * self.top_k_logprobs
 
             entropy_val = compute_entropy(logprob_vals)
             token_obs.append(token_to_obs(selected_lp, entropy_val, logprob_vals, self.obs_dim))
@@ -215,7 +215,7 @@ class OnlineTemperatureEvaluator:
                 all_temps[i].append(temp)
                 round_params.append(SamplingParams(
                     n=V, temperature=temp, max_tokens=self.segment_size,
-                    logprobs=self.top_k_logits,
+                    logprobs=self.top_k_logprobs,
                 ))
                 round_indices.append(i)
 
@@ -335,7 +335,7 @@ def main() -> None:
     parser.add_argument("--config", required=True, help="Path to YAML config")
     parser.add_argument("--ppo-ckpt", default=None, help="Override paths.ppo_ckpt from config")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--tensor-parallel-size", default="auto")
+    parser.add_argument("--parallel-size", default="auto")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--output", default=None, help="Optional path to save metrics JSON")

@@ -142,7 +142,7 @@ def build_dataset(
         exported_batch = exporter.export_token_features_multi_temp(
             prompts=all_questions,
             temperatures=all_temps,
-            top_k_logits=int(inf_cfg["top_k_logits"]),
+            top_k_logprobs=int(inf_cfg["top_k_logprobs"]),
             use_math_chat_prompt=bool(inf_cfg.get("use_math_chat_prompt", True)),
             system_prompt=inf_cfg.get("system_prompt", DEFAULT_MATH_SYSTEM_PROMPT),
             num_votes=num_votes,
@@ -154,7 +154,7 @@ def build_dataset(
 
         # Build sample dicts.  For hidden_states/all mode we collect them
         # in memory, split by group, and write train/val/test directly.
-        # For basic/topk_logits we write all_dataset.jsonl inline.
+        # For basic/topk_logprobs we write all_dataset.jsonl inline.
         # ------------------------------------------------------------------
         if fmode in {"hidden_states", "all"}:
             # --- Merged build+split: write train/val/test JSONL (no safetensors sidecar).
@@ -181,6 +181,8 @@ def build_dataset(
                         n_samples += 1
                         n_positive += (1 - majority_label)
                         token_features = exported["token_features"]
+                        for tf in token_features:
+                            tf.topk_logprobs = None
                         vid_suffix = f"_v{v}" if num_votes > 1 else ""
 
                         sample = BagSample(
@@ -241,6 +243,8 @@ def build_dataset(
                             n_samples += 1
                             n_positive += (1 - majority_label)
                             token_features = exported["token_features"]
+                            for tf in token_features:
+                                tf.topk_logprobs = None
                             vid_suffix = f"_v{v}" if num_votes > 1 else ""
                             sample = BagSample(
                                 sample_id=f"{row_obj['sample_base']}_t{temp}{vid_suffix}",

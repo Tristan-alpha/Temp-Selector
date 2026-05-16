@@ -30,7 +30,7 @@ class GenerationOutput:
     tokens: List[str]
     token_ids: List[int]
     logprobs: List[float]
-    topk_logits: Optional[List[List[float]]]
+    topk_logprobs: Optional[List[List[float]]]
     hidden_states: Optional[List[List[float]]]
 
 
@@ -134,10 +134,10 @@ class VLLMFeatureExporter:
         chunks.append("[ASSISTANT]\n")
         return "\n\n".join(chunks)
 
-    def generate(self, prompt: str, temperature: float, top_k_logits: int = 16) -> GenerationOutput:
-        return self.generate_batch(prompts=[prompt], temperature=temperature, top_k_logits=top_k_logits)[0]
+    def generate(self, prompt: str, temperature: float, top_k_logprobs: int = 16) -> GenerationOutput:
+        return self.generate_batch(prompts=[prompt], temperature=temperature, top_k_logprobs=top_k_logprobs)[0]
 
-    def _to_generation_output(self, out: Any, top_k_logits: int) -> GenerationOutput:
+    def _to_generation_output(self, out: Any, top_k_logprobs: int) -> GenerationOutput:
         token_ids = out.token_ids
         logprobs = []
         topk = []
@@ -158,22 +158,22 @@ class VLLMFeatureExporter:
                     lp = max(vals) if vals else -20.0
                 logprobs.append(float(lp.logprob if hasattr(lp, "logprob") else lp))
                 vals = [float(v.logprob if hasattr(v, "logprob") else v) for v in lp_dict.values()]
-                vals = sorted(vals, reverse=True)[:top_k_logits]
+                vals = sorted(vals, reverse=True)[:top_k_logprobs]
                 topk.append(vals)
             else:
                 logprobs.append(-20.0)
-                topk.append([-20.0] * top_k_logits)
+                topk.append([-20.0] * top_k_logprobs)
 
         return GenerationOutput(
             text=out.text,
             tokens=tokens,
             token_ids=token_ids,
             logprobs=logprobs,
-            topk_logits=topk,
+            topk_logprobs=topk,
             hidden_states=None,
         )
 
-    def generate_batch(self, prompts: List[str], temperature: float, top_k_logits: int = 16, num_votes: int = 1) -> List[GenerationOutput]:
+    def generate_batch(self, prompts: List[str], temperature: float, top_k_logprobs: int = 16, num_votes: int = 1) -> List[GenerationOutput]:
         if not prompts:
             return []
 
@@ -184,14 +184,14 @@ class VLLMFeatureExporter:
             n=num_votes,
             temperature=temperature,
             max_tokens=self.max_new_tokens,
-            logprobs=max(1, top_k_logits),
+            logprobs=max(1, top_k_logprobs),
         )
         outputs = self._llm.generate(prompts, sampling_params)
 
         parsed: List[GenerationOutput] = []
         for req_out in outputs:
             for out in req_out.outputs:
-                parsed.append(self._to_generation_output(out=out, top_k_logits=top_k_logits))
+                parsed.append(self._to_generation_output(out=out, top_k_logprobs=top_k_logprobs))
         return parsed
 
     def _build_feature_payload(
@@ -203,7 +203,7 @@ class VLLMFeatureExporter:
         features: List[TokenFeature] = []
         for i, tid in enumerate(gen.token_ids):
             logprob = gen.logprobs[i]
-            dist = gen.topk_logits[i] if gen.topk_logits else [logprob]
+            dist = gen.topk_logprobs[i] if gen.topk_logprobs else [logprob]
             probs = [math.exp(v) for v in dist]
             z = sum(probs) + 1e-12
             entropy = 0.0
@@ -212,8 +212,8 @@ class VLLMFeatureExporter:
                 entropy -= pn * math.log(max(pn, 1e-12))
 
             # basic / hidden_states: logprob + entropy only
-            # topk_logits / all: + top-16 logprob values
-            if self.feature_mode in {"topk_logits", "all"}:
+            # topk_logprobs / all: + top-16 logprob values
+            if self.feature_mode in {"topk_logprobs", "all"}:
                 tk_logits = dist
             else:
                 tk_logits = None
@@ -224,7 +224,7 @@ class VLLMFeatureExporter:
                     text=gen.tokens[i] if i < len(gen.tokens) else "",
                     logprob=float(logprob),
                     entropy=float(entropy),
-                    topk_logits=tk_logits,
+                    topk_logprobs=tk_logits,
                     hidden=None,  # requires speculative decoding backend
                 )
             )
@@ -244,7 +244,7 @@ class VLLMFeatureExporter:
         self,
         prompts: List[str],
         temperatures: List[float],
-        top_k_logits: int = 16,
+        top_k_logprobs: int = 16,
         use_math_chat_prompt: bool = False,
         system_prompt: Optional[str] = None,
         num_votes: int = 1,
@@ -285,7 +285,7 @@ class VLLMFeatureExporter:
                     n=num_votes,
                     temperature=temp,
                     max_tokens=self.max_new_tokens,
-                    logprobs=max(1, top_k_logits),
+                    logprobs=max(1, top_k_logprobs),
                 ))
 
         outputs = self._llm.generate(all_prompts, all_params)
@@ -294,7 +294,7 @@ class VLLMFeatureExporter:
         gens: List[GenerationOutput] = []
         for req_out in outputs:
             for out in req_out.outputs:
-                gens.append(self._to_generation_output(out=out, top_k_logits=top_k_logits))
+                gens.append(self._to_generation_output(out=out, top_k_logprobs=top_k_logprobs))
 
         # Build payloads
         payloads: List[Dict[str, Any]] = []
@@ -316,14 +316,14 @@ class VLLMFeatureExporter:
         self,
         prompt: str,
         temperature: float,
-        top_k_logits: int = 16,
+        top_k_logprobs: int = 16,
         use_math_chat_prompt: bool = False,
         system_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         return self.export_token_features_batch(
             prompts=[prompt],
             temperature=temperature,
-            top_k_logits=top_k_logits,
+            top_k_logprobs=top_k_logprobs,
             use_math_chat_prompt=use_math_chat_prompt,
             system_prompt=system_prompt,
         )[0]
@@ -332,7 +332,7 @@ class VLLMFeatureExporter:
         self,
         prompts: List[str],
         temperature: float,
-        top_k_logits: int = 16,
+        top_k_logprobs: int = 16,
         use_math_chat_prompt: bool = False,
         system_prompt: Optional[str] = None,
         num_votes: int = 1,
@@ -346,7 +346,7 @@ class VLLMFeatureExporter:
                 self.render_messages(self.build_math_messages(question=p, system_prompt=system_prompt)) for p in prompts
             ]
 
-        gens = self.generate_batch(prompts=rendered_prompts, temperature=temperature, top_k_logits=top_k_logits, num_votes=num_votes)
+        gens = self.generate_batch(prompts=rendered_prompts, temperature=temperature, top_k_logprobs=top_k_logprobs, num_votes=num_votes)
         payloads = []
         for i, gen in enumerate(gens):
             prompt_idx = i // num_votes

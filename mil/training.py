@@ -39,6 +39,7 @@ class BagDataset(Dataset):
         bin_map = {float(v): i for i, v in enumerate(temp_bins)}
 
         need_hidden = feature_mode in {"hidden_states", "all"} and extractor is not None
+        need_logprobs = feature_mode in {"topk_logprobs", "all"} and extractor is not None
 
         # Load all rows from JSONL
         all_rows = []
@@ -48,21 +49,33 @@ class BagDataset(Dataset):
                     continue
                 all_rows.append(json.loads(line))
 
-        if need_hidden:
-            # Batch extract hidden states, pool, and store
+        def _extract_and_pool(batch_rows, extract_fn, field):
+            """Extract via extract_fn, patch field into token features, pool."""
+            prompts = [r["metadata"]["rendered_prompt"] if "metadata" in r and "rendered_prompt" in r.get("metadata", {})
+                       else r["prompt"] for r in batch_rows]
+            responses = [r["response"] for r in batch_rows]
+            tensors = extract_fn(prompts, responses)
+            for row, t in zip(batch_rows, tensors):
+                token_features = row.get("token_features", [])
+                t_list = t.tolist() if hasattr(t, "tolist") else t
+                for j in range(min(len(t_list), len(token_features))):
+                    token_features[j][field] = t_list[j]
+
+        if need_hidden or need_logprobs:
             for batch_start in range(0, len(all_rows), hidden_batch_size):
                 batch_rows = all_rows[batch_start:batch_start + hidden_batch_size]
-                prompts = [r["metadata"]["rendered_prompt"] if "metadata" in r and "rendered_prompt" in r.get("metadata", {})
-                           else r["prompt"] for r in batch_rows]
-                responses = [r["response"] for r in batch_rows]
-                hs_tensors = extractor.extract(prompts, responses)
+                if need_hidden:
+                    _extract_and_pool(batch_rows, extractor.extract_hidden, "hidden")
+                if need_logprobs:
+                    temps = [float(r.get("temperature", 0.0)) for r in batch_rows]
+                    _extract_and_pool(
+                        batch_rows,
+                        lambda p, r: extractor.extract_logprobs(p, r, temperatures=temps),
+                        "topk_logprobs",
+                    )
 
-                for row, hs in zip(batch_rows, hs_tensors):
+                for row in batch_rows:
                     token_features = row.get("token_features", [])
-                    hs_list = hs.tolist() if hasattr(hs, "tolist") else hs
-                    for j in range(min(len(hs_list), len(token_features))):
-                        token_features[j]["hidden"] = hs_list[j]
-
                     token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
                                    for tf in token_features]
                     response = row.get("response", "")
@@ -320,8 +333,8 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
                     # ---- positive bag (wrong answer) ----
                     if instance_loss_method == "topk":
                         k = max(1, n_valid // 3)
-                        topk_logits, topk_idx = torch.topk(scores, k)
-                        loss_pos = bce(topk_logits, torch.ones(k, device=device))
+                        topk_logprobs, topk_idx = torch.topk(scores, k)
+                        loss_pos = bce(topk_logprobs, torch.ones(k, device=device))
                         all_idx = set(range(n_valid))
                         rest_idx = torch.tensor(sorted(all_idx - set(topk_idx.tolist())), device=device)
                         if len(rest_idx) > 0:
@@ -335,8 +348,8 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
 
                     elif instance_loss_method == "pure":
                         k = 1
-                        topk_logits, topk_idx = torch.topk(scores, k)
-                        loss_pos = bce(topk_logits, torch.ones(k, device=device))
+                        topk_logprobs, topk_idx = torch.topk(scores, k)
+                        loss_pos = bce(topk_logprobs, torch.ones(k, device=device))
                         all_idx = set(range(n_valid))
                         rest_idx = torch.tensor(sorted(all_idx - set(topk_idx.tolist())), device=device)
                         if len(rest_idx) > 0:
