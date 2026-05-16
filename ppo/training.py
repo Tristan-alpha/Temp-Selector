@@ -21,7 +21,7 @@ import torch.optim as optim
 import yaml
 
 from features.segmenter import segment_pooling
-from features.vectorizer import token_to_vec, compute_entropy
+from features.vectorizer import token_to_vec, compute_entropy, mean_pool_obs
 from utils.jsonl import sample_prefix
 from mil.model import MILModel
 from ppo.model import PolicyValueNet, sample_action, compute_gae, load_mil_encoder_for_warmstart
@@ -52,7 +52,7 @@ def _load_prompts(path: str, logger=None) -> List[Dict[str, Any]]:
 def _extract_segment_obs(token_ids: List[int], logprobs_list: List[Any],
                          obs_dim: int, top_k: int,
                          hidden_states: Optional[List[List[float]]] = None,
-                         feature_mode: str = "basic") -> Optional[List[float]]:
+                         feature_mode: str = "basic") -> Optional[torch.Tensor]:
     """Mean-pool per-token features into one segment observation vector.
 
     When hidden_states is provided (feature_mode=hidden_states or all),
@@ -64,7 +64,7 @@ def _extract_segment_obs(token_ids: List[int], logprobs_list: List[Any],
         return None
 
     # Standard logprob features
-    token_obs: List[List[float]] = []
+    token_obs: List[torch.Tensor] = []
     for tid, lp_item in zip(token_ids, logprobs_list):
         if lp_item is None:
             continue
@@ -79,44 +79,38 @@ def _extract_segment_obs(token_ids: List[int], logprobs_list: List[Any],
             selected_lp = float(getattr(lp_item, 'logprob', -20.0))
             logprob_vals = [selected_lp] * top_k
         entropy_val = compute_entropy(logprob_vals)
-        obs = token_to_vec({"logprob": selected_lp, "entropy": entropy_val, "topk_logprobs": logprob_vals}, obs_dim)
+        obs = token_to_vec({"logprob": selected_lp, "entropy": entropy_val}, obs_dim,
+                           extracted={"topk_logprobs": torch.tensor(logprob_vals, dtype=torch.float32)})
         token_obs.append(obs)
 
-    std_vec: List[float] = []
+    std_vec: Optional[torch.Tensor] = None
     if feature_mode != "hidden_states":
         if not token_obs:
             return None
-        avg = [0.0] * obs_dim
-        for row in token_obs:
-            for i, v in enumerate(row):
-                avg[i] += v
-        denom = float(len(token_obs))
-        std_vec = [v / denom for v in avg]
+        std_vec = mean_pool_obs(token_obs, obs_dim)
 
     # Hidden state features
     if hidden_states is not None and feature_mode in {"hidden_states", "all"}:
         n_hs = len(hidden_states)
         if n_hs == 0:
-            return std_vec if std_vec else None
-        hs_dim = len(hidden_states[0])
-        hs_pooled = [0.0] * hs_dim
-        for hs in hidden_states:
-            for j, v in enumerate(hs):
-                hs_pooled[j] += v
-        hs_pooled = [v / n_hs for v in hs_pooled]
+            return std_vec
+        hs_tensor = torch.tensor(hidden_states, dtype=torch.float32)
+        hs_pooled = hs_tensor.mean(dim=0)
         if feature_mode == "hidden_states":
             return hs_pooled
         # all: concatenate
-        return std_vec + hs_pooled
+        if std_vec is not None:
+            return torch.cat([std_vec, hs_pooled])
+        return hs_pooled
 
-    return std_vec if std_vec else None
+    return std_vec
 
 
 def _extract_segment_obs_sglang(token_ids: List[int], logprob_vals: List[float],
                                  obs_dim: int, top_k: int,
                                  topk_logprob_vals: Optional[List[float]] = None,
                                  hidden_states: Optional[List[List[float]]] = None,
-                                 feature_mode: str = "basic") -> Optional[List[float]]:
+                                 feature_mode: str = "basic") -> Optional[torch.Tensor]:
     """Same as _extract_segment_obs but for SGLang's flat logprob format."""
     if not token_ids or not logprob_vals:
         return None
@@ -124,10 +118,9 @@ def _extract_segment_obs_sglang(token_ids: List[int], logprob_vals: List[float],
     tk_num = len(token_ids)
     logprobs_per_token = len(logprob_vals) // max(1, tk_num)
 
-    token_obs: List[List[float]] = []
+    token_obs: List[torch.Tensor] = []
     for pos, (tid, lp) in enumerate(zip(token_ids, logprob_vals)):
         if pos < logprobs_per_token * tk_num:
-            # Extract top-k logprobs for this token
             if topk_logprob_vals and len(topk_logprob_vals) >= (pos + 1) * top_k:
                 topk_list = topk_logprob_vals[pos * top_k : (pos + 1) * top_k]
             else:
@@ -143,35 +136,29 @@ def _extract_segment_obs_sglang(token_ids: List[int], logprob_vals: List[float],
             topk_list = [lp] * top_k
             entropy_val = 0.0
 
-        obs = token_to_vec({"logprob": float(lp), "entropy": float(entropy_val), "topk_logprobs": topk_list}, obs_dim)
+        obs = token_to_vec({"logprob": float(lp), "entropy": float(entropy_val)}, obs_dim,
+                           extracted={"topk_logprobs": torch.tensor(topk_list, dtype=torch.float32)})
         token_obs.append(obs)
 
-    std_vec: List[float] = []
+    std_vec: Optional[torch.Tensor] = None
     if feature_mode != "hidden_states":
         if not token_obs:
             return None
-        avg = [0.0] * obs_dim
-        for row in token_obs:
-            for i, v in enumerate(row):
-                avg[i] += v
-        denom = float(len(token_obs))
-        std_vec = [v / denom for v in avg]
+        std_vec = mean_pool_obs(token_obs, obs_dim)
 
     if hidden_states is not None and feature_mode in {"hidden_states", "all"}:
         n_hs = len(hidden_states)
         if n_hs == 0:
-            return std_vec if std_vec else None
-        hs_dim = len(hidden_states[0])
-        hs_pooled = [0.0] * hs_dim
-        for hs in hidden_states:
-            for j, v in enumerate(hs):
-                hs_pooled[j] += v
-        hs_pooled = [v / n_hs for v in hs_pooled]
+            return std_vec
+        hs_tensor = torch.tensor(hidden_states, dtype=torch.float32)
+        hs_pooled = hs_tensor.mean(dim=0)
         if feature_mode == "hidden_states":
             return hs_pooled
-        return std_vec + hs_pooled
+        if std_vec is not None:
+            return torch.cat([std_vec, hs_pooled])
+        return hs_pooled
 
-    return std_vec if std_vec else None
+    return std_vec
 
 
 def load_train_prompts(dataset_path: str) -> list:

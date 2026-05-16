@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Iterable, List
 
+import torch
+
 from features.schema import Segment, clamp_segment
 
 
@@ -70,50 +72,44 @@ def _char_to_token(cum_char: List[int], char_pos: int) -> int:
 # ═══════════════════════════════════════════════════════════════
 
 def segment_pooling(
-    token_vecs: List[List[float]],
+    token_tensor: torch.Tensor,
     spans: List[Segment],
     obs_dim: int,
     mode: str = "mean",
     segment_size: int = 32,
-) -> List[List[float]]:
+) -> torch.Tensor:
     """Aggregate per-token feature vectors into per-segment instance vectors.
 
-    ``"mean"`` — average over tokens (works for any segment mode).
-    ``"concat"`` — flatten tokens, zero-pad or truncate to `segment_size × obs_dim`.
-        Only makes sense with fixed_window segmentation (equal token counts).
+    ``token_tensor``: [n_tokens, obs_dim] float32.
+    Returns [n_segments, obs_dim] float32.
+
+    ``"mean"`` — average over tokens via ``chunk.mean(dim=0)``.
+    ``"concat"`` — flatten tokens, zero-pad or truncate to ``segment_size × obs_dim``.
 
     Span boundaries are clamped: start is clipped to [0, n_tokens], end is
     clipped to [start+1, n_tokens] so that every span produces at least one
-    token.  An empty input returns a single zero-vector to satisfy the
-    expectation that a bag always has at least one instance.
-    ``"concat"`` — concatenate token vectors; shorter segments are zero-padded
-    to *segment_size × obs_dim*.  Only makes sense with ``fixed_window``.
+    token.  An empty input returns a single zero-vector.
     """
-    out: List[List[float]] = []
+    n_tokens = token_tensor.shape[0]
+    out: List[torch.Tensor] = []
     for s in spans:
-        st, ed = s.start, s.end
-        st = max(0, min(st, len(token_vecs)))
-        ed = max(st + 1, min(ed, len(token_vecs)))
-        chunk = token_vecs[st:ed]
-        if not chunk:
-            out.append([0.0] * obs_dim)
+        st = max(0, min(s.start, n_tokens))
+        ed = max(st + 1, min(s.end, n_tokens))
+        chunk = token_tensor[st:ed]
+        if chunk.shape[0] == 0:
+            out.append(torch.zeros(obs_dim))
             continue
         if mode == "concat":
-            flat = [v for row in chunk for v in row]
+            flat = chunk.reshape(-1)
             target_len = segment_size * obs_dim
-            if len(flat) < target_len:
-                flat += [0.0] * (target_len - len(flat))
+            if flat.shape[0] < target_len:
+                flat = torch.cat([flat, torch.zeros(target_len - flat.shape[0])])
             out.append(flat[:target_len])
         else:  # mean
-            avg = [0.0] * obs_dim
-            for row in chunk:
-                for i, v in enumerate(row):
-                    avg[i] += v
-            denom = float(len(chunk))
-            out.append([v / denom for v in avg])
+            out.append(chunk.mean(dim=0))
     if not out:
-        out = [[0.0] * obs_dim]
-    return out
+        return torch.zeros(1, obs_dim)
+    return torch.stack(out)
 
 
 # ═══════════════════════════════════════════════════════════════

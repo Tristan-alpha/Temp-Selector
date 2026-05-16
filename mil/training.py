@@ -61,31 +61,24 @@ def make_collate_fn(
     need_hidden = feature_mode in {"hidden_states", "all"} and extractor is not None
     need_logprobs = feature_mode in {"topk_logprobs", "all"} and extractor is not None
 
-    def _patch_features(batch_rows, field, tensors):
-        """Patch extracted tensor rows into token_features dicts inline."""
-        for row, t in zip(batch_rows, tensors):
-            token_features = row.get("token_features", [])
-            for j in range(min(t.shape[0], len(token_features))):
-                token_features[j][field] = t[j].tolist()
-
     def collate_fn(batch_rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        hidden_tensors = None
+        logprob_tensors = None
         if need_hidden or need_logprobs:
             full_ids = [r["_full_ids"] for r in batch_rows]
             prompt_lens = [r["_prompt_len"] for r in batch_rows]
 
             if need_hidden:
                 hidden_tensors = extractor.extract_hidden_from_ids(full_ids, prompt_lens)
-                _patch_features(batch_rows, "hidden", hidden_tensors)
             if need_logprobs:
                 temps = [float(r.get("temperature", 0.0)) for r in batch_rows]
                 logprob_tensors = extractor.extract_logprobs_from_ids(full_ids, prompt_lens, temperatures=temps)
-                _patch_features(batch_rows, "topk_logprobs", logprob_tensors)
 
         instances_list: List[torch.Tensor] = []
         labels: List[float] = []
         temp_indices: List[int] = []
 
-        for row in batch_rows:
+        for i, row in enumerate(batch_rows):
             token_features = row.get("token_features", [])
             if not token_features:
                 instances_list.append(torch.zeros(1, instance_dim))
@@ -94,6 +87,19 @@ def make_collate_fn(
                 temp_indices.append(bin_map.get(t_val, 0))
                 continue
 
+            h_t = hidden_tensors[i] if hidden_tensors is not None else None
+            l_t = logprob_tensors[i] if logprob_tensors is not None else None
+
+            token_vecs = []
+            for j, tf in enumerate(token_features):
+                extra: Dict[str, torch.Tensor] = {}
+                if h_t is not None and j < h_t.shape[0]:
+                    extra["hidden"] = h_t[j]
+                if l_t is not None and j < l_t.shape[0]:
+                    extra["topk_logprobs"] = l_t[j]
+                token_vecs.append(token_to_vec(tf, instance_dim, extra if extra else None))
+
+            t = torch.stack(token_vecs)  # [n_tokens, instance_dim]
             token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
                            for tf in token_features]
             response = row.get("response", "")
@@ -101,10 +107,9 @@ def make_collate_fn(
                 tokens=token_texts, mode=segment_mode,
                 segment_size=segment_size, response=response,
             )
-            token_vecs = [token_to_vec(tf, instance_dim) for tf in token_features]
-            inst_vecs = segment_pooling(token_vecs, spans, instance_dim,
-                                       mode=pooling_mode, segment_size=segment_size)
-            instances_list.append(torch.tensor(inst_vecs, dtype=torch.float32))
+            inst = segment_pooling(t, spans, instance_dim,
+                                   mode=pooling_mode, segment_size=segment_size)
+            instances_list.append(inst)
             labels.append(float(row.get("label", 0)))
             t_val = float(row.get("temperature", temp_bins[0]))
             temp_indices.append(bin_map.get(t_val, 0))
@@ -312,7 +317,8 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
             dynamic_head.train()
 
         sum_loss = 0.0
-        for batch in loader:
+        n_batches = len(loader)
+        for batch_idx, batch in enumerate(loader):
             x = batch["instances"].to(device)
             mask = batch["mask"].to(device)
             y = batch["label"].to(device)
@@ -419,11 +425,16 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
 
             sum_loss += float(loss.item())
 
+            logger.info("epoch=%d batch=%d/%d loss=%.4f bag=%.4f inst=%.4f",
+                         epoch + 1, batch_idx + 1, n_batches,
+                         float(loss.item()), float(loss_bag.item()),
+                         float(loss_inst.item()))
+
         avg = sum_loss / max(1, len(loader))
 
         # ---- validation + early stopping ----
         separation = _validate()
-        logger.info("epoch=%d loss=%.6f separation=%.4f best=%.4f patience=%d/%d",
+        logger.info("epoch=%d done avg_loss=%.6f separation=%.4f best=%.4f patience=%d/%d",
                      epoch + 1, avg, separation, best_separation,
                      patience_counter, early_stop_patience)
 

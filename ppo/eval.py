@@ -137,11 +137,11 @@ class OnlineTemperatureEvaluator:
             parts = [f"[SYSTEM]\n{self.system_prompt}", f"[USER]\n{question}", "[ASSISTANT]\n"]
             return "\n\n".join(parts)
 
-    def _extract_segment_obs(self, token_ids: List[int], logprobs_list: List[Any]) -> Optional[List[float]]:
+    def _extract_segment_obs(self, token_ids: List[int], logprobs_list: List[Any]) -> Optional[torch.Tensor]:
         if not token_ids or not logprobs_list:
             return None
 
-        token_obs: List[List[float]] = []
+        token_obs: List[torch.Tensor] = []
         for tid, lp_item in zip(token_ids, logprobs_list):
             if lp_item is None:
                 continue

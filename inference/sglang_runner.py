@@ -460,10 +460,3 @@ class SGLangRunner:
             results.append(lp_tensor)
         return results
 
-    def extract(
-        self,
-        prompts: List[str],
-        responses: List[str],
-    ) -> List[torch.Tensor]:
-        """Alias for :meth:`extract_hidden` (backward compat)."""
-        return self.extract_hidden(prompts, responses)
