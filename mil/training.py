@@ -3,8 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
@@ -18,126 +17,114 @@ from mil.model import MILModel, DynamicTempHead, GlobalTempHead, smoothness_loss
 from utils.exp_logger import log_exception, setup_experiment_logger
 
 
-@dataclass
-class RowTensor:
-    instances: torch.Tensor
-    label: torch.Tensor
-    temp_idx: torch.Tensor
-
-
 def load_config(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 class BagDataset(Dataset):
-    def __init__(self, data_path: str, temp_bins: List[float], instance_dim: int,
-                 pooling_mode: str = "mean", segment_size: int = 32,
-                 segment_mode: str = "step", feature_mode: str = "basic",
-                 extractor=None, hidden_batch_size: int = 256):
-        self.rows: List[Tuple[torch.Tensor, int, int]] = []
-        bin_map = {float(v): i for i, v in enumerate(temp_bins)}
+    """Lazy dataset: stores row metadata only.  Feature extraction happens in collate_fn."""
 
-        need_hidden = feature_mode in {"hidden_states", "all"} and extractor is not None
-        need_logprobs = feature_mode in {"topk_logprobs", "all"} and extractor is not None
-
-        # Load all rows from JSONL
-        all_rows = []
+    def __init__(self, data_path: str):
+        self.rows: List[Dict[str, Any]] = []
         with open(data_path, "r", encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
                     continue
-                all_rows.append(json.loads(line))
-
-        def _extract_and_pool(batch_rows, extract_fn, field):
-            """Extract via extract_fn, patch field into token features, pool."""
-            prompts = [r["metadata"]["rendered_prompt"] if "metadata" in r and "rendered_prompt" in r.get("metadata", {})
-                       else r["prompt"] for r in batch_rows]
-            responses = [r["response"] for r in batch_rows]
-            tensors = extract_fn(prompts, responses)
-            for row, t in zip(batch_rows, tensors):
-                token_features = row.get("token_features", [])
-                t_list = t.tolist() if hasattr(t, "tolist") else t
-                for j in range(min(len(t_list), len(token_features))):
-                    token_features[j][field] = t_list[j]
-
-        if need_hidden or need_logprobs:
-            for batch_start in range(0, len(all_rows), hidden_batch_size):
-                batch_rows = all_rows[batch_start:batch_start + hidden_batch_size]
-                if need_hidden:
-                    _extract_and_pool(batch_rows, extractor.extract_hidden, "hidden")
-                if need_logprobs:
-                    temps = [float(r.get("temperature", 0.0)) for r in batch_rows]
-                    _extract_and_pool(
-                        batch_rows,
-                        lambda p, r: extractor.extract_logprobs(p, r, temperatures=temps),
-                        "topk_logprobs",
-                    )
-
-                for row in batch_rows:
-                    token_features = row.get("token_features", [])
-                    token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
-                                   for tf in token_features]
-                    response = row.get("response", "")
-                    spans = build_segments(
-                        tokens=token_texts, mode=segment_mode,
-                        segment_size=segment_size, response=response,
-                    )
-                    token_vecs = [token_to_vec(tf, instance_dim) for tf in token_features]
-                    inst_vecs = segment_pooling(token_vecs, spans, instance_dim,
-                                               mode=pooling_mode, segment_size=segment_size)
-                    instances = torch.tensor(inst_vecs, dtype=torch.float32)
-                    label = int(row.get("label", 0))
-                    t = float(row.get("temperature", temp_bins[0]))
-                    temp_idx = bin_map.get(t, 0)
-                    self.rows.append((instances, label, temp_idx))
-        else:
-            # Logprob-only features (no hidden states)
-            for row in all_rows:
-                token_features = row.get("token_features", [])
-                token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
-                               for tf in token_features]
-                response = row.get("response", "")
-                spans = build_segments(
-                    tokens=token_texts, mode=segment_mode,
-                    segment_size=segment_size, response=response,
-                )
-                token_vecs = [token_to_vec(tf, instance_dim) for tf in token_features]
-                inst_vecs = segment_pooling(token_vecs, spans, instance_dim,
-                                           mode=pooling_mode, segment_size=segment_size)
-                instances = torch.tensor(inst_vecs, dtype=torch.float32)
-                label = int(row.get("label", 0))
-                t = float(row.get("temperature", temp_bins[0]))
-                temp_idx = bin_map.get(t, 0)
-                self.rows.append((instances, label, temp_idx))
+                self.rows.append(json.loads(line))
 
     def __len__(self) -> int:
         return len(self.rows)
 
-    def __getitem__(self, idx: int) -> RowTensor:
-        ins, y, tidx = self.rows[idx]
-        return RowTensor(
-            instances=ins,
-            label=torch.tensor(y, dtype=torch.float32),
-            temp_idx=torch.tensor(tidx, dtype=torch.long),
-        )
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return self.rows[idx]
 
 
-def collate_rows(rows: List[RowTensor]) -> Dict[str, torch.Tensor]:
-    max_k = max(r.instances.shape[0] for r in rows)
-    d = rows[0].instances.shape[1]
-    b = len(rows)
-    x = torch.zeros((b, max_k, d), dtype=torch.float32)
-    mask = torch.zeros((b, max_k), dtype=torch.float32)
-    y = torch.stack([r.label for r in rows], dim=0)
-    t = torch.stack([r.temp_idx for r in rows], dim=0)
+def make_collate_fn(
+    extractor=None,
+    feature_mode: str = "basic",
+    instance_dim: int = 4098,
+    segment_mode: str = "step",
+    segment_size: int = 256,
+    pooling_mode: str = "mean",
+    temp_bins: List[float] | None = None,
+):
+    """Factory that returns a collate function with per-batch SGLang extraction.
 
-    for i, r in enumerate(rows):
-        k = r.instances.shape[0]
-        x[i, :k] = r.instances
-        mask[i, :k] = 1.0
+    The returned function receives a list of row dicts from BagDataset,
+    optionally extracts logprob/hidden features via SGLang, builds per-segment
+    instance vectors, and returns a padded batch dict for MIL training.
+    """
+    if temp_bins is None:
+        temp_bins = [0.0]
+    bin_map = {float(v): i for i, v in enumerate(temp_bins)}
+    need_hidden = feature_mode in {"hidden_states", "all"} and extractor is not None
+    need_logprobs = feature_mode in {"topk_logprobs", "all"} and extractor is not None
 
-    return {"instances": x, "mask": mask, "label": y, "temp_idx": t}
+    def _patch_features(batch_rows, field, tensors):
+        """Patch extracted tensor rows into token_features dicts inline."""
+        for row, t in zip(batch_rows, tensors):
+            token_features = row.get("token_features", [])
+            for j in range(min(t.shape[0], len(token_features))):
+                token_features[j][field] = t[j].tolist()
+
+    def collate_fn(batch_rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        if need_hidden or need_logprobs:
+            full_ids = [r["_full_ids"] for r in batch_rows]
+            prompt_lens = [r["_prompt_len"] for r in batch_rows]
+
+            if need_hidden:
+                hidden_tensors = extractor.extract_hidden_from_ids(full_ids, prompt_lens)
+                _patch_features(batch_rows, "hidden", hidden_tensors)
+            if need_logprobs:
+                temps = [float(r.get("temperature", 0.0)) for r in batch_rows]
+                logprob_tensors = extractor.extract_logprobs_from_ids(full_ids, prompt_lens, temperatures=temps)
+                _patch_features(batch_rows, "topk_logprobs", logprob_tensors)
+
+        instances_list: List[torch.Tensor] = []
+        labels: List[float] = []
+        temp_indices: List[int] = []
+
+        for row in batch_rows:
+            token_features = row.get("token_features", [])
+            if not token_features:
+                instances_list.append(torch.zeros(1, instance_dim))
+                labels.append(float(row.get("label", 0)))
+                t_val = float(row.get("temperature", temp_bins[0]))
+                temp_indices.append(bin_map.get(t_val, 0))
+                continue
+
+            token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
+                           for tf in token_features]
+            response = row.get("response", "")
+            spans = build_segments(
+                tokens=token_texts, mode=segment_mode,
+                segment_size=segment_size, response=response,
+            )
+            token_vecs = [token_to_vec(tf, instance_dim) for tf in token_features]
+            inst_vecs = segment_pooling(token_vecs, spans, instance_dim,
+                                       mode=pooling_mode, segment_size=segment_size)
+            instances_list.append(torch.tensor(inst_vecs, dtype=torch.float32))
+            labels.append(float(row.get("label", 0)))
+            t_val = float(row.get("temperature", temp_bins[0]))
+            temp_indices.append(bin_map.get(t_val, 0))
+
+        max_k = max(inst.shape[0] for inst in instances_list)
+        d = instances_list[0].shape[1]
+        b = len(instances_list)
+        x = torch.zeros((b, max_k, d), dtype=torch.float32)
+        mask = torch.zeros((b, max_k), dtype=torch.float32)
+        y = torch.tensor(labels, dtype=torch.float32)
+        t = torch.tensor(temp_indices, dtype=torch.long)
+
+        for i, inst in enumerate(instances_list):
+            k = inst.shape[0]
+            x[i, :k] = inst
+            mask[i, :k] = 1.0
+
+        return {"instances": x, "mask": mask, "label": y, "temp_idx": t}
+
+    return collate_fn
 
 
 def seed_everything(seed: int) -> None:
@@ -162,12 +149,11 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
     instance_dim = int(cfg["data"]["instance_dim"])
     hidden_dim = int(cfg["mil"]["model"]["hidden_dim"])
     feature_mode = cfg["inference"].get("feature_mode", "basic")
-    hidden_batch_size = int(cfg["mil"]["training"].get("hidden_batch_size", 256))
     backend = cfg["inference"].get("backend", "sglang")
 
-    # Create SGLang engine for online hidden state extraction
+    # Create SGLang engine for online feature extraction (shared across train + val)
     runner = None
-    if feature_mode in {"hidden_states", "all"} and backend == "sglang":
+    if feature_mode in {"topk_logprobs", "hidden_states", "all"} and backend == "sglang":
         from inference.sglang_runner import SGLangRunner
         runner = SGLangRunner(
             model_name_or_path=cfg["inference"]["model_name_or_path"],
@@ -175,31 +161,50 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
             parallel_size=cfg["inference"].get("parallel_size", "auto"),
             gpu_memory_utilization=float(cfg["inference"].get("gpu_memory_utilization", 0.90)),
             feature_mode=feature_mode,
+            log_level="info",
+            engine_preset="prefill",
         )
-        logger.info("SGLangRunner ready for online hidden extraction")
+        logger.info("SGLangRunner ready for online feature extraction")
 
-    dataset = BagDataset(
-        data_path=data_path, temp_bins=temp_bins, instance_dim=instance_dim,
-        pooling_mode=cfg["data"].get("segment_pooling", "mean"),
-        segment_size=int(cfg["data"].get("segment_size", 32)),
-        segment_mode=cfg["data"].get("segment_mode", "step"),
-        feature_mode=feature_mode,
-        extractor=runner,
-        hidden_batch_size=hidden_batch_size,
-    )
+    dataset = BagDataset(data_path=data_path)
     logger.info("dataset_size=%d", len(dataset))
+
+    # Pre-tokenize prompts once; response IDs come from token_features
+    # (preserves original generation tokenization across boundaries).
+    # SGLang receives pre-built input_ids, skipping internal tokenization.
+    if runner is not None:
+        prompts = [
+            r.get("metadata", {}).get("rendered_prompt") or r.get("prompt", "")
+            for r in dataset.rows
+        ]
+        if prompts:
+            encoded = runner.tokenizer(prompts, add_special_tokens=False)
+            for row, pids in zip(dataset.rows, encoded.input_ids):
+                resp_ids = [tf["token_id"] for tf in row.get("token_features", [])]
+                row["_full_ids"] = pids + resp_ids
+                row["_prompt_len"] = len(pids)
+            logger.info("pre_tokenized prompts batch_encoded=%d", len(prompts))
 
     device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     n_gpu = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
     logger.info("device=%s n_gpu=%d", device, n_gpu)
 
+    collate_fn = make_collate_fn(
+        extractor=runner,
+        feature_mode=feature_mode,
+        instance_dim=instance_dim,
+        segment_mode=cfg["data"].get("segment_mode", "step"),
+        segment_size=int(cfg["data"].get("segment_size", 32)),
+        pooling_mode=cfg["data"].get("segment_pooling", "mean"),
+        temp_bins=temp_bins,
+    )
+
     loader = DataLoader(
         dataset,
         batch_size=int(cfg["mil"]["training"]["batch_size"]),
         shuffle=True,
-        collate_fn=collate_rows,
-        pin_memory=True,
-        num_workers=2,
+        collate_fn=collate_fn,
+        num_workers=0,
     )
 
     mil = MILModel(
@@ -222,7 +227,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         params += list(global_head.parameters()) + list(dynamic_head.parameters())
     optimizer = optim.Adam(params, lr=float(cfg["mil"]["training"]["lr"]))
 
-    n_pos = sum(1 for _, label, _ in dataset.rows if label > 0.5)
+    n_pos = sum(1 for r in dataset.rows if float(r.get("label", 0)) > 0.5)
     n_neg = len(dataset.rows) - n_pos
     pos_weight = torch.tensor([(n_neg / max(1, n_pos)) ** 0.5], device=device)
     logger.info("bce_pos_weight=%.4f (n_wrong=%d n_correct=%d)", pos_weight.item(), n_pos, n_neg)
@@ -244,23 +249,26 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
 
     # ---- validation DataLoader for early stopping ----
     val_path = cfg["paths"]["val_dataset"]
-    val_dataset = BagDataset(
-        data_path=val_path, temp_bins=temp_bins, instance_dim=instance_dim,
-        pooling_mode=cfg["data"].get("segment_pooling", "mean"),
-        segment_size=int(cfg["data"].get("segment_size", 32)),
-        segment_mode=cfg["data"].get("segment_mode", "step"),
-        feature_mode=feature_mode,
-        extractor=runner,
-        hidden_batch_size=hidden_batch_size,
-    )
+    val_dataset = BagDataset(data_path=val_path)
+
+    if runner is not None:
+        prompts = [
+            r.get("metadata", {}).get("rendered_prompt") or r.get("prompt", "")
+            for r in val_dataset.rows
+        ]
+        if prompts:
+            encoded = runner.tokenizer(prompts, add_special_tokens=False)
+            for row, pids in zip(val_dataset.rows, encoded.input_ids):
+                resp_ids = [tf["token_id"] for tf in row.get("token_features", [])]
+                row["_full_ids"] = pids + resp_ids
+                row["_prompt_len"] = len(pids)
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(cfg["mil"]["training"]["batch_size"]),
         shuffle=False,
-        collate_fn=collate_rows,
-        pin_memory=True,
-        num_workers=2,
+        collate_fn=collate_fn,
+        num_workers=0,
     )
 
     def _validate() -> float:

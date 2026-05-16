@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from utils.exp_logger import setup_experiment_logger
 
 from mil.model import MILModel, DynamicTempHead, GlobalTempHead, smoothness_loss
-from mil.training import BagDataset, collate_rows
+from mil.training import BagDataset, make_collate_fn
 from utils.math import safe_div
 
 
@@ -197,7 +197,7 @@ def evaluate_mil(
     backend = config["inference"].get("backend", "sglang")
 
     runner = None
-    if feature_mode in {"hidden_states", "all"} and backend == "sglang":
+    if feature_mode in {"topk_logprobs", "hidden_states", "all"} and backend == "sglang":
         from inference.sglang_runner import SGLangRunner
         runner = SGLangRunner(
             model_name_or_path=config["inference"]["model_name_or_path"],
@@ -205,18 +205,33 @@ def evaluate_mil(
             parallel_size=config["inference"].get("parallel_size", "auto"),
             gpu_memory_utilization=float(config["inference"].get("gpu_memory_utilization", 0.90)),
             feature_mode=feature_mode,
+            engine_preset="prefill",
         )
 
-    dataset = BagDataset(
-        data_path=data_path, temp_bins=temp_bins, instance_dim=instance_dim,
-        pooling_mode=config["data"].get("segment_pooling", "mean"),
-        segment_size=int(config["data"].get("segment_size", 32)),
-        segment_mode=config["data"].get("segment_mode", "step"),
-        feature_mode=feature_mode,
+    dataset = BagDataset(data_path=data_path)
+
+    if runner is not None:
+        prompts = [
+            r.get("metadata", {}).get("rendered_prompt") or r.get("prompt", "")
+            for r in dataset.rows
+        ]
+        if prompts:
+            encoded = runner.tokenizer(prompts, add_special_tokens=False)
+            for row, pids in zip(dataset.rows, encoded.input_ids):
+                resp_ids = [tf["token_id"] for tf in row.get("token_features", [])]
+                row["_full_ids"] = pids + resp_ids
+                row["_prompt_len"] = len(pids)
+
+    collate_fn = make_collate_fn(
         extractor=runner,
-        hidden_batch_size=int(config["mil"]["training"].get("hidden_batch_size", 256)),
+        feature_mode=feature_mode,
+        instance_dim=instance_dim,
+        segment_mode=config["data"].get("segment_mode", "step"),
+        segment_size=int(config["data"].get("segment_size", 32)),
+        pooling_mode=config["data"].get("segment_pooling", "mean"),
+        temp_bins=temp_bins,
     )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_rows)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=0)
 
     all_bag_logits: List[torch.Tensor] = []
     all_bag_labels: List[torch.Tensor] = []

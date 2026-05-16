@@ -39,6 +39,7 @@ class SGLangRunner:
         gpu_memory_utilization: float = 0.90,
         feature_mode: str = "basic",
         log_level: str = "warn",
+        engine_preset: str = "decode",
     ):
         self.model_name_or_path = model_name_or_path
         self.max_new_tokens = max_new_tokens
@@ -46,6 +47,7 @@ class SGLangRunner:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.feature_mode = feature_mode
         self.log_level = log_level
+        self.engine_preset = engine_preset
         self._engine = None
         self._tokenizer = None
         self._resolve_device_count()
@@ -84,24 +86,48 @@ class SGLangRunner:
             return
         from sglang import Engine
 
-        self._engine = Engine(
+        # Shared args for both presets
+        engine_kwargs: Dict[str, Any] = dict(
             model_path=self.model_name_or_path,
             dp_size=self._tp,
             tp_size=1,
-            cuda_graph_max_bs=512,
-            max_running_requests=512,
-            schedule_policy="lpm",
             mem_fraction_static=self.gpu_memory_utilization,
             context_length=self.max_new_tokens + 2048,  # prompt headroom + output
-            schedule_conservativeness=0.3,
-            enable_mixed_chunk=True,
+            schedule_policy="lpm",  # APC: prompts share common question prefix
             pre_warm_nccl=True,
             enable_tokenizer_batch_encode=True,
-            num_continuous_decode_steps=8,
             random_seed=42,
             log_level=self.log_level,
             enable_return_hidden_states=self.feature_mode in {"hidden_states", "all"},
+            stream_interval=32,
         )
+
+        if self.engine_preset == "prefill":
+            # Prefill-heavy: feature extraction with max_new_tokens=1.
+            # Single decode step → no need for CUDA graphs, mixed chunk,
+            # or multi-step decode batching.
+            # Higher conservativeness to avoid OOM on large prefill batches.
+            engine_kwargs.update(
+                cuda_graph_max_bs=1,
+                max_running_requests=128,
+                schedule_conservativeness=0.3,
+                enable_mixed_chunk=False,
+                num_continuous_decode_steps=1,
+                max_prefill_tokens=1048576,
+                chunked_prefill_size=-1,
+                disable_cuda_graph=True,
+            )
+        else:
+            # Decode-heavy: generation with many decode steps (build_dataset, PPO).
+            engine_kwargs.update(
+                cuda_graph_max_bs=512,
+                max_running_requests=512,
+                schedule_conservativeness=0.3,
+                enable_mixed_chunk=True,
+                num_continuous_decode_steps=8,
+            )
+
+        self._engine = Engine(**engine_kwargs)
         from transformers import AutoTokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
 
@@ -302,13 +328,17 @@ class SGLangRunner:
         prompts: List[str],
         responses: List[str],
     ) -> List[torch.Tensor]:
-        """Return per-response hidden state tensors (native dtype)."""
+        """Return per-response hidden state tensors (native dtype).
+
+        Uses ``max_new_tokens=0`` for pure prefill — no decode step,
+        just a single forward pass through ``prompt + response``.
+        """
         self._lazy_init()
 
         full_texts = [p + r for p, r in zip(prompts, responses)]
         outputs = self._engine.generate(
             full_texts,
-            [{"max_new_tokens": 1, "temperature": 0.0}] * len(full_texts),
+            [{"max_new_tokens": 0, "temperature": 1.0}] * len(full_texts),
             return_hidden_states=True,
         )
 
@@ -335,14 +365,15 @@ class SGLangRunner:
         """Return per-response top-k logprob tensors (float32).
 
         Each tensor has shape ``[n_response_tokens, top_k]``.
-        If ``temperatures`` is given, each sample uses its original
-        generation temperature for consistent logprob scaling.
+        Uses ``max_new_tokens=0`` for pure prefill — no decode step.
+        Temperature defaults to 1.0 (raw logprobs, no scaling).
         """
         self._lazy_init()
 
         full_texts = [p + r for p, r in zip(prompts, responses)]
-        temps = temperatures or [0.0] * len(full_texts)
-        batch_params = [{"max_new_tokens": 1, "temperature": t} for t in temps]
+        batch_params = [{"max_new_tokens": 0, "temperature": 1.0}] * len(full_texts)
+        if temperatures is not None:
+            batch_params = [{"max_new_tokens": 0, "temperature": t} for t in temperatures]
         outputs = self._engine.generate(
             full_texts, batch_params,
             return_logprob=True,
@@ -356,6 +387,72 @@ class SGLangRunner:
             tp_list = meta.get("output_top_logprobs", [])
             # Slice out response portion
             tp_slice = tp_list[prompt_len:]
+            if not tp_slice:
+                results.append(torch.zeros(1, top_k))
+                continue
+            lp_tensor = torch.tensor([[t[0] for t in row] for row in tp_slice])
+            results.append(lp_tensor)
+        return results
+
+    # ------------------------------------------------------------------
+    # ID-based extraction (pre-tokenized, skip SGLang internal tokenization)
+    # ------------------------------------------------------------------
+
+    def extract_hidden_from_ids(
+        self,
+        full_ids: List[List[int]],
+        prompt_lens: List[int],
+    ) -> List[torch.Tensor]:
+        """Return per-response hidden states using pre-tokenized IDs.
+
+        Passes ``input_ids`` to SGLang to skip internal tokenization.
+        ``prompt_lens`` is pre-computed from the dataset.
+        """
+        self._lazy_init()
+
+        outputs = self._engine.generate(
+            input_ids=full_ids,
+            sampling_params=[{"max_new_tokens": 0, "temperature": 1.0}] * len(full_ids),
+            return_hidden_states=True,
+        )
+
+        results: List[torch.Tensor] = []
+        for p_len, output in zip(prompt_lens, outputs):
+            hs = output.get("meta_info", {}).get("hidden_states")
+            if hs is None:
+                results.append(torch.zeros(1, 4096, dtype=torch.float32))
+                continue
+            hs_chunk = hs[max(0, p_len - 1):]
+            if not isinstance(hs_chunk, torch.Tensor):
+                hs_chunk = torch.tensor(hs_chunk)
+            results.append(hs_chunk)
+        return results
+
+    def extract_logprobs_from_ids(
+        self,
+        full_ids: List[List[int]],
+        prompt_lens: List[int],
+        temperatures: Optional[List[float]] = None,
+        top_k: int = 4096,
+    ) -> List[torch.Tensor]:
+        """Return per-response top-k logprob tensors using pre-tokenized IDs."""
+        self._lazy_init()
+
+        batch_params = [{"max_new_tokens": 0, "temperature": 1.0}] * len(full_ids)
+        if temperatures is not None:
+            batch_params = [{"max_new_tokens": 0, "temperature": t} for t in temperatures]
+        outputs = self._engine.generate(
+            input_ids=full_ids,
+            sampling_params=batch_params,
+            return_logprob=True,
+            top_logprobs_num=top_k,
+        )
+
+        results: List[torch.Tensor] = []
+        for p_len, output in zip(prompt_lens, outputs):
+            meta = output.get("meta_info", {})
+            tp_list = meta.get("output_top_logprobs", [])
+            tp_slice = tp_list[p_len:]
             if not tp_slice:
                 results.append(torch.zeros(1, top_k))
                 continue

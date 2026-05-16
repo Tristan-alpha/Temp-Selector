@@ -13,7 +13,7 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 | `inference/sglang_runner.py` | `SGLangRunner` — **default** backend; single engine with `generate()` + `extract()` |
 | `inference/vllm_runner.py` | `VLLMFeatureExporter` — legacy backend (`--backend vllm`); raises ValueError for hidden_states mode |
 | `mil/model.py` | `MILModel`, temp heads, smoothness_loss — all MIL model definitions |
-| `mil/training.py` | `BagDataset`, `collate_rows`, `train_mil()` — Stage 2 training |
+| `mil/training.py` | `BagDataset`, `make_collate_fn`, `train()` — Stage 2 training |
 | `mil/eval.py` | `evaluate_mil()` + all MIL metric functions — Stage 2 evaluation |
 | `ppo/model.py` | `PolicyValueNet`, `compute_gae`, `sample_action`, warm-start — PPO model |
 | `ppo/training.py` | `train_ppo()` + online feature extraction — Stage 3 training |
@@ -35,9 +35,10 @@ Stage 1: JSONL prompts → multi-temp generation → BagSample (per prompt×temp
          BagSample = {token_features: [TokenFeature], segment_spans: [Segment], label: 0|1, ...}
          feature_mode=hidden_states/all → merged build+split → train/val/test JSONL (no sidecar)
               ↓
-Stage 2: BagDataset loads JSONL; for hidden_states/all: SGLang engine batch prefill
-         extracts per-token hidden states → segment_pooling → [K, 64] instance matrix
-         MILModel(instances) → {bag_logit, inst_logit, attn_w, encoder_out}
+Stage 2: BagDataset loads JSONL as list[dict] (metadata only).  make_collate_fn
+         produces a collate function that extracts logprob/hidden features per
+         training batch via SGLangRunner → segment_pooling → [K, 4098] instance
+         matrix.  MILModel(instances) → {bag_logit, inst_logit, attn_w, encoder_out}
          Loss = bag_bce + β×top_k_instance_bce + α×temp_ce + γ×smoothness
               ↓  warm-start backbone + inst_logit as shaping reward
 Stage 3: PolicyValueNet(segment_obs) → temperature action
@@ -62,6 +63,8 @@ Stage 3: PolicyValueNet(segment_obs) → temperature action
 - **Even vote ties**: `num_votes=8` in config. Majority threshold `(V+1)//2=4` means 4-4 ties are labeled "correct". Use odd vote counts to avoid this.
 - **Config section scoping**: `mil.model.hidden_dim` and `ppo.model.hidden_dim` are separate keys. The evaluator reads `ppo.model.hidden_dim` — do not use `model.hidden_dim` (that section was deleted).
 - **`inst_repr = out["encoder_out"]`**: In `mil/training.py`, the dynamic temp head MUST receive `encoder_out` (pos+GRU processed), not `mil.encoder(x)` (raw). The latter was Bug 1 — fixed but easily reintroduced.
+- **MIL DataLoader `num_workers=0`**: Feature extraction happens in collate_fn via SGLangRunner (cannot be pickled). Do NOT set num_workers > 0 or DataLoader will hang/fail.
+- **BagDataset is metadata-only**: Rows are raw dicts from JSONL, not pre-built tensors. Instance tensor construction happens in `make_collate_fn()`. The old `collate_rows` and `RowTensor` are deleted.
 
 ## Common tasks
 

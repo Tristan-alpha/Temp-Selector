@@ -1,27 +1,29 @@
 ## ADDED Requirements
 
-### Requirement: BagDataset extracts hidden states on init via engine prefill
+### Requirement: BagDataset stores metadata only, no extraction in init
 
-When `feature_mode` is `"hidden_states"` or `"all"`, `BagDataset.__init__` SHALL use a SGLang engine to batch-prefill all `prompt+response` pairs in the dataset, extract per-token hidden states from each output, and immediately compute per-segment 64-dim instance vectors via `segment_pooling`. No hidden states SHALL be persisted to disk.
+BagDataset SHALL store only row metadata during `__init__` (no SGLang calls, no tensor materialization). Feature extraction is deferred to the collate function, which is invoked once per training batch by the DataLoader.
 
-#### Scenario: BagDataset init with hidden_states mode
+#### Scenario: BagDataset init does not perform extraction
 
-- **WHEN** `BagDataset` loads a JSONL dataset with `feature_mode="hidden_states"` and a SGLang engine is available
-- **THEN** hidden states are extracted per sample via `engine.generate(prompt+response, max_new_tokens=1, return_hidden_states=True)`, pooled per segment, and stored as instance tensors in `self.rows`
+- **WHEN** `BagDataset` loads a JSONL dataset with any `feature_mode` (including `"hidden_states"` or `"all"`)
+- **THEN** no SGLang engine calls are made during `__init__`
+- **AND** rows are stored as lightweight dicts containing prompt, response, label, temperature, token_features (basic), and metadata
 
-#### Scenario: BagDataset init without hidden states
+#### Scenario: BagDataset getitem returns raw metadata
 
-- **WHEN** `BagDataset` loads with `feature_mode="basic"` or `"topk_logits"`
-- **THEN** no engine is needed, and segment vectors are computed from logprob features only (existing behavior)
+- **WHEN** `BagDataset.__getitem__` is called
+- **THEN** it returns the row dict as-is, without building any tensors
 
-### Requirement: engine is provided to BagDataset, not created internally
+### Requirement: engine is provided to collate_fn, not BagDataset
 
-`BagDataset` SHALL accept an external SGLang `Engine` object via constructor parameter, not create one internally. This allows the caller (MIL training script) to manage the engine lifecycle and use it across training + evaluation stages.
+The SGLangRunner SHALL be passed to the collate function (via `functools.partial`), not to `BagDataset`. `BagDataset.__init__` SHALL accept only `data_path` and no extractor parameter.
 
-#### Scenario: External engine passed to BagDataset
+#### Scenario: Engine passed to collate_fn
 
-- **WHEN** `train_mil()` creates a SGLang engine and passes it to `BagDataset`
-- **THEN** both train and val datasets use the same engine instance, which is shut down after training completes
+- **WHEN** `train_mil()` creates a SGLangRunner
+- **THEN** it passes the runner to `make_collate_fn(extractor=runner, ...)` for both train and val DataLoaders
+- **AND** BagDataset does not hold a reference to the runner
 
 ### Requirement: Build stage does not emit hidden states
 
