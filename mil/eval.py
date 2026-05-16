@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from utils.exp_logger import setup_experiment_logger
 
 from mil.model import MILModel, DynamicTempHead, GlobalTempHead, smoothness_loss
-from mil.training import BagDataset, make_collate_fn
+from mil.training import BagDataset, make_collate_fn, TokenBatchSampler
 from utils.math import safe_div
 
 
@@ -170,7 +170,7 @@ def evaluate_mil(
     hidden_dim = int(config["mil"]["model"]["hidden_dim"])
     temp_bins = [float(x) for x in config["data"]["temp_bins"]]
     n_temps = len(temp_bins)
-    batch_size = int(config["mil"]["training"]["batch_size"])
+    max_tokens_per_batch = int(config["mil"]["training"].get("max_tokens_per_batch", 100000))
 
     mil = MILModel(
         input_dim=instance_dim, hidden_dim=hidden_dim,
@@ -231,7 +231,9 @@ def evaluate_mil(
         pooling_mode=config["data"].get("segment_pooling", "mean"),
         temp_bins=temp_bins,
     )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=0)
+    token_counts = [len(r.get("_full_ids", r.get("token_features", []))) for r in dataset.rows]
+    eval_sampler = TokenBatchSampler(token_counts, max_tokens_per_batch, shuffle=False)
+    loader = DataLoader(dataset, batch_sampler=eval_sampler, collate_fn=collate_fn, num_workers=0)
 
     all_bag_logits: List[torch.Tensor] = []
     all_bag_labels: List[torch.Tensor] = []

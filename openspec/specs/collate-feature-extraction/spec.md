@@ -2,22 +2,26 @@
 
 ### Requirement: Collate function extracts features per training batch
 
-The MIL training collate function SHALL, for each training batch, invoke the SGLangRunner to extract per-token logprob features (and optionally hidden states when `feature_mode` is `"hidden_states"` or `"all"`), then immediately compute per-segment instance vectors via `token_to_vec` and `segment_pooling`, and pad to a uniform batch tensor.
+The MIL training collate function SHALL, for each training batch, invoke the SGLangRunner to extract per-token logprob features (and optionally hidden states), then compute per-segment instance vectors via `token_to_vec` and `segment_pooling`, and pad to a uniform batch tensor. Batch size SHALL be determined by a `TokenBatchSampler` that limits total tokens per batch to `max_tokens_per_batch` rather than a fixed bag count.
+
+#### Scenario: Token-based batch sizing
+
+- **WHEN** `TokenBatchSampler` accumulates sample indices with `max_tokens_per_batch=100000`
+- **THEN** each yielded batch contains as many samples as fit without exceeding 100K total `(prompt + response)` tokens
+- **AND** a single sample exceeding the limit is yielded alone in its own batch
+
+#### Scenario: Deterministic eval batches
+
+- **WHEN** `TokenBatchSampler` is used with `shuffle=False` for the val loader
+- **THEN** batch composition is deterministic across epochs
 
 #### Scenario: Collate with logprob extraction (topk_logprobs mode)
 
 - **WHEN** collate_fn receives a batch of rows with `feature_mode="topk_logprobs"` or `"all"`
 - **THEN** it calls `extractor.extract_logprobs(prompts, responses, temperatures=[...])` with per-sample temperatures
-- **AND** patches the returned logprob tensors into each row's token features
+- **AND** passes extracted tensors to `token_to_vec` via the `extracted` parameter (NOT stored in row dicts)
 - **AND** builds segment-level instance vectors via `token_to_vec` → `build_segments` → `segment_pooling`
-- **AND** returns a padded batch dict `{"instances": (B, max_K, D), "mask": (B, max_K), "label": (B,), "temp_idx": (B,)}`
-
-#### Scenario: Collate with hidden state extraction (hidden_states mode)
-
-- **WHEN** collate_fn receives a batch with `feature_mode="hidden_states"` or `"all"`
-- **THEN** it calls `extractor.extract_hidden(prompts, responses)` for per-token hidden states
-- **AND** patches the returned hidden state tensors into each row's token features
-- **AND** instance vectors are built as above
+- **AND** returns a padded batch dict
 
 #### Scenario: Collate with basic mode (no extraction)
 

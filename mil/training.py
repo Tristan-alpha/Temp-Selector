@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import yaml
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from features.segmenter import build_segments, segment_pooling
 from features.vectorizer import token_to_vec
@@ -20,6 +20,35 @@ from utils.exp_logger import log_exception, setup_experiment_logger
 def load_config(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+class TokenBatchSampler(Sampler):
+    """Group samples so each batch stays under ``max_tokens`` total (prompt + response)."""
+
+    def __init__(self, token_counts: List[int], max_tokens: int, shuffle: bool = True):
+        self.token_counts = token_counts
+        self.max_tokens = max_tokens
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        indices = list(range(len(self.token_counts)))
+        if self.shuffle:
+            random.shuffle(indices)
+        batch: List[int] = []
+        batch_tokens = 0
+        for idx in indices:
+            n = self.token_counts[idx]
+            if batch and batch_tokens + n > self.max_tokens:
+                yield batch
+                batch = []
+                batch_tokens = 0
+            batch.append(idx)
+            batch_tokens += n
+        if batch:
+            yield batch
+
+    def __len__(self) -> int:
+        return max(1, sum(self.token_counts) // max(1, self.max_tokens))
 
 
 class BagDataset(Dataset):
@@ -68,11 +97,14 @@ def make_collate_fn(
             full_ids = [r["_full_ids"] for r in batch_rows]
             prompt_lens = [r["_prompt_len"] for r in batch_rows]
 
+            torch.cuda.empty_cache()
+            extractor.resume_memory_occupation(tags=["kv_cache"])
             if need_hidden:
                 hidden_tensors = extractor.extract_hidden_from_ids(full_ids, prompt_lens)
             if need_logprobs:
                 temps = [float(r.get("temperature", 0.0)) for r in batch_rows]
                 logprob_tensors = extractor.extract_logprobs_from_ids(full_ids, prompt_lens, temperatures=temps)
+            extractor.release_memory_occupation(tags=["kv_cache"])
 
         instances_list: List[torch.Tensor] = []
         labels: List[float] = []
@@ -127,7 +159,9 @@ def make_collate_fn(
             x[i, :k] = inst
             mask[i, :k] = 1.0
 
-        return {"instances": x, "mask": mask, "label": y, "temp_idx": t}
+        batch_tokens = sum(len(r.get("_full_ids", r.get("token_features", []))) for r in batch_rows)
+
+        return {"instances": x, "mask": mask, "label": y, "temp_idx": t, "_batch_tokens": batch_tokens}
 
     return collate_fn
 
@@ -204,10 +238,14 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         temp_bins=temp_bins,
     )
 
+    max_tokens_per_batch = int(cfg["mil"]["training"].get("max_tokens_per_batch", 100000))
+    token_counts = [len(r.get("_full_ids", r.get("token_features", []))) for r in dataset.rows]
+    logger.info("max_tokens_per_batch=%d total_tokens=%d", max_tokens_per_batch, sum(token_counts))
+
+    train_sampler = TokenBatchSampler(token_counts, max_tokens_per_batch, shuffle=True)
     loader = DataLoader(
         dataset,
-        batch_size=int(cfg["mil"]["training"]["batch_size"]),
-        shuffle=True,
+        batch_sampler=train_sampler,
         collate_fn=collate_fn,
         num_workers=0,
     )
@@ -268,10 +306,11 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
                 row["_full_ids"] = pids + resp_ids
                 row["_prompt_len"] = len(pids)
 
+    val_token_counts = [len(r.get("_full_ids", r.get("token_features", []))) for r in val_dataset.rows]
+    val_sampler = TokenBatchSampler(val_token_counts, max_tokens_per_batch, shuffle=False)
     val_loader = DataLoader(
         val_dataset,
-        batch_size=int(cfg["mil"]["training"]["batch_size"]),
-        shuffle=False,
+        batch_sampler=val_sampler,
         collate_fn=collate_fn,
         num_workers=0,
     )
@@ -310,6 +349,9 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
     patience_counter = 0
     best_ckpt: Dict[str, Any] | None = None
 
+    if runner is not None:
+        runner.release_memory_occupation(tags=["kv_cache"])
+
     for epoch in range(max_epochs):
         mil.train()
         if use_temp:
@@ -317,12 +359,14 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
             dynamic_head.train()
 
         sum_loss = 0.0
-        n_batches = len(loader)
+        cumul_tokens = 0
+        total_tokens = sum(token_counts)
         for batch_idx, batch in enumerate(loader):
             x = batch["instances"].to(device)
             mask = batch["mask"].to(device)
             y = batch["label"].to(device)
             t = batch["temp_idx"].to(device)
+            bags = x.shape[0]
 
             out = mil(x)
             bag_logit = out["bag_logit"]
@@ -425,8 +469,11 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
 
             sum_loss += float(loss.item())
 
-            logger.info("epoch=%d batch=%d/%d loss=%.4f bag=%.4f inst=%.4f",
-                         epoch + 1, batch_idx + 1, n_batches,
+            cumul_tokens += batch.get("_batch_tokens", 0)
+            logger.info("epoch=%d batch=%d tokens=%d/%d bags=%d loss=%.4f bag=%.4f inst=%.4f",
+                         epoch + 1, batch_idx + 1,
+                         cumul_tokens, total_tokens,
+                         bags,
                          float(loss.item()), float(loss_bag.item()),
                          float(loss_inst.item()))
 

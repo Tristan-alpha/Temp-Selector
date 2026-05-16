@@ -69,6 +69,16 @@ class SGLangRunner:
         self._lazy_init()
         return self._tokenizer
 
+    def release_memory_occupation(self, tags: Optional[List[str]] = None):
+        """Release engine memory (e.g. KV cache) to free GPU RAM for training."""
+        if self._engine is not None:
+            self._engine.release_memory_occupation(tags=tags)
+
+    def resume_memory_occupation(self, tags: Optional[List[str]] = None):
+        """Resume engine memory occupation after training step."""
+        if self._engine is not None:
+            self._engine.resume_memory_occupation(tags=tags)
+
     def generate_raw(self, prompt, sampling_params,
                      return_logprob=False, top_logprobs_num=None,
                      return_hidden_states=False):
@@ -109,13 +119,14 @@ class SGLangRunner:
             # Higher conservativeness to avoid OOM on large prefill batches.
             engine_kwargs.update(
                 cuda_graph_max_bs=1,
-                max_running_requests=128,
+                max_running_requests=512,
                 schedule_conservativeness=0.3,
                 enable_mixed_chunk=False,
                 num_continuous_decode_steps=1,
-                max_prefill_tokens=1048576,
+                max_prefill_tokens=262144,
                 chunked_prefill_size=-1,
                 disable_cuda_graph=True,
+                enable_memory_saver=True,
             )
         else:
             # Decode-heavy: generation with many decode steps (build_dataset, PPO).
