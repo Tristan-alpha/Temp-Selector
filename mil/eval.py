@@ -206,6 +206,7 @@ def evaluate_mil(
             gpu_memory_utilization=float(config["inference"].get("gpu_memory_utilization", 0.90)),
             feature_mode=feature_mode,
             engine_preset="prefill",
+            base_gpu_id=1,
         )
 
     dataset = BagDataset(data_path=data_path)

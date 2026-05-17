@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from typing import Any, Dict, List
 
 import torch
@@ -91,25 +92,25 @@ def make_collate_fn(
     need_logprobs = feature_mode in {"topk_logprobs", "all"} and extractor is not None
 
     def collate_fn(batch_rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        _t = [time.perf_counter()]
         hidden_tensors = None
         logprob_tensors = None
         if need_hidden or need_logprobs:
             full_ids = [r["_full_ids"] for r in batch_rows]
             prompt_lens = [r["_prompt_len"] for r in batch_rows]
 
-            torch.cuda.empty_cache()
-            extractor.resume_memory_occupation(tags=["kv_cache"])
             if need_hidden:
                 hidden_tensors = extractor.extract_hidden_from_ids(full_ids, prompt_lens)
             if need_logprobs:
                 temps = [float(r.get("temperature", 0.0)) for r in batch_rows]
                 logprob_tensors = extractor.extract_logprobs_from_ids(full_ids, prompt_lens, temperatures=temps)
-            extractor.release_memory_occupation(tags=["kv_cache"])
+        _t.append(time.perf_counter())  # _t[1] = after SGLand extract
 
         instances_list: List[torch.Tensor] = []
         labels: List[float] = []
         temp_indices: List[int] = []
 
+        _loop_tokens = 0
         for i, row in enumerate(batch_rows):
             token_features = row.get("token_features", [])
             if not token_features:
@@ -121,17 +122,21 @@ def make_collate_fn(
 
             h_t = hidden_tensors[i] if hidden_tensors is not None else None
             l_t = logprob_tensors[i] if logprob_tensors is not None else None
+            n = len(token_features)
 
-            token_vecs = []
-            for j, tf in enumerate(token_features):
-                extra: Dict[str, torch.Tensor] = {}
-                if h_t is not None and j < h_t.shape[0]:
-                    extra["hidden"] = h_t[j]
-                if l_t is not None and j < l_t.shape[0]:
-                    extra["topk_logprobs"] = l_t[j]
-                token_vecs.append(token_to_vec(tf, instance_dim, extra if extra else None))
+            # Batch-construct [n, instance_dim] in one cat instead of n per-token cats.
+            parts = [torch.tensor([[float(tf.get("logprob", -20.0)), float(tf.get("entropy", 0.0))]
+                                   for tf in token_features], dtype=torch.float32)]
+            if l_t is not None:
+                parts.append(l_t[:n])
+            if h_t is not None:
+                parts.append(h_t[:n])
+            t = torch.cat(parts, dim=1)  # [n, actual_dim]
+            if t.shape[1] < instance_dim:
+                t = torch.cat([t, torch.zeros(n, instance_dim - t.shape[1])], dim=1)
+            else:
+                t = t[:, :instance_dim]
 
-            t = torch.stack(token_vecs)  # [n_tokens, instance_dim]
             token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
                            for tf in token_features]
             response = row.get("response", "")
@@ -146,6 +151,8 @@ def make_collate_fn(
             t_val = float(row.get("temperature", temp_bins[0]))
             temp_indices.append(bin_map.get(t_val, 0))
 
+        _t.append(time.perf_counter())  # _t[2] = after token→segment loop
+
         max_k = max(inst.shape[0] for inst in instances_list)
         d = instances_list[0].shape[1]
         b = len(instances_list)
@@ -159,9 +166,18 @@ def make_collate_fn(
             x[i, :k] = inst
             mask[i, :k] = 1.0
 
-        batch_tokens = sum(len(r.get("_full_ids", r.get("token_features", []))) for r in batch_rows)
+        _t.append(time.perf_counter())  # _t[3] = after pad
 
-        return {"instances": x, "mask": mask, "label": y, "temp_idx": t, "_batch_tokens": batch_tokens}
+        batch_tokens = sum(len(r.get("_full_ids", r.get("token_features", []))) for r in batch_rows)
+        _coll_timings = {
+            "extract_s": _t[1] - _t[0],
+            "token2seg_s": _t[2] - _t[1],
+            "pad_s": _t[3] - _t[2],
+            "total_s": _t[3] - _t[0],
+        }
+
+        return {"instances": x, "mask": mask, "label": y, "temp_idx": t,
+                "_batch_tokens": batch_tokens, "_coll_timings": _coll_timings}
 
     return collate_fn
 
@@ -202,6 +218,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
             feature_mode=feature_mode,
             log_level="info",
             engine_preset="prefill",
+            base_gpu_id=1,
         )
         logger.info("SGLangRunner ready for online feature extraction")
 
@@ -349,9 +366,6 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
     patience_counter = 0
     best_ckpt: Dict[str, Any] | None = None
 
-    if runner is not None:
-        runner.release_memory_occupation(tags=["kv_cache"])
-
     for epoch in range(max_epochs):
         mil.train()
         if use_temp:
@@ -362,6 +376,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         cumul_tokens = 0
         total_tokens = sum(token_counts)
         for batch_idx, batch in enumerate(loader):
+            t0 = time.perf_counter()
             x = batch["instances"].to(device)
             mask = batch["mask"].to(device)
             y = batch["label"].to(device)
@@ -373,6 +388,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
             inst_logit = out["inst_logit"]
             bag_repr = out["bag_repr"]
             inst_repr = out["encoder_out"]
+            t1 = time.perf_counter()
 
             loss_bag = bce(bag_logit, y)
 
@@ -466,16 +482,26 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             optimizer.step()
+            t2 = time.perf_counter()
 
-            sum_loss += float(loss.item())
+            _batch_loss = float(loss.item())
+            _batch_bag = float(loss_bag.item())
+            _batch_inst = float(loss_inst.item())
+            _batch_tokens = batch.get("_batch_tokens", 0)
+            _ct = batch.get("_coll_timings", {})
+            sum_loss += _batch_loss
 
-            cumul_tokens += batch.get("_batch_tokens", 0)
-            logger.info("epoch=%d batch=%d tokens=%d/%d bags=%d loss=%.4f bag=%.4f inst=%.4f",
+            del x, mask, y, t, out, loss, loss_bag, loss_inst, batch
+
+            cumul_tokens += _batch_tokens
+            logger.info("epoch=%d batch=%d tokens=%d/%d bags=%d loss=%.4f bag=%.4f inst=%.4f | "
+                         "coll[extract=%.2fs tok2seg=%.2fs pad=%.3fs] fwd=%.2fs bwd=%.2fs",
                          epoch + 1, batch_idx + 1,
                          cumul_tokens, total_tokens,
                          bags,
-                         float(loss.item()), float(loss_bag.item()),
-                         float(loss_inst.item()))
+                         _batch_loss, _batch_bag, _batch_inst,
+                         _ct.get("extract_s", 0), _ct.get("token2seg_s", 0), _ct.get("pad_s", 0),
+                         t1 - t0, t2 - t1)
 
         avg = sum_loss / max(1, len(loader))
 
@@ -488,13 +514,15 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         if separation > best_separation:
             best_separation = separation
             patience_counter = 0
+            # clone to CPU — state_dict() returns references to live parameters,
+            # which are mutated in-place by optimizer.step().
             ckpt: Dict[str, Any] = {
-                "mil": mil.state_dict(),
+                "mil": {k: v.detach().cpu().clone() for k, v in mil.state_dict().items()},
                 "config": cfg,
             }
             if use_temp:
-                ckpt["global_head"] = global_head.state_dict()
-                ckpt["dynamic_head"] = dynamic_head.state_dict()
+                ckpt["global_head"] = {k: v.detach().cpu().clone() for k, v in global_head.state_dict().items()}
+                ckpt["dynamic_head"] = {k: v.detach().cpu().clone() for k, v in dynamic_head.state_dict().items()}
             best_ckpt = ckpt
             logger.info("new_best separation=%.4f", best_separation)
         else:
@@ -505,12 +533,12 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
 
     if best_ckpt is None:
         best_ckpt = {
-            "mil": mil.state_dict(),
+            "mil": {k: v.detach().cpu().clone() for k, v in mil.state_dict().items()},
             "config": cfg,
         }
         if use_temp:
-            best_ckpt["global_head"] = global_head.state_dict()
-            best_ckpt["dynamic_head"] = dynamic_head.state_dict()
+            best_ckpt["global_head"] = {k: v.detach().cpu().clone() for k, v in global_head.state_dict().items()}
+            best_ckpt["dynamic_head"] = {k: v.detach().cpu().clone() for k, v in dynamic_head.state_dict().items()}
     ckpt_path = cfg["paths"]["mil_ckpt"]
     torch.save(best_ckpt, ckpt_path)
     logger.info("saved_checkpoint=%s best_separation=%.4f run_name=%s log_path=%s",

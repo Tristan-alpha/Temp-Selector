@@ -609,7 +609,7 @@ def train_ppo(
         if val_value < best_val_value:
             best_val_value = val_value
             patience_counter = 0
-            best_state = {"policy_value": policy.state_dict(), "config": cfg}
+            best_state = {"policy_value": {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}, "config": cfg}
             logger.info("new_best val_value=%.4f", best_val_value)
         else:
             patience_counter += 1
@@ -618,7 +618,7 @@ def train_ppo(
                 break
 
     if best_state is None:
-        best_state = {"policy_value": policy.state_dict(), "config": cfg}
+        best_state = {"policy_value": {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}, "config": cfg}
     ckpt_path = cfg["paths"]["ppo_ckpt"]
     torch.save(best_state, ckpt_path)
     logger.info("saved_checkpoint=%s best_val_value=%.4f run_name=%s", ckpt_path, best_val_value, final_run_name)
