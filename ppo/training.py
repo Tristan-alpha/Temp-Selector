@@ -26,7 +26,7 @@ from utils.jsonl import sample_prefix
 from mil.model import MILModel
 from ppo.model import PolicyValueNet, sample_action, compute_gae, load_mil_encoder_for_warmstart
 from utils.exp_logger import log_exception, setup_experiment_logger
-from inference.sglang_runner import SGLangRunner
+from inference.vllm_runner import VLLMFeatureExporter
 
 
 def _load_config(path: str) -> Dict[str, Any]:
@@ -106,61 +106,6 @@ def _extract_segment_obs(token_ids: List[int], logprobs_list: List[Any],
     return std_vec
 
 
-def _extract_segment_obs_sglang(token_ids: List[int], logprob_vals: List[float],
-                                 obs_dim: int, top_k: int,
-                                 topk_logprob_vals: Optional[List[float]] = None,
-                                 hidden_states: Optional[List[List[float]]] = None,
-                                 feature_mode: str = "basic") -> Optional[torch.Tensor]:
-    """Same as _extract_segment_obs but for SGLang's flat logprob format."""
-    if not token_ids or not logprob_vals:
-        return None
-
-    tk_num = len(token_ids)
-    logprobs_per_token = len(logprob_vals) // max(1, tk_num)
-
-    token_obs: List[torch.Tensor] = []
-    for pos, (tid, lp) in enumerate(zip(token_ids, logprob_vals)):
-        if pos < logprobs_per_token * tk_num:
-            if topk_logprob_vals and len(topk_logprob_vals) >= (pos + 1) * top_k:
-                topk_list = topk_logprob_vals[pos * top_k : (pos + 1) * top_k]
-            else:
-                topk_list = [lp] * top_k
-            probs = [math.exp(v) for v in topk_list]
-            z = sum(probs) + 1e-12
-            entropy_val = 0.0
-            for p in probs:
-                pn = p / z
-                entropy_val -= pn * math.log(max(pn, 1e-12))
-        else:
-            lp = -20.0
-            topk_list = [lp] * top_k
-            entropy_val = 0.0
-
-        obs = token_to_vec({"logprob": float(lp), "entropy": float(entropy_val)}, obs_dim,
-                           extracted={"topk_logprobs": torch.tensor(topk_list, dtype=torch.float32)})
-        token_obs.append(obs)
-
-    std_vec: Optional[torch.Tensor] = None
-    if feature_mode != "hidden_states":
-        if not token_obs:
-            return None
-        std_vec = mean_pool_obs(token_obs, obs_dim)
-
-    if hidden_states is not None and feature_mode in {"hidden_states", "all"}:
-        n_hs = len(hidden_states)
-        if n_hs == 0:
-            return std_vec
-        hs_tensor = torch.tensor(hidden_states, dtype=torch.float32)
-        hs_pooled = hs_tensor.mean(dim=0)
-        if feature_mode == "hidden_states":
-            return hs_pooled
-        if std_vec is not None:
-            return torch.cat([std_vec, hs_pooled])
-        return hs_pooled
-
-    return std_vec
-
-
 def load_train_prompts(dataset_path: str) -> list:
     """Extract unique (question, answer) pairs from labeled train dataset JSONL."""
     seen: set = set()
@@ -189,7 +134,6 @@ def train_ppo(
     parallel_size: int | str = "auto",
     run_name: str | None = None,
     log_dir: str = "logs",
-    backend: str = "sglang",
 ) -> None:
     cfg = _load_config(config_path)
     logger, _log_path, final_run_name = setup_experiment_logger(
@@ -212,12 +156,8 @@ def train_ppo(
     use_math_chat = bool(cfg["inference"].get("use_math_chat_prompt", True))
     feature_mode = cfg["inference"].get("feature_mode", "basic")
 
-    # Hidden state extraction config (extractor LLM created on-demand
-    # and destroyed after each batch to avoid GPU conflict with gen LLM).
     hs_layer_ids = [int(x) for x in cfg["inference"].get("eagle_aux_hidden_state_layer_ids", [28])]
     hs_needed = feature_mode in {"hidden_states", "all"}
-    if hs_needed and backend == "vllm":
-        raise ValueError("vLLM does not support hidden state extraction. Use --backend sglang.")
 
     max_iterations = int(cfg["ppo"]["training"]["max_iterations"])
     early_stop_patience = int(cfg["ppo"]["training"]["early_stop_patience"])
@@ -252,28 +192,15 @@ def train_ppo(
     else:
         tp_size = max(1, int(parallel_size))
 
-    if backend == "vllm":
-        from inference.vllm_runner import VLLMFeatureExporter
-        runner = VLLMFeatureExporter(
-            model_name_or_path=model_path,
-            max_new_tokens=max_new_tokens,
-            parallel_size=tp_size,
-            gpu_memory_utilization=gpu_mem,
-            feature_mode=feature_mode,
-        )
-        tokenizer = runner.tokenizer
-        logger.info("VLLMFeatureExporter ready parallel_size=%d", tp_size)
-    else:
-        # sglang (default)
-        runner = SGLangRunner(
-            model_name_or_path=model_path,
-            max_new_tokens=max_new_tokens,
-            parallel_size=tp_size,
-            gpu_memory_utilization=gpu_mem,
-            feature_mode=feature_mode,
-        )
-        tokenizer = runner.tokenizer
-        logger.info("SGLangRunner ready parallel_size=%d", tp_size)
+    runner = VLLMFeatureExporter(
+        model_name_or_path=model_path,
+        max_new_tokens=max_new_tokens,
+        parallel_size=tp_size,
+        gpu_memory_utilization=gpu_mem,
+        feature_mode=feature_mode,
+    )
+    tokenizer = runner.tokenizer
+    logger.info("VLLMFeatureExporter ready parallel_size=%d", tp_size)
 
     device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -363,8 +290,7 @@ def train_ppo(
         ep_correct: List[int] = [-1] * N  # 1 = majority correct, 0 = majority wrong, -1 = unknown
 
         max_rounds = max_new_tokens // segment_size + 1
-        if backend == "vllm":
-            from vllm import SamplingParams
+        from vllm import SamplingParams
 
         for _seg_idx in range(max_rounds):
             round_prompts = []
@@ -398,14 +324,10 @@ def train_ppo(
                     ep_logprobs[i].append(logp.cpu())
                     ep_values[i].append(value.squeeze(0).cpu())
 
-                if backend == "vllm":
-                    round_params.append(SamplingParams(
-                        n=V, temperature=temp, max_tokens=segment_size, logprobs=top_k_logprobs,
-                        top_p=1.0, top_k=0,
-                    ))
-                else:
-                    round_params.append({"max_new_tokens": segment_size, "temperature": temp, "n": V,
-                                         "top_p": 1.0, "top_k": -1})
+                round_params.append(SamplingParams(
+                    n=V, temperature=temp, max_tokens=segment_size, logprobs=top_k_logprobs,
+                    top_p=1.0, top_k=0,
+                ))
                 round_indices.append(i)
 
             if not round_indices:
@@ -414,89 +336,34 @@ def train_ppo(
             seg_hidden_map: Dict[int, Optional[List[List[float]]]] = {}
             hs_requests: List[Tuple[int, List[int], object, str]] = []
 
-            if backend == "vllm":
-                # ---- vLLM path: batch generate + two-pass hidden extraction ----
-                outputs = runner.generate_raw(round_prompts, round_params)
+            outputs = runner.generate_raw(round_prompts, round_params)
 
-                for j, i in enumerate(round_indices):
-                    req_outputs = outputs[j].outputs
-                    for v in range(min(V, len(req_outputs))):
-                        generated[i][v] += req_outputs[v].text
-                    out0 = req_outputs[0]
-                    new_tokens = out0.token_ids
-                    finish_reason = getattr(out0, 'finish_reason', None)
-                    if (tokenizer.eos_token_id is not None and tokenizer.eos_token_id in new_tokens) or \
-                       finish_reason == 'stop' or not new_tokens:
-                        active[i] = False
-                        ep_correct[i] = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
-                        continue
-                    if out0.logprobs:
-                        seg_text = req_outputs[0].text
-                        if seg_text:
-                            ep_prefixes[i] += seg_text
-                        hs_requests.append((i, new_tokens, out0, seg_text))
-
-            else:
-                # ---- SGLang path: per-prompt generate + inline hidden states ----
-                for j, i in enumerate(round_indices):
-                    output = runner.generate_raw(
-                        round_prompts[j], round_params[j],
-                        return_logprob=True,
-                        top_logprobs_num=top_k_logprobs if feature_mode in {"topk_logprobs","all"} else 1,
-                        return_hidden_states=hs_needed,
-                    )
-                    output = output[0] if isinstance(output, list) else output
-                    meta = output.get("meta_info", {})
-                    out_ids = output.get("output_ids", [])
-                    lp_vals = meta.get("output_token_logprobs_val", [])
-                    tp_vals = meta.get("output_top_logprobs_val", [])
-
-                    for v in range(V):
-                        n_per_vote = len(out_ids) // V if V > 0 else 1
-                        start_v = v * n_per_vote
-                        end_v = start_v + n_per_vote
-                        generated[i][v] += output.get("text", "")
-
-                    # Check finish (use first vote's tokens)
-                    first_vote_ids = out_ids[:n_per_vote] if V > 1 else out_ids
-                    if (tokenizer.eos_token_id is not None and tokenizer.eos_token_id in first_vote_ids) or \
-                       not first_vote_ids:
-                        active[i] = False
-                        ep_correct[i] = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
-                        continue
-
-                    seg_text = output.get("text", "")
+            for j, i in enumerate(round_indices):
+                req_outputs = outputs[j].outputs
+                for v in range(min(V, len(req_outputs))):
+                    generated[i][v] += req_outputs[v].text
+                out0 = req_outputs[0]
+                new_tokens = out0.token_ids
+                finish_reason = getattr(out0, 'finish_reason', None)
+                if (tokenizer.eos_token_id is not None and tokenizer.eos_token_id in new_tokens) or \
+                   finish_reason == 'stop' or not new_tokens:
+                    active[i] = False
+                    ep_correct[i] = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
+                    continue
+                if out0.logprobs:
+                    seg_text = req_outputs[0].text
                     if seg_text:
                         ep_prefixes[i] += seg_text
-                    hs_requests.append((i, first_vote_ids, lp_vals, tp_vals, seg_text))
-
-                    if hs_needed:
-                        hs = meta.get("hidden_states")
-                        if hs is not None:
-                            prompt_len = len(tokenizer.encode(round_prompts[j]))
-                            hs_chunk = hs[prompt_len:]
-                            if hasattr(hs_chunk, "tolist"):
-                                hs_chunk = hs_chunk.tolist()
-                            seg_hidden_map[i] = hs_chunk
+                    hs_requests.append((i, new_tokens, out0, seg_text))
 
             # Compute segment observations
-            if backend == "vllm":
-                for i, new_tokens, out0, _ in hs_requests:
-                    obs = _extract_segment_obs(
-                        new_tokens, out0.logprobs, obs_dim, top_k_logprobs,
-                        hidden_states=seg_hidden_map.get(i),
-                        feature_mode=feature_mode,
-                    )
-                    segment_obs[i] = torch.tensor(obs, dtype=torch.float32) if obs else None
-            else:
-                for i, new_tokens, lp_vals, tp_vals, _ in hs_requests:
-                    obs = _extract_segment_obs_sglang(
-                        new_tokens, lp_vals, obs_dim, top_k_logprobs,
-                        topk_logprob_vals=tp_vals,
-                        hidden_states=seg_hidden_map.get(i),
-                        feature_mode=feature_mode,
-                    )
-                    segment_obs[i] = torch.tensor(obs, dtype=torch.float32) if obs else None
+            for i, new_tokens, out0, _ in hs_requests:
+                obs = _extract_segment_obs(
+                    new_tokens, out0.logprobs, obs_dim, top_k_logprobs,
+                    hidden_states=seg_hidden_map.get(i),
+                    feature_mode=feature_mode,
+                )
+                segment_obs[i] = torch.tensor(obs, dtype=torch.float32) if obs else None
 
         for i in range(N):
             if ep_correct[i] == -1:
@@ -633,8 +500,6 @@ def main() -> None:
     parser.add_argument("--mil-ckpt", default=None, help="Override paths.mil_ckpt from config")
     parser.add_argument("--parallel-size", default=None,
                         help="Override inference.parallel_size from config")
-    parser.add_argument("--backend", default=None, choices=["sglang", "vllm"],
-                        help="Override inference.backend from config")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     args = parser.parse_args()
@@ -642,10 +507,9 @@ def main() -> None:
     train_path = args.train_data or cfg["paths"]["train_dataset"]
     mil_ckpt = args.mil_ckpt or cfg["paths"]["mil_ckpt"]
     inf = cfg.get("inference", {})
-    backend = args.backend or inf.get("backend", "sglang")
     psize = args.parallel_size or inf.get("parallel_size", "auto")
     try:
-        train_ppo(args.config, train_path, mil_ckpt=mil_ckpt, parallel_size=psize, run_name=args.run_name, log_dir=args.log_dir, backend=backend)
+        train_ppo(args.config, train_path, mil_ckpt=mil_ckpt, parallel_size=psize, run_name=args.run_name, log_dir=args.log_dir)
     except Exception as exc:
         cfg = _load_config(args.config)
         logger, _, _ = setup_experiment_logger(component="train_ppo", run_name=args.run_name, log_dir=args.log_dir, config=cfg)

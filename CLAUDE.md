@@ -10,8 +10,7 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 | `features/segmenter.py` | Segmentation strategies (`fixed_window`, `step`, `punctuation`) + `segment_pooling` |
 | `features/vectorizer.py` | `token_to_vec`, `token_to_obs`, `mean_pool_obs`, `compute_entropy` — feature construction |
 | `features/dataset_eval.py` | `evaluate_dataset()`, `load_temperature_labels()` — Stage 1 analysis |
-| `inference/sglang_runner.py` | `SGLangRunner` — **default** backend; single engine with `generate()` + `extract()` |
-| `inference/vllm_runner.py` | `VLLMFeatureExporter` — legacy backend (`--backend vllm`); raises ValueError for hidden_states mode |
+| `inference/vllm_runner.py` | `VLLMFeatureExporter` — vLLM backend for generation + extraction |
 | `mil/model.py` | `MILModel`, temp heads, smoothness_loss — all MIL model definitions |
 | `mil/training.py` | `BagDataset`, `make_collate_fn`, `train()` — Stage 2 training |
 | `mil/eval.py` | `evaluate_mil()` + all MIL metric functions — Stage 2 evaluation |
@@ -21,7 +20,7 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 | `utils/math.py` | `safe_div` — shared one-liner |
 | `utils/answer_verifier.py` | Math-Verify wrapper for answer correctness checking |
 | `utils/exp_logger.py` | File + stream logging setup |
-| `utils/dataset_io.py` | Hybrid JSONL + safetensors I/O — **deleted**; SGLangRunner.extract() replaces safetensors sidecar |
+| `utils/dataset_io.py` | Hybrid JSONL + safetensors I/O — **deleted**; online extraction replaces safetensors sidecar |
 | `scripts/run_pipeline.sh` | Full pipeline orchestrator (`STAGES` env var controls which stages run) |
 | `scripts/build_dataset.py` | Stage 1 entry: vLLM multi-temp gen, majority voting. For hidden_states/all mode: merged build+split writes train/val/test JSONL+safetensors directly |
 | `scripts/split_jsonl.py` | Group-aware train/eval split; propagates safetensors sidecar |
@@ -37,7 +36,7 @@ Stage 1: JSONL prompts → multi-temp generation → BagSample (per prompt×temp
               ↓
 Stage 2: BagDataset loads JSONL as list[dict] (metadata only).  make_collate_fn
          produces a collate function that extracts logprob/hidden features per
-         training batch via SGLangRunner → segment_pooling → [K, 4098] instance
+         training batch via VLLMFeatureExporter → segment_pooling → [K, 4098] instance
          matrix.  MILModel(instances) → {bag_logit, inst_logit, attn_w, encoder_out}
          Loss = bag_bce + β×top_k_instance_bce + α×temp_ce + γ×smoothness
               ↓  warm-start backbone + inst_logit as shaping reward
@@ -63,7 +62,7 @@ Stage 3: PolicyValueNet(segment_obs) → temperature action
 - **Even vote ties**: `num_votes=8` in config. Majority threshold `(V+1)//2=4` means 4-4 ties are labeled "correct". Use odd vote counts to avoid this.
 - **Config section scoping**: `mil.model.hidden_dim` and `ppo.model.hidden_dim` are separate keys. The evaluator reads `ppo.model.hidden_dim` — do not use `model.hidden_dim` (that section was deleted).
 - **`inst_repr = out["encoder_out"]`**: In `mil/training.py`, the dynamic temp head MUST receive `encoder_out` (pos+GRU processed), not `mil.encoder(x)` (raw). The latter was Bug 1 — fixed but easily reintroduced.
-- **MIL DataLoader `num_workers=0`**: Feature extraction happens in collate_fn via SGLangRunner (cannot be pickled). Do NOT set num_workers > 0 or DataLoader will hang/fail.
+- **MIL DataLoader `num_workers=0`**: Feature extraction happens in collate_fn via VLLMFeatureExporter (cannot be pickled). Do NOT set num_workers > 0 or DataLoader will hang/fail.
 - **BagDataset is metadata-only**: Rows are raw dicts from JSONL, not pre-built tensors. Instance tensor construction happens in `make_collate_fn()`. The old `collate_rows` and `RowTensor` are deleted.
 
 ## Common tasks

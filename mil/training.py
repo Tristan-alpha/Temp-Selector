@@ -204,35 +204,21 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
     instance_dim = int(cfg["data"]["instance_dim"])
     hidden_dim = int(cfg["mil"]["model"]["hidden_dim"])
     feature_mode = cfg["inference"].get("feature_mode", "basic")
-    backend = cfg["inference"].get("backend", "sglang")
 
     # Create extraction engine (shared across train + val)
     extraction_logprobs = feature_mode in {"topk_logprobs", "all"}
     runner = None
     if extraction_logprobs or feature_mode in {"hidden_states", "all"}:
-        if backend == "vllm":
-            from inference.vllm_runner import VLLMFeatureExporter
-            runner = VLLMFeatureExporter(
-                model_name_or_path=cfg["inference"]["model_name_or_path"],
-                max_new_tokens=int(cfg["inference"].get("max_new_tokens", 8192)),
-                parallel_size=cfg["inference"].get("parallel_size", "auto"),
-                gpu_memory_utilization=float(cfg["inference"].get("gpu_memory_utilization", 0.90)),
-                feature_mode=feature_mode,
-                engine_preset="prefill",
-            )
-        else:
-            from inference.sglang_runner import SGLangRunner
-            runner = SGLangRunner(
-                model_name_or_path=cfg["inference"]["model_name_or_path"],
-                max_new_tokens=int(cfg["inference"].get("max_new_tokens", 8192)),
-                parallel_size=cfg["inference"].get("parallel_size", "auto"),
-                gpu_memory_utilization=float(cfg["inference"].get("gpu_memory_utilization", 0.90)),
-                feature_mode=feature_mode,
-                log_level="info",
-                engine_preset="prefill",
-                base_gpu_id=1,
-            )
-        logger.info("extraction engine ready backend=%s", backend)
+        from inference.vllm_runner import VLLMFeatureExporter
+        runner = VLLMFeatureExporter(
+            model_name_or_path=cfg["inference"]["model_name_or_path"],
+            max_new_tokens=int(cfg["inference"].get("max_new_tokens", 8192)),
+            parallel_size=cfg["inference"].get("parallel_size", "auto"),
+            gpu_memory_utilization=float(cfg["inference"].get("gpu_memory_utilization", 0.90)),
+            feature_mode=feature_mode,
+            engine_preset="prefill",
+        )
+        logger.info("VLLMFeatureExporter ready for online feature extraction")
 
     dataset = BagDataset(data_path=data_path)
     logger.info("dataset_size=%d", len(dataset))
