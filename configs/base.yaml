@@ -20,7 +20,7 @@ data:
 
 inference:
   model_name_or_path: /home/xuezhe/models/Qwen3-8B
-  backend: sglang              # sglang (default) | vllm
+  backend: vllm              # sglang (default) | vllm
   parallel_size: auto
   gpu_memory_utilization: 0.80
   max_new_tokens: 8192
@@ -55,7 +55,7 @@ mil:
     use_gru: true
   training:
     instance_loss: pure     # topk | pure | soft_pseudo_label | contrastive
-    max_tokens_per_batch: 1048576
+    max_tokens_per_batch: 16384
     lr: 2.0e-4
     max_epochs: 50
     early_stop_patience: 5

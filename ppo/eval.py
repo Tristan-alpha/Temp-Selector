@@ -216,6 +216,7 @@ class OnlineTemperatureEvaluator:
                 round_params.append(SamplingParams(
                     n=V, temperature=temp, max_tokens=self.segment_size,
                     logprobs=self.top_k_logprobs,
+                    top_p=1.0, top_k=0,
                 ))
                 round_indices.append(i)
 

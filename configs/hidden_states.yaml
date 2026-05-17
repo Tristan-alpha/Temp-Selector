@@ -20,7 +20,7 @@ data:
 
 inference:
   model_name_or_path: /home/xuezhe/models/Qwen3-8B
-  backend: sglang
+  backend: vllm
   gpu_memory_utilization: 0.60
   parallel_size: auto
   max_new_tokens: 8192

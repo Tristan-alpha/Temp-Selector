@@ -196,18 +196,30 @@ def evaluate_mil(
     feature_mode = config["inference"].get("feature_mode", "basic")
     backend = config["inference"].get("backend", "sglang")
 
+    extraction_logprobs = feature_mode in {"topk_logprobs", "all"}
     runner = None
-    if feature_mode in {"topk_logprobs", "hidden_states", "all"} and backend == "sglang":
-        from inference.sglang_runner import SGLangRunner
-        runner = SGLangRunner(
-            model_name_or_path=config["inference"]["model_name_or_path"],
-            max_new_tokens=int(config["inference"].get("max_new_tokens", 8192)),
-            parallel_size=config["inference"].get("parallel_size", "auto"),
-            gpu_memory_utilization=float(config["inference"].get("gpu_memory_utilization", 0.90)),
-            feature_mode=feature_mode,
-            engine_preset="prefill",
-            base_gpu_id=1,
-        )
+    if extraction_logprobs or feature_mode in {"hidden_states", "all"}:
+        if backend == "vllm":
+            from inference.vllm_runner import VLLMFeatureExporter
+            runner = VLLMFeatureExporter(
+                model_name_or_path=config["inference"]["model_name_or_path"],
+                max_new_tokens=int(config["inference"].get("max_new_tokens", 8192)),
+                parallel_size=config["inference"].get("parallel_size", "auto"),
+                gpu_memory_utilization=float(config["inference"].get("gpu_memory_utilization", 0.90)),
+                feature_mode=feature_mode,
+                engine_preset="prefill",
+            )
+        else:
+            from inference.sglang_runner import SGLangRunner
+            runner = SGLangRunner(
+                model_name_or_path=config["inference"]["model_name_or_path"],
+                max_new_tokens=int(config["inference"].get("max_new_tokens", 8192)),
+                parallel_size=config["inference"].get("parallel_size", "auto"),
+                gpu_memory_utilization=float(config["inference"].get("gpu_memory_utilization", 0.90)),
+                feature_mode=feature_mode,
+                engine_preset="prefill",
+                base_gpu_id=1,
+            )
 
     dataset = BagDataset(data_path=data_path)
 

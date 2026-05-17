@@ -401,9 +401,11 @@ def train_ppo(
                 if backend == "vllm":
                     round_params.append(SamplingParams(
                         n=V, temperature=temp, max_tokens=segment_size, logprobs=top_k_logprobs,
+                        top_p=1.0, top_k=0,
                     ))
                 else:
-                    round_params.append({"max_new_tokens": segment_size, "temperature": temp, "n": V})
+                    round_params.append({"max_new_tokens": segment_size, "temperature": temp, "n": V,
+                                         "top_p": 1.0, "top_k": -1})
                 round_indices.append(i)
 
             if not round_indices:

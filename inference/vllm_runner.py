@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import torch
+
 from features.schema import TokenFeature
 
 
@@ -34,23 +36,45 @@ class GenerationOutput:
     hidden_states: Optional[List[List[float]]]
 
 
+def _make_logprobs_fn(hidden_states_cpu, token_ids_cpu, k, temperature_cpu=None):
+    """Return a closure for ``llm.apply_model()`` to compute top-k logprobs."""
+    def _fn(model):
+        from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
+        dev = next(model.parameters()).device
+        h = hidden_states_cpu.to(dev, non_blocking=True)
+        ids = token_ids_cpu.to(dev, non_blocking=True)
+        normed = model.model.norm(h)
+        logits = model.compute_logits(normed)
+        if temperature_cpu is not None:
+            t = temperature_cpu.to(dev, non_blocking=True)
+            logits = logits / t.unsqueeze(-1)
+        result = compute_topk_logprobs(logits, k, ids)
+        return torch.stack([result.logprobs.cpu(), result.logprob_token_ids.cpu().float()])
+    return _fn
+
+
 class VLLMFeatureExporter:
     def __init__(self, model_name_or_path: str, max_new_tokens: int = 256,
                  parallel_size: int | str | None = "auto",
                  gpu_memory_utilization: float = 0.90,
-                 feature_mode: str = "basic"):
-        if feature_mode in {"hidden_states", "all"}:
-            raise ValueError(
-                f"VLLMFeatureExporter does not support feature_mode={feature_mode!r}. "
-                f"Hidden state extraction requires SGLang. Use --backend sglang."
-            )
+                 feature_mode: str = "basic",
+                 max_logprobs: int = 4096,
+                 engine_preset: str = "decode"):
         self.model_name_or_path = model_name_or_path
         self.max_new_tokens = max_new_tokens
         self.parallel_size = parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.feature_mode = feature_mode
+        self.max_logprobs = max_logprobs
+        self.engine_preset = engine_preset
         self._llm = None
         self._tokenizer = None
+        self._hs_tmpdir: Optional[str] = None  # for hidden state extraction
+
+    def _cleanup_hs_tmpdir(self):
+        import shutil
+        if self._hs_tmpdir and os.path.isdir(self._hs_tmpdir):
+            shutil.rmtree(self._hs_tmpdir, ignore_errors=True)
 
     def _resolve_parallel_size(self) -> int:
         if isinstance(self.parallel_size, int):
@@ -93,12 +117,48 @@ class VLLMFeatureExporter:
             from vllm import LLM
         except ImportError as exc:
             raise RuntimeError("vLLM is required for online feature export.") from exc
+
         tp_size = self._resolve_parallel_size()
-        max_model_len = self.max_new_tokens + 2048  # prompt headroom + output
-        self._llm = LLM(model=self.model_name_or_path,
-                        tensor_parallel_size=tp_size,
-                        max_model_len=max_model_len,
-                        gpu_memory_utilization=self.gpu_memory_utilization)
+        max_model_len = self.max_new_tokens + 2048
+
+        llm_kwargs: Dict[str, Any] = dict(
+            model=self.model_name_or_path,
+            tensor_parallel_size=tp_size,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=self.gpu_memory_utilization,
+            max_logprobs=self.max_logprobs,
+        )
+
+        need_hidden = self.feature_mode != "basic"
+
+        if need_hidden:
+            import tempfile, atexit
+            from transformers import AutoConfig
+            hf_cfg = AutoConfig.from_pretrained(self.model_name_or_path)
+            # eagle_aux_hidden_state_layer_ids is 1-indexed; last layer = num_layers
+            last_layer_id = hf_cfg.num_hidden_layers
+            self._hs_tmpdir = tempfile.mkdtemp(prefix="vllm_hs_")
+            atexit.register(self._cleanup_hs_tmpdir)
+            llm_kwargs.update(
+                speculative_config={
+                    "method": "extract_hidden_states",
+                    "num_speculative_tokens": 1,
+                    "draft_model_config": {
+                        "hf_config": {
+                            "eagle_aux_hidden_state_layer_ids": [last_layer_id],
+                        }
+                    },
+                },
+                kv_transfer_config={
+                    "kv_connector": "ExampleHiddenStatesConnector",
+                    "kv_role": "kv_producer",
+                    "kv_connector_extra_config": {
+                        "shared_storage_path": self._hs_tmpdir,
+                    },
+                },
+            )
+
+        self._llm = LLM(**llm_kwargs)
         self._tokenizer = self._llm.get_tokenizer()
 
     def build_math_messages(self, question: str, system_prompt: Optional[str] = None) -> List[Dict[str, str]]:
@@ -185,6 +245,7 @@ class VLLMFeatureExporter:
             temperature=temperature,
             max_tokens=self.max_new_tokens,
             logprobs=max(1, top_k_logprobs),
+            top_p=1.0, top_k=0,
         )
         outputs = self._llm.generate(prompts, sampling_params)
 
@@ -193,6 +254,84 @@ class VLLMFeatureExporter:
             for out in req_out.outputs:
                 parsed.append(self._to_generation_output(out=out, top_k_logprobs=top_k_logprobs))
         return parsed
+
+    # ------------------------------------------------------------------
+    # Extraction (pre-tokenized, for MIL training collate_fn)
+    # ------------------------------------------------------------------
+
+    def extract_logprobs_from_ids(
+        self,
+        full_ids: List[List[int]],
+        prompt_lens: List[int],
+        temperatures: Optional[List[float]] = None,
+        top_k: int = 4096,
+    ) -> List[torch.Tensor]:
+        """Return per-response top-k logprob tensors via apply_model + compute_logits."""
+        self._lazy_init()
+        from vllm import SamplingParams
+        from safetensors import safe_open
+
+        sp = SamplingParams(max_tokens=1, top_p=1.0, top_k=0)
+        if temperatures is not None:
+            params = [SamplingParams(max_tokens=1, top_p=1.0, top_k=0, temperature=t)
+                      for t in temperatures]
+        else:
+            params = [sp] * len(full_ids)
+        outputs = self._llm.generate(full_ids, params)
+
+        results: List[torch.Tensor] = []
+        for i, (out, p_len) in enumerate(zip(outputs, prompt_lens)):
+            hs_path = out.kv_transfer_params.get("hidden_states_path")
+            if hs_path is None:
+                results.append(torch.zeros(1, top_k))
+                continue
+            with safe_open(hs_path, "pt") as f:
+                hs = f.get_tensor("hidden_states")  # [seq_len, 1, hidden_dim]
+            os.remove(hs_path)
+            resp_hs = hs[max(0, p_len - 1):, -1, :]  # [R+1, hidden_dim]
+
+            if resp_hs.shape[0] == 0:
+                results.append(torch.zeros(1, top_k))
+                continue
+
+            token_ids = torch.tensor(full_ids[i][p_len:], dtype=torch.long)
+            resp_hs = resp_hs[: len(token_ids)]  # trim extra hidden state
+            t_cpu = (torch.tensor([temperatures[i]], dtype=torch.float32)
+                     if temperatures is not None else None)
+            raw = self._llm.apply_model(
+                _make_logprobs_fn(resp_hs.cpu(), token_ids, top_k, t_cpu)
+            )[0]
+            results.append(raw[0].float())  # logprobs [R, top_k+1]
+        return results
+
+    def extract_hidden_from_ids(
+        self,
+        full_ids: List[List[int]],
+        prompt_lens: List[int],
+    ) -> List[torch.Tensor]:
+        """Return per-response hidden states via speculative extract_hidden_states."""
+        self._lazy_init()
+        from vllm import SamplingParams
+        from safetensors import safe_open
+
+        outputs = self._llm.generate(
+            full_ids,
+            [SamplingParams(max_tokens=1, top_p=1.0, top_k=0)] * len(full_ids),
+        )
+
+        results: List[torch.Tensor] = []
+        for out, p_len in zip(outputs, prompt_lens):
+            hs_path = out.kv_transfer_params.get("hidden_states_path")
+            if hs_path is None:
+                results.append(torch.zeros(1, 4096))
+                continue
+            with safe_open(hs_path, "pt") as f:
+                hs = f.get_tensor("hidden_states")  # [seq_len, 1, hidden_dim]
+            os.remove(hs_path)
+            hs_1d = hs[:, -1, :]                           # [seq_len, hidden_dim]
+            resp_hs = hs_1d[max(0, p_len - 1):]             # response portion
+            results.append(resp_hs.float())
+        return results
 
     def _build_feature_payload(
         self,
@@ -286,6 +425,7 @@ class VLLMFeatureExporter:
                     temperature=temp,
                     max_tokens=self.max_new_tokens,
                     logprobs=max(1, top_k_logprobs),
+                    top_p=1.0, top_k=0,
                 ))
 
         outputs = self._llm.generate(all_prompts, all_params)

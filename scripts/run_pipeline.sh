@@ -2,6 +2,7 @@
 set -euo pipefail
 
 export LD_LIBRARY_PATH="/home/xuezhe/miniconda3/envs/sglang/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 
 if [[ -n "${PIPELINE_ENV_FILE:-}" && -f "${PIPELINE_ENV_FILE}" ]]; then
     # shellcheck disable=SC1090

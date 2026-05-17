@@ -207,7 +207,8 @@ class SGLangRunner:
             for temp in temperatures:
                 for _ in range(num_votes):
                     all_prompts.append(rp)
-                    all_params.append({"max_new_tokens": self.max_new_tokens, "temperature": temp, "n": 1})
+                    all_params.append({"max_new_tokens": self.max_new_tokens, "temperature": temp, "n": 1,
+                                       "top_p": 1.0, "top_k": -1})
 
         outputs = self._engine.generate(
             all_prompts, all_params,
@@ -347,7 +348,8 @@ class SGLangRunner:
 
         outputs = self._engine.generate(
             input_ids=full_ids,
-            sampling_params=[{"max_new_tokens": 0, "temperature": 1.0}] * len(full_ids),
+            sampling_params=[{"max_new_tokens": 0, "temperature": 1.0,
+                              "top_p": 1.0, "top_k": -1}] * len(full_ids),
             return_hidden_states=True,
         )
 
@@ -381,9 +383,11 @@ class SGLangRunner:
         """
         self._lazy_init()
 
-        batch_params = [{"max_new_tokens": 0, "temperature": 1.0}] * len(full_ids)
+        batch_params = [{"max_new_tokens": 0, "temperature": 1.0,
+                         "top_p": 1.0, "top_k": -1}] * len(full_ids)
         if temperatures is not None:
-            batch_params = [{"max_new_tokens": 0, "temperature": t} for t in temperatures]
+            batch_params = [{"max_new_tokens": 0, "temperature": t,
+                             "top_p": 1.0, "top_k": -1} for t in temperatures]
         outputs = self._engine.generate(
             input_ids=full_ids,
             sampling_params=batch_params,
