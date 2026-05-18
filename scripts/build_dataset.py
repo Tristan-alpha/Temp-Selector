@@ -76,7 +76,7 @@ def build_dataset(
     exporter = VLLMFeatureExporter(
         model_name_or_path=inf_cfg["model_name_or_path"],
         max_new_tokens=inf_cfg["max_new_tokens"],
-        parallel_size=inf_cfg.get("parallel_size", "auto"),
+        parallel_size=inf_cfg.get("parallel_size"),
         gpu_memory_utilization=float(inf_cfg.get("gpu_memory_utilization", 0.90)),
         feature_mode=inf_cfg.get("feature_mode", "basic"),
     )

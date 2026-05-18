@@ -52,6 +52,8 @@ class _LogprobsComputeFn:
         h = self.hidden_states_cpu.to(dev, non_blocking=True)
         ids = self.token_ids_cpu.to(dev, non_blocking=True)
         n, = h.shape[:1]
+        if self.temperature_cpu is not None:
+            t = self.temperature_cpu.to(dev, non_blocking=True)
 
         CHUNK_SIZE = 1024
         lp_chunks, id_chunks = [], []
@@ -60,8 +62,7 @@ class _LogprobsComputeFn:
             normed = model.model.norm(h[start:end])
             logits = model.compute_logits(normed)
             if self.temperature_cpu is not None:
-                t = self.temperature_cpu.to(dev, non_blocking=True)
-                logits = logits / t.unsqueeze(-1)
+                logits = logits / t
             result = compute_topk_logprobs(logits, self.k, ids[start:end])
             lp_chunks.append(result.logprobs.cpu())
             id_chunks.append(result.logprob_token_ids.cpu())
@@ -73,18 +74,18 @@ class _LogprobsComputeFn:
 
 class VLLMFeatureExporter:
     def __init__(self, model_name_or_path: str, max_new_tokens: int = 256,
-                 parallel_size: int | str | None = "auto",
+                 parallel_size: int | None = None,
                  gpu_memory_utilization: float = 0.90,
                  feature_mode: str = "basic",
                  max_logprobs: int = 4096,
-                 engine_preset: str = "decode"):
+                 reserve_training_gpu: bool = False):
         self.model_name_or_path = model_name_or_path
         self.max_new_tokens = max_new_tokens
-        self.parallel_size = parallel_size
+        self.parallel_size = parallel_size if isinstance(parallel_size, int) else None
         self.gpu_memory_utilization = gpu_memory_utilization
         self.feature_mode = feature_mode
         self.max_logprobs = max_logprobs
-        self.engine_preset = engine_preset
+        self.reserve_training_gpu = reserve_training_gpu
         self._llm = None
         self._tokenizer = None
         self._hs_tmpdir: Optional[str] = None  # for hidden state extraction
@@ -95,24 +96,20 @@ class VLLMFeatureExporter:
             shutil.rmtree(self._hs_tmpdir, ignore_errors=True)
 
     def _resolve_parallel_size(self) -> int:
-        if isinstance(self.parallel_size, int):
-            tp = self.parallel_size
-        elif isinstance(self.parallel_size, str) and self.parallel_size.lower() != "auto":
-            tp = max(1, int(self.parallel_size))
-        else:
-            visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-            if visible:
-                devices = [d.strip() for d in visible.split(",") if d.strip() and d.strip() != "-1"]
-                tp = max(1, len(devices)) if devices else 1
-            else:
-                try:
-                    import torch as _t
-                    tp = max(1, int(_t.cuda.device_count()))
-                except Exception:
-                    tp = 1
+        n_gpus = torch.cuda.device_count()
+        if n_gpus == 0:
+            raise RuntimeError("No GPUs available for vLLM")
 
-        if self.engine_preset == "prefill":
-            tp = max(1, tp - 1)
+        tp = self.parallel_size if self.parallel_size is not None else n_gpus
+
+        if self.reserve_training_gpu:
+            tp -= 1
+
+        if tp <= 0:
+            raise RuntimeError(
+                f"No GPUs left for vLLM after training reservation "
+                f"(total={n_gpus}, reserve_training_gpu=True)"
+            )
         return tp
 
     @property
@@ -287,7 +284,7 @@ class VLLMFeatureExporter:
 
             token_ids = torch.tensor(full_ids[i][p_len:], dtype=torch.long)
             resp_hs = resp_hs[: len(token_ids)]  # trim extra hidden state
-            t_cpu = (torch.tensor([temperatures[i]], dtype=torch.float32)
+            t_cpu = (torch.tensor(temperatures[i], dtype=torch.float32)
                      if temperatures is not None else None)
             raw = self._llm.apply_model(
                 _LogprobsComputeFn(resp_hs.cpu(), token_ids, top_k, t_cpu)

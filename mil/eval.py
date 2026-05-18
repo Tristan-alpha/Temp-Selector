@@ -202,10 +202,10 @@ def evaluate_mil(
         runner = VLLMFeatureExporter(
             model_name_or_path=config["inference"]["model_name_or_path"],
             max_new_tokens=int(config["inference"].get("max_new_tokens", 8192)),
-            parallel_size=config["inference"].get("parallel_size", "auto"),
+            parallel_size=config["inference"].get("parallel_size"),
             gpu_memory_utilization=float(config["inference"].get("gpu_memory_utilization", 0.90)),
             feature_mode=feature_mode,
-            engine_preset="prefill",
+            reserve_training_gpu=True,
         )
 
     dataset = BagDataset(data_path=data_path)

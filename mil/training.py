@@ -205,10 +205,10 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         runner = VLLMFeatureExporter(
             model_name_or_path=cfg["inference"]["model_name_or_path"],
             max_new_tokens=int(cfg["inference"].get("max_new_tokens", 8192)),
-            parallel_size=cfg["inference"].get("parallel_size", "auto"),
+            parallel_size=cfg["inference"].get("parallel_size"),
             gpu_memory_utilization=float(cfg["inference"].get("gpu_memory_utilization", 0.90)),
             feature_mode=feature_mode,
-            engine_preset="prefill",
+            reserve_training_gpu=True,
         )
         logger.info("VLLMFeatureExporter ready for online feature extraction")
 
