@@ -116,18 +116,20 @@ class VLLMFeatureExporter:
         segment_size: int,
         top_k: int = 4096,
         return_hidden: bool = False,
+        n: int = 1,
     ) -> List[Dict[str, Any]]:
         """Generate ``segment_size`` tokens per prompt and return per-token features.
 
         Returns one dict per prompt with keys: token_ids, tokens, text,
-        logprobs (tensor [n, top_k+1]), hidden_states (tensor [n, hidden_dim]
-        or None), finish_reason.
+        all_texts (list of all ``n`` output texts), logprobs (tensor
+        [n_tok, top_k+1] from first output), hidden_states (tensor or None),
+        finish_reason.
         """
         self._lazy_init()
         from vllm import SamplingParams
         from safetensors import safe_open
 
-        params = [SamplingParams(temperature=t, max_tokens=segment_size,
+        params = [SamplingParams(n=n, temperature=t, max_tokens=segment_size,
                                   logprobs=top_k, top_p=1.0, top_k=0)
                   for t in temperatures]
         outputs = self._llm.generate(prompts, params, use_tqdm=False)
@@ -136,13 +138,14 @@ class VLLMFeatureExporter:
         for out in outputs:
             o0 = out.outputs[0]
             token_ids = o0.token_ids
-            n = len(token_ids)
+            n_tok = len(token_ids)
             tokens = [self._tokenizer.decode([tid]) if self._tokenizer else ""
                       for tid in token_ids]
             finish_reason = getattr(o0, "finish_reason", None)
+            all_texts = [o.text for o in out.outputs]
 
             lp_tensor: Optional[torch.Tensor] = None
-            if o0.logprobs and n > 0:
+            if o0.logprobs and n_tok > 0:
                 lp_rows = []
                 for idx, tid in enumerate(token_ids):
                     lp_dict = o0.logprobs[idx] if idx < len(o0.logprobs) else None
@@ -160,7 +163,7 @@ class VLLMFeatureExporter:
                     if len(row) < top_k + 1:
                         row += [-20.0] * (top_k + 1 - len(row))
                     lp_rows.append(torch.tensor(row, dtype=torch.float32))
-                lp_tensor = torch.stack(lp_rows)  # [n, top_k+1]
+                lp_tensor = torch.stack(lp_rows)  # [n_tok, top_k+1]
 
             hs_tensor: Optional[torch.Tensor] = None
             if return_hidden:
@@ -170,12 +173,13 @@ class VLLMFeatureExporter:
                         hs = f.get_tensor("hidden_states")  # [seq_len, 1, hidden_dim]
                     os.remove(hs_path)
                     hs_1d = hs[:, -1, :]                       # [seq_len, hidden_dim]
-                    hs_tensor = hs_1d[-n:].float()             # [n, hidden_dim]
+                    hs_tensor = hs_1d[-n_tok:].float()         # [n_tok, hidden_dim]
 
             results.append({
                 "token_ids": token_ids,
                 "tokens": tokens,
                 "text": o0.text,
+                "all_texts": all_texts,
                 "logprobs": lp_tensor,
                 "hidden_states": hs_tensor,
                 "finish_reason": finish_reason,

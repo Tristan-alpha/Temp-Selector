@@ -10,18 +10,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
-from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 import yaml
 
+from features.segmenter import build_segments, segment_pooling
 from features.dataset_eval import load_temperature_labels
-from features.vectorizer import token_to_obs, mean_pool_obs, compute_entropy
 from ppo.model import PolicyValueNet
+from inference.vllm_runner import VLLMFeatureExporter
 from utils.jsonl import sample_prefix
 from utils.exp_logger import setup_experiment_logger
 from utils.math import safe_div
@@ -82,7 +81,7 @@ class OnlineTemperatureEvaluator:
         model_name_or_path: str,
         ppo_ckpt: str,
         config: Dict[str, Any],
-        parallel_size: int | str = "auto",
+        parallel_size: int | None = None,
     ):
         self.segment_size = int(config["data"]["segment_size"])
         self.max_new_tokens = int(config["inference"]["max_new_tokens"])
@@ -94,35 +93,24 @@ class OnlineTemperatureEvaluator:
         self.num_votes = int(config["inference"].get("num_votes", 1))
         self.system_prompt = config["inference"].get("system_prompt", "")
         self.use_math_chat = bool(config["inference"].get("use_math_chat_prompt", True))
+        self.feature_mode = config["inference"].get("feature_mode", "basic")
 
-        from vllm import LLM
-
-        tp = self._resolve_tp(parallel_size)
-        max_model_len = self.max_new_tokens + 2048
         gpu_mem = float(config.get("inference", {}).get("gpu_memory_utilization", 0.90))
-        self.llm = LLM(model=model_name_or_path, tensor_parallel_size=tp, max_model_len=max_model_len, gpu_memory_utilization=gpu_mem)
-        self.tokenizer = self.llm.get_tokenizer()
+        self.runner = VLLMFeatureExporter(
+            model_name_or_path=model_name_or_path,
+            max_new_tokens=self.max_new_tokens,
+            parallel_size=parallel_size,
+            gpu_memory_utilization=gpu_mem,
+            feature_mode=self.feature_mode,
+            reserve_training_gpu=True,
+        )
+        self.tokenizer = self.runner.tokenizer
 
         ckpt = torch.load(ppo_ckpt, map_location="cpu", weights_only=False)
         policy_state = ckpt.get("policy_value", ckpt)
         self.policy = PolicyValueNet(obs_dim=self.obs_dim, n_actions=self.n_actions, hidden=self.hidden_dim)
         self.policy.load_state_dict(policy_state, strict=False)
         self.policy.eval()
-
-    @staticmethod
-    def _resolve_tp(parallel_size: int | str) -> int:
-        if isinstance(parallel_size, int) and parallel_size >= 1:
-            return parallel_size
-        import os
-        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-        if visible:
-            devices = [d.strip() for d in visible.split(",") if d.strip() and d.strip() != "-1"]
-            if devices:
-                return max(1, len(devices))
-        try:
-            return max(1, int(torch.cuda.device_count()))
-        except Exception:
-            return 1
 
     def _render_prompt(self, question: str) -> str:
         if not self.use_math_chat:
@@ -137,33 +125,6 @@ class OnlineTemperatureEvaluator:
             parts = [f"[SYSTEM]\n{self.system_prompt}", f"[USER]\n{question}", "[ASSISTANT]\n"]
             return "\n\n".join(parts)
 
-    def _extract_segment_obs(self, token_ids: List[int], logprobs_list: List[Any]) -> Optional[torch.Tensor]:
-        if not token_ids or not logprobs_list:
-            return None
-
-        token_obs: List[torch.Tensor] = []
-        for tid, lp_item in zip(token_ids, logprobs_list):
-            if lp_item is None:
-                continue
-            if isinstance(lp_item, dict):
-                selected_lp_obj = lp_item.get(tid)
-                if selected_lp_obj is None:
-                    selected_lp = float(max(lp_item.values(), key=lambda v: v.logprob).logprob) if lp_item else -20.0
-                else:
-                    selected_lp = float(selected_lp_obj.logprob)
-                logprob_vals = sorted(
-                    [float(v.logprob) for v in lp_item.values()],
-                    reverse=True,
-                )[:self.top_k_logprobs]
-            else:
-                selected_lp = float(getattr(lp_item, 'logprob', -20.0))
-                logprob_vals = [selected_lp] * self.top_k_logprobs
-
-            entropy_val = compute_entropy(logprob_vals)
-            token_obs.append(token_to_obs(selected_lp, entropy_val, logprob_vals, self.obs_dim))
-
-        return mean_pool_obs(token_obs, self.obs_dim)
-
     def _evaluate_strategy_batch(
         self,
         prompts_data: List[Dict[str, Any]],
@@ -171,8 +132,6 @@ class OnlineTemperatureEvaluator:
         best_fixed_temp: float,
         rng: random.Random,
     ) -> OnlineResult:
-        from vllm import SamplingParams
-
         V = self.num_votes
         N = len(prompts_data)
         rendered = [self._render_prompt(self._get_question(p)) for p in prompts_data]
@@ -184,13 +143,13 @@ class OnlineTemperatureEvaluator:
         all_temps: List[List[float]] = [[] for _ in range(N)]
         n_segments: List[int] = [0] * N
 
-        from utils.answer_verifier import verify_answer, self_consistency_correct
+        from utils.answer_verifier import self_consistency_correct
 
         max_rounds = self.max_new_tokens // self.segment_size + 1
 
         for _seg_idx in range(max_rounds):
             round_prompts: List[str] = []
-            round_params: List[SamplingParams] = []
+            round_temps: List[float] = []
             round_indices: List[int] = []
 
             for i in range(N):
@@ -213,35 +172,55 @@ class OnlineTemperatureEvaluator:
                     temp = rng.choice(self.temp_bins)
 
                 all_temps[i].append(temp)
-                round_params.append(SamplingParams(
-                    n=V, temperature=temp, max_tokens=self.segment_size,
-                    logprobs=self.top_k_logprobs,
-                    top_p=1.0, top_k=0,
-                ))
+                round_temps.append(temp)
                 round_indices.append(i)
 
             if not round_indices:
                 break
 
-            outputs = self.llm.generate(round_prompts, round_params, use_tqdm=False)
+            feats = self.runner.generate_with_features(
+                round_prompts, round_temps, self.segment_size,
+                top_k=self.top_k_logprobs, n=V,
+            )
 
             for j, i in enumerate(round_indices):
-                req_outputs = outputs[j].outputs
-                for v in range(min(V, len(req_outputs))):
-                    out = req_outputs[v]
-                    generated[i][v] += out.text
+                f = feats[j]
+                for v in range(min(V, len(f["all_texts"]))):
+                    generated[i][v] += f["all_texts"][v]
 
-                out0 = req_outputs[0]
                 n_segments[i] += 1
 
-                finish_reason = getattr(out0, 'finish_reason', None)
-                if (self.tokenizer.eos_token_id is not None and self.tokenizer.eos_token_id in out0.token_ids) or \
-                   finish_reason == 'stop' or not out0.token_ids:
+                if (self.tokenizer.eos_token_id is not None and
+                    self.tokenizer.eos_token_id in f["token_ids"]) or \
+                   f["finish_reason"] == 'stop' or not f["token_ids"]:
                     active[i] = False
                     continue
 
-                if out0.logprobs:
-                    segment_obs[i] = self._extract_segment_obs(out0.token_ids, out0.logprobs)
+                if f["logprobs"] is not None:
+                    lp_t = f["logprobs"]
+                    n_tok = len(f["token_ids"])
+                    parts = [torch.tensor(
+                        [[float(lp_t[k, 0]), 0.0] for k in range(n_tok)],
+                        dtype=torch.float32)]
+                    for k in range(n_tok):
+                        probs = torch.softmax(lp_t[k, 1:].float(), dim=0)
+                        ent = -(probs * torch.log(probs + 1e-12)).sum()
+                        parts[0][k, 1] = ent.item()
+                    tok_vecs = torch.cat(parts, dim=1)
+                    if tok_vecs.shape[1] < self.obs_dim:
+                        tok_vecs = torch.cat([
+                            tok_vecs,
+                            torch.zeros(n_tok, self.obs_dim - tok_vecs.shape[1]),
+                        ], dim=1)
+                    else:
+                        tok_vecs = tok_vecs[:, :self.obs_dim]
+                    spans = build_segments(tokens=f["tokens"], mode="step",
+                                           segment_size=self.segment_size,
+                                           response=f["text"])
+                    obs = segment_pooling(tok_vecs, spans, self.obs_dim,
+                                          mode="mean",
+                                          segment_size=self.segment_size)
+                    segment_obs[i] = obs.tolist()
 
         result = OnlineResult()
         for i in range(N):
