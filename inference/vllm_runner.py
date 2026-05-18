@@ -40,7 +40,7 @@ class GenerationOutput:
 
 
 class _LogprobsComputeFn:
-    """Callable for ``llm.apply_model()`` — must be picklable (no closures)."""
+    """Callable for ``llm.apply_model()`` — single chunk, must be picklable."""
 
     def __init__(self, hidden_states_cpu, token_ids_cpu, k, temperature_cpu=None):
         self.hidden_states_cpu = hidden_states_cpu
@@ -50,29 +50,17 @@ class _LogprobsComputeFn:
 
     def __call__(self, model):
         from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
-        import torch as _t
         dev = next(model.parameters()).device
         h = self.hidden_states_cpu.to(dev, non_blocking=True)
         ids = self.token_ids_cpu.to(dev, non_blocking=True)
-        n, = h.shape[:1]
+
+        normed = model.model.norm(h)
+        logits = model.compute_logits(normed)
         if self.temperature_cpu is not None:
             t = self.temperature_cpu.to(dev, non_blocking=True)
-
-        CHUNK_SIZE = 1024
-        lp_chunks, id_chunks = [], []
-        for start in range(0, n, CHUNK_SIZE):
-            end = start + CHUNK_SIZE
-            normed = model.model.norm(h[start:end])
-            logits = model.compute_logits(normed)
-            if self.temperature_cpu is not None:
-                logits = logits / t
-            result = compute_topk_logprobs(logits, self.k, ids[start:end])
-            lp_chunks.append(result.logprobs.cpu())
-            id_chunks.append(result.logprob_token_ids.cpu())
-
-        lp = _t.cat(lp_chunks, dim=0) if len(lp_chunks) > 1 else lp_chunks[0]
-        ids_out = _t.cat(id_chunks, dim=0) if len(id_chunks) > 1 else id_chunks[0]
-        return _t.stack([lp, ids_out.float()])
+            logits = logits / t
+        result = compute_topk_logprobs(logits, self.k, ids)
+        return result.logprobs.cpu()
 
 
 class VLLMFeatureExporter:
@@ -258,11 +246,13 @@ class VLLMFeatureExporter:
         top_k: int = 4096,
         return_logprobs: bool = False,
         return_hidden: bool = False,
+        device: torch.device | None = None,
     ) -> Dict[str, List[torch.Tensor]]:
         """Return per-response logprob and/or hidden tensors from pre-tokenized IDs.
 
         Uses a single ``llm.generate()`` call to get hidden states, then
-        optionally computes logprobs via ``apply_model``.
+        optionally computes logprobs via ``apply_model``.  Logprob chunks
+        are concatenated on ``device`` (or CPU if ``None``).
         """
         self._lazy_init()
         from vllm import SamplingParams
@@ -307,12 +297,23 @@ class VLLMFeatureExporter:
             if return_logprobs:
                 t_cpu = (torch.tensor(temperatures[i], dtype=torch.float32)
                          if temperatures is not None else None)
-                raw = self._llm.apply_model(
-                    _LogprobsComputeFn(resp_hs.cpu(),
-                                       torch.tensor(token_ids, dtype=torch.long),
-                                       top_k, t_cpu)
-                )[0]
-                logprob_results.append(raw[0].float())          # [R, top_k+1]
+                tid_tensor = torch.tensor(token_ids, dtype=torch.long)
+                hs_cpu = resp_hs.cpu()
+
+                CHUNK = 1024
+                lp_chunks: List[torch.Tensor] = []
+                for start in range(0, n_resp, CHUNK):
+                    end = min(start + CHUNK, n_resp)
+                    raw = self._llm.apply_model(
+                        _LogprobsComputeFn(hs_cpu[start:end],
+                                           tid_tensor[start:end],
+                                           top_k, t_cpu)
+                    )[0]
+                    lp_chunks.append(raw)
+
+                cat_device = device if device is not None else torch.device("cpu")
+                lp = torch.cat([c.to(cat_device) for c in lp_chunks], dim=0)
+                logprob_results.append(lp.float())               # [R, top_k+1]
             if return_hidden:
                 hidden_results.append(resp_hs.float())
 

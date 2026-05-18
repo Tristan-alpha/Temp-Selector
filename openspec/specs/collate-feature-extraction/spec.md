@@ -2,12 +2,12 @@
 
 ### Requirement: Unified extract_from_ids method
 
-`VLLMFeatureExporter` SHALL provide a single `extract_from_ids` method that replaces `extract_logprobs_from_ids` and `extract_hidden_from_ids`. The method SHALL accept `return_logprobs: bool` and `return_hidden: bool` flags and SHALL make at most one `llm.generate()` call. The method SHALL return a dict with optional `"logprobs"` and `"hidden"` keys.
+`VLLMFeatureExporter` SHALL provide a single `extract_from_ids` method that replaces `extract_logprobs_from_ids` and `extract_hidden_from_ids`. The method SHALL accept `return_logprobs: bool`, `return_hidden: bool`, and `device: torch.device | None` parameters and SHALL make at most one `llm.generate()` call. Logprob computation SHALL be chunked (CHUNK_SIZE=1024) with per-chunk `apply_model` calls, concatenated on `device` (or CPU if `None`). The method SHALL return a dict with optional `"logprobs"` and `"hidden"` keys.
 
-#### Scenario: Both logprobs and hidden requested
+#### Scenario: Both logprobs and hidden requested with training GPU cat
 
-- **WHEN** `extract_from_ids(full_ids, prompt_lens, temperatures=temps, return_logprobs=True, return_hidden=True)` is called
-- **THEN** a single `llm.generate()` call SHALL be made, and the returned dict SHALL contain both `"logprobs"` and `"hidden"` tensors
+- **WHEN** `extract_from_ids(full_ids, prompt_lens, temperatures=temps, return_logprobs=True, return_hidden=True, device=train_device)` is called
+- **THEN** a single `llm.generate()` call SHALL be made, logprob chunks SHALL be cat'd on `train_device`, and the returned dict SHALL contain both `"logprobs"` and `"hidden"` tensors
 
 #### Scenario: Only logprobs requested
 

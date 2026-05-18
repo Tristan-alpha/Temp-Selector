@@ -104,6 +104,7 @@ def make_collate_fn(
                 full_ids, prompt_lens, temperatures=temps,
                 return_logprobs=need_logprobs,
                 return_hidden=need_hidden,
+                device=train_device,
             )
             logprob_tensors = result.get("logprobs")
             hidden_tensors = result.get("hidden")
