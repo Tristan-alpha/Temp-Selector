@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from features.schema import TokenFeature
 
@@ -247,79 +250,78 @@ class VLLMFeatureExporter:
     # Extraction (pre-tokenized, for MIL training collate_fn)
     # ------------------------------------------------------------------
 
-    def extract_logprobs_from_ids(
+    def extract_from_ids(
         self,
         full_ids: List[List[int]],
         prompt_lens: List[int],
         temperatures: Optional[List[float]] = None,
         top_k: int = 4096,
-    ) -> List[torch.Tensor]:
-        """Return per-response top-k logprob tensors via apply_model + compute_logits."""
+        return_logprobs: bool = False,
+        return_hidden: bool = False,
+    ) -> Dict[str, List[torch.Tensor]]:
+        """Return per-response logprob and/or hidden tensors from pre-tokenized IDs.
+
+        Uses a single ``llm.generate()`` call to get hidden states, then
+        optionally computes logprobs via ``apply_model``.
+        """
         self._lazy_init()
         from vllm import SamplingParams
         from safetensors import safe_open
 
-        sp = SamplingParams(max_tokens=1, top_p=1.0, top_k=0)
         if temperatures is not None:
             params = [SamplingParams(max_tokens=1, top_p=1.0, top_k=0, temperature=t)
                       for t in temperatures]
         else:
-            params = [sp] * len(full_ids)
+            params = [SamplingParams(max_tokens=1, top_p=1.0, top_k=0)] * len(full_ids)
         outputs = self._llm.generate(full_ids, params)
 
-        results: List[torch.Tensor] = []
+        logprob_results: List[torch.Tensor] = []
+        hidden_results: List[torch.Tensor] = []
         for i, (out, p_len) in enumerate(zip(outputs, prompt_lens)):
             hs_path = out.kv_transfer_params.get("hidden_states_path")
             if hs_path is None:
-                results.append(torch.zeros(1, top_k))
+                logger.warning("extract_from_ids: no hidden_states_path for sample %d (p_len=%d). "
+                               "Is extract_hidden_states configured in _lazy_init?", i, p_len)
+                if return_logprobs:
+                    logprob_results.append(torch.zeros(1, top_k + 1))
+                if return_hidden:
+                    hidden_results.append(torch.zeros(1, 4096))
                 continue
             with safe_open(hs_path, "pt") as f:
                 hs = f.get_tensor("hidden_states")  # [seq_len, 1, hidden_dim]
             os.remove(hs_path)
-            resp_hs = hs[max(0, p_len - 1):, -1, :]  # [R+1, hidden_dim]
 
-            if resp_hs.shape[0] == 0:
-                results.append(torch.zeros(1, top_k))
+            token_ids = full_ids[i][p_len:]
+            n_resp = len(token_ids)
+            if n_resp == 0:
+                logger.warning("extract_from_ids: zero response tokens for sample %d (p_len=%d)", i, p_len)
+                if return_logprobs:
+                    logprob_results.append(torch.zeros(1, top_k + 1))
+                if return_hidden:
+                    hidden_results.append(torch.zeros(1, 4096))
                 continue
 
-            token_ids = torch.tensor(full_ids[i][p_len:], dtype=torch.long)
-            resp_hs = resp_hs[: len(token_ids)]  # trim extra hidden state
-            t_cpu = (torch.tensor(temperatures[i], dtype=torch.float32)
-                     if temperatures is not None else None)
-            raw = self._llm.apply_model(
-                _LogprobsComputeFn(resp_hs.cpu(), token_ids, top_k, t_cpu)
-            )[0]
-            results.append(raw[0].float())  # logprobs [R, top_k+1]
-        return results
+            hs_1d = hs[:, -1, :]                               # [seq_len, hidden_dim]
+            resp_hs = hs_1d[max(0, p_len - 1):][:n_resp]       # [R, hidden_dim]
 
-    def extract_hidden_from_ids(
-        self,
-        full_ids: List[List[int]],
-        prompt_lens: List[int],
-    ) -> List[torch.Tensor]:
-        """Return per-response hidden states via speculative extract_hidden_states."""
-        self._lazy_init()
-        from vllm import SamplingParams
-        from safetensors import safe_open
+            if return_logprobs:
+                t_cpu = (torch.tensor(temperatures[i], dtype=torch.float32)
+                         if temperatures is not None else None)
+                raw = self._llm.apply_model(
+                    _LogprobsComputeFn(resp_hs.cpu(),
+                                       torch.tensor(token_ids, dtype=torch.long),
+                                       top_k, t_cpu)
+                )[0]
+                logprob_results.append(raw[0].float())          # [R, top_k+1]
+            if return_hidden:
+                hidden_results.append(resp_hs.float())
 
-        outputs = self._llm.generate(
-            full_ids,
-            [SamplingParams(max_tokens=1, top_p=1.0, top_k=0)] * len(full_ids),
-        )
-
-        results: List[torch.Tensor] = []
-        for out, p_len in zip(outputs, prompt_lens):
-            hs_path = out.kv_transfer_params.get("hidden_states_path")
-            if hs_path is None:
-                results.append(torch.zeros(1, 4096))
-                continue
-            with safe_open(hs_path, "pt") as f:
-                hs = f.get_tensor("hidden_states")  # [seq_len, 1, hidden_dim]
-            os.remove(hs_path)
-            hs_1d = hs[:, -1, :]                           # [seq_len, hidden_dim]
-            resp_hs = hs_1d[max(0, p_len - 1):]             # response portion
-            results.append(resp_hs.float())
-        return results
+        result: Dict[str, List[torch.Tensor]] = {}
+        if return_logprobs:
+            result["logprobs"] = logprob_results
+        if return_hidden:
+            result["hidden"] = hidden_results
+        return result
 
     def _build_feature_payload(
         self,

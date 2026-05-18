@@ -98,12 +98,15 @@ def make_collate_fn(
         if need_hidden or need_logprobs:
             full_ids = [r["_full_ids"] for r in batch_rows]
             prompt_lens = [r["_prompt_len"] for r in batch_rows]
+            temps = [float(r.get("temperature", 0.0)) for r in batch_rows]
 
-            if need_hidden:
-                hidden_tensors = extractor.extract_hidden_from_ids(full_ids, prompt_lens)
-            if need_logprobs:
-                temps = [float(r.get("temperature", 0.0)) for r in batch_rows]
-                logprob_tensors = extractor.extract_logprobs_from_ids(full_ids, prompt_lens, temperatures=temps)
+            result = extractor.extract_from_ids(
+                full_ids, prompt_lens, temperatures=temps,
+                return_logprobs=need_logprobs,
+                return_hidden=need_hidden,
+            )
+            logprob_tensors = result.get("logprobs")
+            hidden_tensors = result.get("hidden")
 
         instances_list: List[torch.Tensor] = []
         labels: List[float] = []
