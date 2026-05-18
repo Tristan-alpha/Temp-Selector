@@ -1,181 +1,24 @@
 from __future__ import annotations
 
 import argparse
-import json
 import random
+import yaml
 from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import yaml
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from features.segmenter import build_segments, segment_pooling
-from features.vectorizer import token_to_vec
 from mil.model import MILModel, DynamicTempHead, GlobalTempHead, smoothness_loss
+from mil.utils import BagDataset, TokenBatchSampler, make_collate_fn
 from utils.exp_logger import log_exception, setup_experiment_logger
 
 
 def load_config(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
-
-class TokenBatchSampler(Sampler):
-    """Group samples so each batch stays under ``max_tokens`` total (prompt + response)."""
-
-    def __init__(self, token_counts: List[int], max_tokens: int, shuffle: bool = True):
-        self.token_counts = token_counts
-        self.max_tokens = max_tokens
-        self.shuffle = shuffle
-
-    def __iter__(self):
-        indices = list(range(len(self.token_counts)))
-        if self.shuffle:
-            random.shuffle(indices)
-        batch: List[int] = []
-        batch_tokens = 0
-        for idx in indices:
-            n = self.token_counts[idx]
-            if batch and batch_tokens + n > self.max_tokens:
-                yield batch
-                batch = []
-                batch_tokens = 0
-            batch.append(idx)
-            batch_tokens += n
-        if batch:
-            yield batch
-
-    def __len__(self) -> int:
-        return max(1, sum(self.token_counts) // max(1, self.max_tokens))
-
-
-class BagDataset(Dataset):
-    """Lazy dataset: stores row metadata only.  Feature extraction happens in collate_fn."""
-
-    def __init__(self, data_path: str):
-        self.rows: List[Dict[str, Any]] = []
-        with open(data_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                self.rows.append(json.loads(line))
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        return self.rows[idx]
-
-
-def make_collate_fn(
-    extractor=None,
-    feature_mode: str = "basic",
-    instance_dim: int = 4098,
-    segment_mode: str = "step",
-    segment_size: int = 256,
-    pooling_mode: str = "mean",
-    temp_bins: List[float] | None = None,
-    train_device: torch.device | None = None,
-):
-    """Factory that returns a collate function with per-batch SGLang extraction.
-
-    The returned function receives a list of row dicts from BagDataset,
-    optionally extracts logprob/hidden features via SGLang, builds per-segment
-    instance vectors, and returns a padded batch dict for MIL training.
-    """
-    if temp_bins is None:
-        temp_bins = [0.0]
-    bin_map = {float(v): i for i, v in enumerate(temp_bins)}
-    need_hidden = feature_mode in {"hidden_states", "all"} and extractor is not None
-    need_logprobs = feature_mode in {"topk_logprobs", "all"} and extractor is not None
-
-    def collate_fn(batch_rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        hidden_tensors = None
-        logprob_tensors = None
-        if need_hidden or need_logprobs:
-            full_ids = [r["_full_ids"] for r in batch_rows]
-            prompt_lens = [r["_prompt_len"] for r in batch_rows]
-            temps = [float(r.get("temperature", 0.0)) for r in batch_rows]
-
-            result = extractor.extract_from_ids(
-                full_ids, prompt_lens, temperatures=temps,
-                return_logprobs=need_logprobs,
-                return_hidden=need_hidden,
-                device=train_device,
-            )
-            logprob_tensors = result.get("logprobs")
-            hidden_tensors = result.get("hidden")
-
-        instances_list: List[torch.Tensor] = []
-        labels: List[float] = []
-        temp_indices: List[int] = []
-
-        for i, row in enumerate(batch_rows):
-            token_features = row.get("token_features", [])
-            if not token_features:
-                instances_list.append(torch.zeros(1, instance_dim))
-                labels.append(float(row.get("label", 0)))
-                t_val = float(row.get("temperature", temp_bins[0]))
-                temp_indices.append(bin_map.get(t_val, 0))
-                continue
-
-            h_t = hidden_tensors[i] if hidden_tensors is not None else None
-            l_t = logprob_tensors[i] if logprob_tensors is not None else None
-            n = len(token_features)
-
-            parts = [torch.tensor([[float(tf.get("logprob", -20.0)), float(tf.get("entropy", 0.0))]
-                                   for tf in token_features], dtype=torch.float32)]
-            if l_t is not None:
-                parts.append(l_t[:n])
-            if h_t is not None:
-                parts.append(h_t[:n])
-            t = torch.cat(parts, dim=1)
-            if t.shape[1] < instance_dim:
-                t = torch.cat([t, torch.zeros(n, instance_dim - t.shape[1])], dim=1)
-            else:
-                t = t[:, :instance_dim]
-
-            token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
-                           for tf in token_features]
-            response = row.get("response", "")
-            spans = build_segments(
-                tokens=token_texts, mode=segment_mode,
-                segment_size=segment_size, response=response,
-            )
-
-            if train_device is not None and train_device.type == "cuda":
-                inst = segment_pooling(t.to(train_device), spans, instance_dim,
-                                       mode=pooling_mode, segment_size=segment_size).cpu()
-            else:
-                inst = segment_pooling(t, spans, instance_dim,
-                                       mode=pooling_mode, segment_size=segment_size)
-            instances_list.append(inst)
-            labels.append(float(row.get("label", 0)))
-            t_val = float(row.get("temperature", temp_bins[0]))
-            temp_indices.append(bin_map.get(t_val, 0))
-
-        max_k = max(inst.shape[0] for inst in instances_list)
-        d = instances_list[0].shape[1]
-        b = len(instances_list)
-        x = torch.zeros((b, max_k, d), dtype=torch.float32)
-        mask = torch.zeros((b, max_k), dtype=torch.float32)
-        y = torch.tensor(labels, dtype=torch.float32)
-        t = torch.tensor(temp_indices, dtype=torch.long)
-
-        for i, inst in enumerate(instances_list):
-            k = inst.shape[0]
-            x[i, :k] = inst
-            mask[i, :k] = 1.0
-
-        batch_tokens = sum(len(r.get("_full_ids", r.get("token_features", []))) for r in batch_rows)
-
-        return {"instances": x, "mask": mask, "label": y, "temp_idx": t,
-                "_batch_tokens": batch_tokens}
-
-    return collate_fn
 
 
 def seed_everything(seed: int) -> None:
@@ -339,9 +182,9 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         neg_means: List[float] = []
         with torch.no_grad():
             for batch_v in val_loader:
-                x_v = batch_v["instances"].to(device)
-                mask_v = batch_v["mask"].to(device)
-                y_v = batch_v["label"].to(device)
+                x_v = batch_v["instances"]
+                mask_v = batch_v["mask"]
+                y_v = batch_v["label"]
                 inst = mil(x_v)["inst_logit"]
                 for i in range(y_v.size(0)):
                     n_valid = int(mask_v[i].sum().item())
@@ -373,10 +216,10 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         pbar = tqdm(total=total_tokens, desc=f"Epoch {epoch + 1}/{max_epochs}",
                      unit="tok", dynamic_ncols=True)
         for batch in loader:
-            x = batch["instances"].to(device)
-            mask = batch["mask"].to(device)
-            y = batch["label"].to(device)
-            t = batch["temp_idx"].to(device)
+            x = batch["instances"]
+            mask = batch["mask"]
+            y = batch["label"]
+            t = batch["temp_idx"]
             bags = x.shape[0]
 
             out = mil(x)

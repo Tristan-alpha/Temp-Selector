@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from utils.exp_logger import setup_experiment_logger
 
 from mil.model import MILModel, DynamicTempHead, GlobalTempHead, smoothness_loss
-from mil.training import BagDataset, make_collate_fn, TokenBatchSampler
+from mil.utils import BagDataset, make_collate_fn, TokenBatchSampler
 from utils.math import safe_div
 
 
