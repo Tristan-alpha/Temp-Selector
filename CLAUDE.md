@@ -6,40 +6,39 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 
 | Path | Role |
 |---|---|
-| `features/schema.py` | `TokenFeature`, `Segment`, `BagSample` — core data structures |
-| `features/segmenter.py` | Segmentation strategies (`fixed_window`, `step`, `punctuation`) + `segment_pooling` |
-| `features/vectorizer.py` | `token_to_vec`, `token_to_obs`, `mean_pool_obs`, `compute_entropy` — feature construction |
-| `features/dataset_eval.py` | `evaluate_dataset()`, `load_temperature_labels()` — Stage 1 analysis |
-| `inference/vllm_runner.py` | `VLLMFeatureExporter` — vLLM backend for generation + extraction |
-| `mil/model.py` | `MILModel`, temp heads, smoothness_loss — all MIL model definitions |
-| `mil/training.py` | `BagDataset`, `make_collate_fn`, `train()` — Stage 2 training |
-| `mil/eval.py` | `evaluate_mil()` + all MIL metric functions — Stage 2 evaluation |
-| `ppo/model.py` | `PolicyValueNet`, `compute_gae`, `sample_action`, warm-start — PPO model |
-| `ppo/training.py` | `train_ppo()` + online feature extraction — Stage 3 training |
+| `features/schema.py` | `Segment` dataclass |
+| `features/segmenter.py` | Segmentation strategies + `segment_pooling` + `build_segment_obs_from_lp` |
+| `features/vectorizer.py` | `token_to_vec`, `token_to_obs`, `mean_pool_obs`, `compute_entropy` |
+| `features/dataset_eval.py` | `evaluate_dataset()`, `load_temperature_labels()` |
+| `inference/vllm_runner.py` | `VLLMFeatureExporter` — generation + `extract_from_ids` + `generate_with_features` |
+| `mil/model.py` | `MILModel`, temp heads, `smoothness_loss` |
+| `mil/utils.py` | `BagDataset`, `TokenBatchSampler`, `make_collate_fn` — shared MIL data utilities |
+| `mil/training.py` | `train()` — Stage 2 training loop |
+| `mil/eval.py` | `evaluate_mil()` — Stage 2 evaluation |
+| `ppo/model.py` | `PolicyValueNet`, `compute_gae`, `sample_action`, warm-start |
+| `ppo/training.py` | `train_ppo()` — Stage 3 training |
 | `ppo/eval.py` | `OnlineTemperatureEvaluator` — Stage 3 online evaluation |
-| `utils/math.py` | `safe_div` — shared one-liner |
-| `utils/answer_verifier.py` | Math-Verify wrapper for answer correctness checking |
-| `utils/exp_logger.py` | File + stream logging setup |
-| `utils/dataset_io.py` | Hybrid JSONL + safetensors I/O — **deleted**; online extraction replaces safetensors sidecar |
-| `scripts/run_pipeline.sh` | Full pipeline orchestrator (`STAGES` env var controls which stages run) |
-| `scripts/build_dataset.py` | Stage 1 entry: vLLM multi-temp gen, majority voting. For hidden_states/all mode: merged build+split writes train/val/test JSONL+safetensors directly |
-| `scripts/split_jsonl.py` | Group-aware train/eval split; propagates safetensors sidecar |
-| `utils/jsonl.py` | Shared JSONL helpers (`sample_prefix`, `row_group_key`, `load_jsonl`, `write_jsonl`, `split_by_group`) |
+| `utils/math.py` | `safe_div` |
+| `utils/answer_verifier.py` | Math-Verify wrapper (`verify_answer`, `extract_final_answer`, `self_consistency_correct`) |
+| `utils/exp_logger.py` | File + stream logging |
+| `utils/jsonl.py` | JSONL helpers (`load_jsonl`, `write_jsonl`, `split_by_group`) |
+| `scripts/build_dataset.py` | Stage 1: raw vLLM gen, majority voting → JSONL with train/val/test splits |
+| `scripts/run_pipeline.sh` | Pipeline orchestrator (`STAGES` env var) |
 | `configs/dataset/` | Dataset generation configs (paths, inference, split) |
 | `configs/training/` | MIL + PPO training configs (data, mil, ppo, inference) |
 
 ## Key data flow
 
 ```
-Stage 1: JSONL prompts → multi-temp generation → BagSample (per prompt×temp×vote)
-         BagSample = {token_features: [TokenFeature], segment_spans: [Segment], label: 0|1, ...}
-         feature_mode=hidden_states/all → merged build+split → train/val/test JSONL (no sidecar)
+Stage 1: JSONL prompts → raw vLLM multi-temp gen → majority voting → JSONL
+         JSONL row = {sample_id, prompt, response, label, temperature,
+                      token_ids, tokens, metadata}
               ↓
-Stage 2: BagDataset loads JSONL as list[dict] (metadata only).  make_collate_fn
-         produces a collate function that extracts logprob/hidden features per
-         training batch via VLLMFeatureExporter → segment_pooling → [K, 4098] instance
-         matrix.  MILModel(instances) → {bag_logit, inst_logit, attn_w, encoder_out}
-         Loss = bag_bce + β×top_k_instance_bce + α×temp_ce + γ×smoothness
+Stage 2: BagDataset loads JSONL as list[dict].  make_collate_fn always
+         does online extraction via extract_from_ids → build_segment_obs_from_lp
+         → segment_pooling → [K, 4098] instance matrix.
+         MILModel(instances) → {bag_logit, inst_logit, attn_w, encoder_out}
+         Loss = bag_bce + β×instance_bce + α×temp_ce + γ×smoothness
               ↓  warm-start backbone + inst_logit as shaping reward
 Stage 3: PolicyValueNet(segment_obs) → temperature action
          vLLM generates next segment at chosen temp
