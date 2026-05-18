@@ -230,6 +230,7 @@ def evaluate_mil(
         segment_size=int(config["data"].get("segment_size", 32)),
         pooling_mode=config["data"].get("segment_pooling", "mean"),
         temp_bins=temp_bins,
+        train_device=device,
     )
     token_counts = [len(r.get("_full_ids", r.get("token_features", []))) for r in dataset.rows]
     eval_sampler = TokenBatchSampler(token_counts, max_tokens_per_batch, shuffle=False)

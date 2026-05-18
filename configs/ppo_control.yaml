@@ -40,10 +40,6 @@ inference:
   num_votes: 8
   top_k_logprobs: 4096
   feature_mode: topk_logprobs
-  api:
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    max_concurrent: 16
-    max_retries: 3
 
 mil:
   model:

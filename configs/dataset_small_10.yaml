@@ -22,7 +22,7 @@ inference:
   num_votes: 8
   top_k_logprobs: 4096
   debug_token_check: false
-  feature_mode: topk_logprobs
+  feature_mode: basic
   use_math_chat_prompt: true
   system_prompt: |
     You are a math reasoning assistant.
@@ -37,7 +37,3 @@ inference:
     - The final paragraph must include the final boxed answer written as \boxed{}.
     - Do not include any explanations, headers, or summaries outside the steps.
     - The response must end immediately after the final paragraph containing \boxed{}.
-  api:
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    max_concurrent: 16
-    max_retries: 3

@@ -36,21 +36,39 @@ class GenerationOutput:
     hidden_states: Optional[List[List[float]]]
 
 
-def _make_logprobs_fn(hidden_states_cpu, token_ids_cpu, k, temperature_cpu=None):
-    """Return a closure for ``llm.apply_model()`` to compute top-k logprobs."""
-    def _fn(model):
+class _LogprobsComputeFn:
+    """Callable for ``llm.apply_model()`` — must be picklable (no closures)."""
+
+    def __init__(self, hidden_states_cpu, token_ids_cpu, k, temperature_cpu=None):
+        self.hidden_states_cpu = hidden_states_cpu
+        self.token_ids_cpu = token_ids_cpu
+        self.k = k
+        self.temperature_cpu = temperature_cpu
+
+    def __call__(self, model):
         from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
+        import torch as _t
         dev = next(model.parameters()).device
-        h = hidden_states_cpu.to(dev, non_blocking=True)
-        ids = token_ids_cpu.to(dev, non_blocking=True)
-        normed = model.model.norm(h)
-        logits = model.compute_logits(normed)
-        if temperature_cpu is not None:
-            t = temperature_cpu.to(dev, non_blocking=True)
-            logits = logits / t.unsqueeze(-1)
-        result = compute_topk_logprobs(logits, k, ids)
-        return torch.stack([result.logprobs.cpu(), result.logprob_token_ids.cpu().float()])
-    return _fn
+        h = self.hidden_states_cpu.to(dev, non_blocking=True)
+        ids = self.token_ids_cpu.to(dev, non_blocking=True)
+        n, = h.shape[:1]
+
+        CHUNK_SIZE = 1024
+        lp_chunks, id_chunks = [], []
+        for start in range(0, n, CHUNK_SIZE):
+            end = start + CHUNK_SIZE
+            normed = model.model.norm(h[start:end])
+            logits = model.compute_logits(normed)
+            if self.temperature_cpu is not None:
+                t = self.temperature_cpu.to(dev, non_blocking=True)
+                logits = logits / t.unsqueeze(-1)
+            result = compute_topk_logprobs(logits, self.k, ids[start:end])
+            lp_chunks.append(result.logprobs.cpu())
+            id_chunks.append(result.logprob_token_ids.cpu())
+
+        lp = _t.cat(lp_chunks, dim=0) if len(lp_chunks) > 1 else lp_chunks[0]
+        ids_out = _t.cat(id_chunks, dim=0) if len(id_chunks) > 1 else id_chunks[0]
+        return _t.stack([lp, ids_out.float()])
 
 
 class VLLMFeatureExporter:
@@ -78,26 +96,24 @@ class VLLMFeatureExporter:
 
     def _resolve_parallel_size(self) -> int:
         if isinstance(self.parallel_size, int):
-            return max(1, self.parallel_size)
+            tp = self.parallel_size
+        elif isinstance(self.parallel_size, str) and self.parallel_size.lower() != "auto":
+            tp = max(1, int(self.parallel_size))
+        else:
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+            if visible:
+                devices = [d.strip() for d in visible.split(",") if d.strip() and d.strip() != "-1"]
+                tp = max(1, len(devices)) if devices else 1
+            else:
+                try:
+                    import torch as _t
+                    tp = max(1, int(_t.cuda.device_count()))
+                except Exception:
+                    tp = 1
 
-        if isinstance(self.parallel_size, str) and self.parallel_size.lower() != "auto":
-            try:
-                return max(1, int(self.parallel_size))
-            except ValueError:
-                return 1
-
-        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-        if visible:
-            devices = [d.strip() for d in visible.split(",") if d.strip() and d.strip() != "-1"]
-            if devices:
-                return max(1, len(devices))
-
-        try:
-            import torch
-
-            return max(1, int(torch.cuda.device_count()))
-        except Exception:
-            return 1
+        if self.engine_preset == "prefill":
+            tp = max(1, tp - 1)
+        return tp
 
     @property
     def tokenizer(self):
@@ -194,9 +210,6 @@ class VLLMFeatureExporter:
         chunks.append("[ASSISTANT]\n")
         return "\n\n".join(chunks)
 
-    def generate(self, prompt: str, temperature: float, top_k_logprobs: int = 16) -> GenerationOutput:
-        return self.generate_batch(prompts=[prompt], temperature=temperature, top_k_logprobs=top_k_logprobs)[0]
-
     def _to_generation_output(self, out: Any, top_k_logprobs: int) -> GenerationOutput:
         token_ids = out.token_ids
         logprobs = []
@@ -232,28 +245,6 @@ class VLLMFeatureExporter:
             topk_logprobs=topk,
             hidden_states=None,
         )
-
-    def generate_batch(self, prompts: List[str], temperature: float, top_k_logprobs: int = 16, num_votes: int = 1) -> List[GenerationOutput]:
-        if not prompts:
-            return []
-
-        self._lazy_init()
-        from vllm import SamplingParams
-
-        sampling_params = SamplingParams(
-            n=num_votes,
-            temperature=temperature,
-            max_tokens=self.max_new_tokens,
-            logprobs=max(1, top_k_logprobs),
-            top_p=1.0, top_k=0,
-        )
-        outputs = self._llm.generate(prompts, sampling_params)
-
-        parsed: List[GenerationOutput] = []
-        for req_out in outputs:
-            for out in req_out.outputs:
-                parsed.append(self._to_generation_output(out=out, top_k_logprobs=top_k_logprobs))
-        return parsed
 
     # ------------------------------------------------------------------
     # Extraction (pre-tokenized, for MIL training collate_fn)
@@ -299,7 +290,7 @@ class VLLMFeatureExporter:
             t_cpu = (torch.tensor([temperatures[i]], dtype=torch.float32)
                      if temperatures is not None else None)
             raw = self._llm.apply_model(
-                _make_logprobs_fn(resp_hs.cpu(), token_ids, top_k, t_cpu)
+                _LogprobsComputeFn(resp_hs.cpu(), token_ids, top_k, t_cpu)
             )[0]
             results.append(raw[0].float())  # logprobs [R, top_k+1]
         return results
@@ -375,10 +366,6 @@ class VLLMFeatureExporter:
             "temperature": temperature,
         }
 
-    # ------------------------------------------------------------------
-    # Multi-temperature batch (APC-optimised)
-    # ------------------------------------------------------------------
-
     def export_token_features_multi_temp(
         self,
         prompts: List[str],
@@ -417,16 +404,19 @@ class VLLMFeatureExporter:
         # Interleave: prompt0@T0, prompt0@T1, ..., prompt0@Tk, prompt1@T0, ...
         all_prompts: List[str] = []
         all_params: List[SamplingParams] = []
+        need_logprobs = self.feature_mode in {"topk_logprobs", "all"}
+        _req_logprobs = max(1, top_k_logprobs) if need_logprobs else None
         for rp in rendered_prompts:
             for temp in temperatures:
-                all_prompts.append(rp)
-                all_params.append(SamplingParams(
-                    n=num_votes,
-                    temperature=temp,
+                sp_kwargs: Dict[str, Any] = dict(
+                    n=num_votes, temperature=temp,
                     max_tokens=self.max_new_tokens,
-                    logprobs=max(1, top_k_logprobs),
                     top_p=1.0, top_k=0,
-                ))
+                )
+                if _req_logprobs is not None:
+                    sp_kwargs["logprobs"] = _req_logprobs
+                all_prompts.append(rp)
+                all_params.append(SamplingParams(**sp_kwargs))
 
         outputs = self._llm.generate(all_prompts, all_params)
 
@@ -446,56 +436,4 @@ class VLLMFeatureExporter:
                 gen=gen,
                 temperature=temperatures[temp_idx],
             ))
-        return payloads
-
-    # ------------------------------------------------------------------
-    # Single-temperature (legacy, kept for API backend compatibility)
-    # ------------------------------------------------------------------
-
-    def export_token_features(
-        self,
-        prompt: str,
-        temperature: float,
-        top_k_logprobs: int = 16,
-        use_math_chat_prompt: bool = False,
-        system_prompt: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        return self.export_token_features_batch(
-            prompts=[prompt],
-            temperature=temperature,
-            top_k_logprobs=top_k_logprobs,
-            use_math_chat_prompt=use_math_chat_prompt,
-            system_prompt=system_prompt,
-        )[0]
-
-    def export_token_features_batch(
-        self,
-        prompts: List[str],
-        temperature: float,
-        top_k_logprobs: int = 16,
-        use_math_chat_prompt: bool = False,
-        system_prompt: Optional[str] = None,
-        num_votes: int = 1,
-    ) -> List[Dict[str, Any]]:
-        if not prompts:
-            return []
-
-        rendered_prompts = list(prompts)
-        if use_math_chat_prompt:
-            rendered_prompts = [
-                self.render_messages(self.build_math_messages(question=p, system_prompt=system_prompt)) for p in prompts
-            ]
-
-        gens = self.generate_batch(prompts=rendered_prompts, temperature=temperature, top_k_logprobs=top_k_logprobs, num_votes=num_votes)
-        payloads = []
-        for i, gen in enumerate(gens):
-            prompt_idx = i // num_votes
-            rendered_prompt = rendered_prompts[prompt_idx]
-            payloads.append(
-                self._build_feature_payload(
-                    rendered_prompt=rendered_prompt,
-                    gen=gen,
-                            temperature=temperature,
-                )
-            )
         return payloads

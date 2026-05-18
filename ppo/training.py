@@ -202,7 +202,8 @@ def train_ppo(
     tokenizer = runner.tokenizer
     logger.info("VLLMFeatureExporter ready parallel_size=%d", tp_size)
 
-    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    device = torch.device(f"cuda:{max(0, n_gpu - 1)}") if n_gpu > 0 else torch.device("cpu")
 
     # ---- PPO policy ----
     policy = PolicyValueNet(obs_dim=obs_dim, n_actions=n_actions, hidden=policy_hidden_dim).to(device)

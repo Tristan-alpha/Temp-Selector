@@ -78,6 +78,7 @@ def make_collate_fn(
     segment_size: int = 256,
     pooling_mode: str = "mean",
     temp_bins: List[float] | None = None,
+    train_device: torch.device | None = None,
 ):
     """Factory that returns a collate function with per-batch SGLang extraction.
 
@@ -110,7 +111,7 @@ def make_collate_fn(
         labels: List[float] = []
         temp_indices: List[int] = []
 
-        _loop_tokens = 0
+        _sub_t = [0.0, 0.0, 0.0]  # build_tensor, build_segments, segment_pooling
         for i, row in enumerate(batch_rows):
             token_features = row.get("token_features", [])
             if not token_features:
@@ -124,19 +125,21 @@ def make_collate_fn(
             l_t = logprob_tensors[i] if logprob_tensors is not None else None
             n = len(token_features)
 
-            # Batch-construct [n, instance_dim] in one cat instead of n per-token cats.
+            _t0 = time.perf_counter()
             parts = [torch.tensor([[float(tf.get("logprob", -20.0)), float(tf.get("entropy", 0.0))]
                                    for tf in token_features], dtype=torch.float32)]
             if l_t is not None:
                 parts.append(l_t[:n])
             if h_t is not None:
                 parts.append(h_t[:n])
-            t = torch.cat(parts, dim=1)  # [n, actual_dim]
+            t = torch.cat(parts, dim=1)
             if t.shape[1] < instance_dim:
                 t = torch.cat([t, torch.zeros(n, instance_dim - t.shape[1])], dim=1)
             else:
                 t = t[:, :instance_dim]
+            _sub_t[0] += time.perf_counter() - _t0
 
+            _t0 = time.perf_counter()
             token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
                            for tf in token_features]
             response = row.get("response", "")
@@ -144,8 +147,16 @@ def make_collate_fn(
                 tokens=token_texts, mode=segment_mode,
                 segment_size=segment_size, response=response,
             )
-            inst = segment_pooling(t, spans, instance_dim,
-                                   mode=pooling_mode, segment_size=segment_size)
+            _sub_t[1] += time.perf_counter() - _t0
+
+            _t0 = time.perf_counter()
+            if train_device is not None and train_device.type == "cuda":
+                inst = segment_pooling(t.to(train_device), spans, instance_dim,
+                                       mode=pooling_mode, segment_size=segment_size).cpu()
+            else:
+                inst = segment_pooling(t, spans, instance_dim,
+                                       mode=pooling_mode, segment_size=segment_size)
+            _sub_t[2] += time.perf_counter() - _t0
             instances_list.append(inst)
             labels.append(float(row.get("label", 0)))
             t_val = float(row.get("temperature", temp_bins[0]))
@@ -174,6 +185,9 @@ def make_collate_fn(
             "token2seg_s": _t[2] - _t[1],
             "pad_s": _t[3] - _t[2],
             "total_s": _t[3] - _t[0],
+            "tok2seg_build_s": _sub_t[0],
+            "tok2seg_seg_s": _sub_t[1],
+            "tok2seg_pool_s": _sub_t[2],
         }
 
         return {"instances": x, "mask": mask, "label": y, "temp_idx": t,
@@ -239,8 +253,8 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
                 row["_prompt_len"] = len(pids)
             logger.info("pre_tokenized prompts batch_encoded=%d", len(prompts))
 
-    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-    n_gpu = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    device = torch.device(f"cuda:{max(0, n_gpu - 1)}") if n_gpu > 0 else torch.device("cpu")
     logger.info("device=%s n_gpu=%d", device, n_gpu)
 
     collate_fn = make_collate_fn(
@@ -251,6 +265,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         segment_size=int(cfg["data"].get("segment_size", 32)),
         pooling_mode=cfg["data"].get("segment_pooling", "mean"),
         temp_bins=temp_bins,
+        train_device=device,
     )
 
     max_tokens_per_batch = int(cfg["mil"]["training"].get("max_tokens_per_batch", 100000))
@@ -493,12 +508,15 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
 
             cumul_tokens += _batch_tokens
             logger.info("epoch=%d batch=%d tokens=%d/%d bags=%d loss=%.4f bag=%.4f inst=%.4f | "
-                         "coll[extract=%.2fs tok2seg=%.2fs pad=%.3fs] fwd=%.2fs bwd=%.2fs",
+                         "coll[extract=%.2fs tok2seg=%.2fs(build=%.2f seg=%.2f pool=%.2f) "
+                         "pad=%.3fs] fwd=%.2fs bwd=%.2fs",
                          epoch + 1, batch_idx + 1,
                          cumul_tokens, total_tokens,
                          bags,
                          _batch_loss, _batch_bag, _batch_inst,
-                         _ct.get("extract_s", 0), _ct.get("token2seg_s", 0), _ct.get("pad_s", 0),
+                         _ct.get("extract_s", 0), _ct.get("token2seg_s", 0),
+                         _ct.get("tok2seg_build_s", 0), _ct.get("tok2seg_seg_s", 0),
+                         _ct.get("tok2seg_pool_s", 0), _ct.get("pad_s", 0),
                          t1 - t0, t2 - t1)
 
         avg = sum_loss / max(1, len(loader))
