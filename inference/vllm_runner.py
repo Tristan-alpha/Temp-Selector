@@ -184,7 +184,7 @@ class VLLMFeatureExporter:
         from transformers import AutoConfig
         hf_cfg = AutoConfig.from_pretrained(self.model_name_or_path)
         last_layer_id = hf_cfg.num_hidden_layers  # 1-indexed
-        self._hs_tmpdir = tempfile.mkdtemp(prefix="vllm_hs_")
+        self._hs_tmpdir = tempfile.mkdtemp(prefix="vllm_hs_", dir="/dev/shm")
         atexit.register(self._cleanup_hs_tmpdir)
 
         llm_kwargs: Dict[str, Any] = dict(
@@ -276,7 +276,7 @@ class VLLMFeatureExporter:
                       for t in temperatures]
         else:
             params = [SamplingParams(max_tokens=1, top_p=1.0, top_k=0)] * len(full_ids)
-        outputs = self._llm.generate(full_ids, params)
+        outputs = self._llm.generate(full_ids, params, use_tqdm=False)
 
         logprob_results: List[torch.Tensor] = []
         hidden_results: List[torch.Tensor] = []

@@ -136,10 +136,8 @@ def build_segment_obs_from_lp(
 
     base = torch.zeros(n_tok, 2, dtype=torch.float32)
     base[:, 0] = lp_tensor[:, 0].float()
-    for k in range(n_tok):
-        lp = lp_tensor[k, 1:].float()
-        probs = torch.exp(lp)
-        base[k, 1] = -(probs * lp).sum()
+    lp = lp_tensor[:, 1:].float()
+    base[:, 1] = -(torch.exp(lp) * lp).sum(dim=1)
 
     parts = [base]
     if extra_parts:
