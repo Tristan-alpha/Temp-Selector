@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
 
 logger = logging.getLogger(__name__)
-
-from features.schema import TokenFeature
-
 
 DEFAULT_MATH_SYSTEM_PROMPT = (
     "You are a math reasoning assistant.\n"
@@ -27,16 +22,6 @@ DEFAULT_MATH_SYSTEM_PROMPT = (
     "- Do not include any explanations, headers, or summaries outside the steps.\n"
     "- The response must end immediately after the final paragraph containing \\boxed{}.\n"
 )
-
-
-@dataclass
-class GenerationOutput:
-    text: str
-    tokens: List[str]
-    token_ids: List[int]
-    logprobs: List[float]
-    topk_logprobs: Optional[List[List[float]]]
-    hidden_states: Optional[List[List[float]]]
 
 
 class _LogprobsComputeFn:
@@ -67,14 +52,12 @@ class VLLMFeatureExporter:
     def __init__(self, model_name_or_path: str, max_new_tokens: int = 256,
                  parallel_size: int | None = None,
                  gpu_memory_utilization: float = 0.90,
-                 feature_mode: str = "basic",
                  max_logprobs: int = 4096,
                  reserve_training_gpu: bool = False):
         self.model_name_or_path = model_name_or_path
         self.max_new_tokens = max_new_tokens
         self.parallel_size = parallel_size if isinstance(parallel_size, int) else None
         self.gpu_memory_utilization = gpu_memory_utilization
-        self.feature_mode = feature_mode
         self.max_logprobs = max_logprobs
         self.reserve_training_gpu = reserve_training_gpu
         self._llm = None
@@ -197,42 +180,36 @@ class VLLMFeatureExporter:
         tp_size = self._resolve_parallel_size()
         max_model_len = self.max_new_tokens + 2048
 
+        import tempfile, atexit
+        from transformers import AutoConfig
+        hf_cfg = AutoConfig.from_pretrained(self.model_name_or_path)
+        last_layer_id = hf_cfg.num_hidden_layers  # 1-indexed
+        self._hs_tmpdir = tempfile.mkdtemp(prefix="vllm_hs_")
+        atexit.register(self._cleanup_hs_tmpdir)
+
         llm_kwargs: Dict[str, Any] = dict(
             model=self.model_name_or_path,
             tensor_parallel_size=tp_size,
             max_model_len=max_model_len,
             gpu_memory_utilization=self.gpu_memory_utilization,
             max_logprobs=self.max_logprobs,
+            speculative_config={
+                "method": "extract_hidden_states",
+                "num_speculative_tokens": 1,
+                "draft_model_config": {
+                    "hf_config": {
+                        "eagle_aux_hidden_state_layer_ids": [last_layer_id],
+                    }
+                },
+            },
+            kv_transfer_config={
+                "kv_connector": "ExampleHiddenStatesConnector",
+                "kv_role": "kv_producer",
+                "kv_connector_extra_config": {
+                    "shared_storage_path": self._hs_tmpdir,
+                },
+            },
         )
-
-        need_hidden = self.feature_mode != "basic"
-
-        if need_hidden:
-            import tempfile, atexit
-            from transformers import AutoConfig
-            hf_cfg = AutoConfig.from_pretrained(self.model_name_or_path)
-            # eagle_aux_hidden_state_layer_ids is 1-indexed; last layer = num_layers
-            last_layer_id = hf_cfg.num_hidden_layers
-            self._hs_tmpdir = tempfile.mkdtemp(prefix="vllm_hs_")
-            atexit.register(self._cleanup_hs_tmpdir)
-            llm_kwargs.update(
-                speculative_config={
-                    "method": "extract_hidden_states",
-                    "num_speculative_tokens": 1,
-                    "draft_model_config": {
-                        "hf_config": {
-                            "eagle_aux_hidden_state_layer_ids": [last_layer_id],
-                        }
-                    },
-                },
-                kv_transfer_config={
-                    "kv_connector": "ExampleHiddenStatesConnector",
-                    "kv_role": "kv_producer",
-                    "kv_connector_extra_config": {
-                        "shared_storage_path": self._hs_tmpdir,
-                    },
-                },
-            )
 
         self._llm = LLM(**llm_kwargs)
         self._tokenizer = self._llm.get_tokenizer()
@@ -269,42 +246,6 @@ class VLLMFeatureExporter:
             chunks.append(f"[{role}]\n{content}")
         chunks.append("[ASSISTANT]\n")
         return "\n\n".join(chunks)
-
-    def _to_generation_output(self, out: Any, top_k_logprobs: int) -> GenerationOutput:
-        token_ids = out.token_ids
-        logprobs = []
-        topk = []
-        tokens = []
-        for idx, tid in enumerate(token_ids):
-            token_str = ""
-            if self._tokenizer is not None:
-                try:
-                    token_str = self._tokenizer.decode([tid])
-                except Exception:
-                    token_str = ""
-            tokens.append(token_str)
-            if out.logprobs and idx < len(out.logprobs) and out.logprobs[idx] is not None:
-                lp_dict = out.logprobs[idx]
-                lp = lp_dict.get(tid)
-                if lp is None:
-                    vals = list(lp_dict.values())
-                    lp = max(vals) if vals else -20.0
-                logprobs.append(float(lp.logprob if hasattr(lp, "logprob") else lp))
-                vals = [float(v.logprob if hasattr(v, "logprob") else v) for v in lp_dict.values()]
-                vals = sorted(vals, reverse=True)[:top_k_logprobs]
-                topk.append(vals)
-            else:
-                logprobs.append(-20.0)
-                topk.append([-20.0] * top_k_logprobs)
-
-        return GenerationOutput(
-            text=out.text,
-            tokens=tokens,
-            token_ids=token_ids,
-            logprobs=logprobs,
-            topk_logprobs=topk,
-            hidden_states=None,
-        )
 
     # ------------------------------------------------------------------
     # Extraction (pre-tokenized, for MIL training collate_fn)
@@ -395,117 +336,3 @@ class VLLMFeatureExporter:
         if return_hidden:
             result["hidden"] = hidden_results
         return result
-
-    def _build_feature_payload(
-        self,
-        rendered_prompt: str,
-        gen: GenerationOutput,
-        temperature: float,
-    ) -> Dict[str, Any]:
-        features: List[TokenFeature] = []
-        for i, tid in enumerate(gen.token_ids):
-            logprob = gen.logprobs[i]
-            dist = gen.topk_logprobs[i] if gen.topk_logprobs else [logprob]
-            probs = [math.exp(v) for v in dist]
-            z = sum(probs) + 1e-12
-            entropy = 0.0
-            for p in probs:
-                pn = p / z
-                entropy -= pn * math.log(max(pn, 1e-12))
-
-            # basic / hidden_states: logprob + entropy only
-            # topk_logprobs / all: + top-16 logprob values
-            if self.feature_mode in {"topk_logprobs", "all"}:
-                tk_logits = dist
-            else:
-                tk_logits = None
-
-            features.append(
-                TokenFeature(
-                    token_id=int(tid),
-                    text=gen.tokens[i] if i < len(gen.tokens) else "",
-                    logprob=float(logprob),
-                    entropy=float(entropy),
-                    topk_logprobs=tk_logits,
-                    hidden=None,  # requires speculative decoding backend
-                )
-            )
-
-        return {
-            "prompt": rendered_prompt,
-            "response": gen.text,
-            "token_features": features,
-            "temperature": temperature,
-        }
-
-    def export_token_features_multi_temp(
-        self,
-        prompts: List[str],
-        temperatures: List[float],
-        top_k_logprobs: int = 16,
-        use_math_chat_prompt: bool = False,
-        system_prompt: Optional[str] = None,
-        num_votes: int = 1,
-    ) -> List[Dict[str, Any]]:
-        """Generate completions for *all temperatures* in a single vLLM call.
-
-        Prompts are interleaved so that the same prompt appears consecutively
-        for every temperature — APC shares the prompt KV-cache across all
-        temperature variants automatically.
-
-        Returns one payload per (prompt, temperature, vote).
-        Ordering: prompt0@T0 (×num_votes), prompt0@T1 (×num_votes), ...,
-                  prompt1@T0 (×num_votes), ...
-        """
-        if not prompts or not temperatures:
-            return []
-
-        self._lazy_init()
-        from vllm import SamplingParams
-
-        n_temps = len(temperatures)
-
-        # Render prompts *once* per input prompt
-        rendered_prompts = list(prompts)
-        if use_math_chat_prompt:
-            rendered_prompts = [
-                self.render_messages(self.build_math_messages(question=p, system_prompt=system_prompt))
-                for p in prompts
-            ]
-
-        # Interleave: prompt0@T0, prompt0@T1, ..., prompt0@Tk, prompt1@T0, ...
-        all_prompts: List[str] = []
-        all_params: List[SamplingParams] = []
-        need_logprobs = self.feature_mode in {"topk_logprobs", "all"}
-        _req_logprobs = max(1, top_k_logprobs) if need_logprobs else None
-        for rp in rendered_prompts:
-            for temp in temperatures:
-                sp_kwargs: Dict[str, Any] = dict(
-                    n=num_votes, temperature=temp,
-                    max_tokens=self.max_new_tokens,
-                    top_p=1.0, top_k=0,
-                )
-                if _req_logprobs is not None:
-                    sp_kwargs["logprobs"] = _req_logprobs
-                all_prompts.append(rp)
-                all_params.append(SamplingParams(**sp_kwargs))
-
-        outputs = self._llm.generate(all_prompts, all_params)
-
-        # Parse outputs: each request produces num_votes GenerationOutputs
-        gens: List[GenerationOutput] = []
-        for req_out in outputs:
-            for out in req_out.outputs:
-                gens.append(self._to_generation_output(out=out, top_k_logprobs=top_k_logprobs))
-
-        # Build payloads
-        payloads: List[Dict[str, Any]] = []
-        for i, gen in enumerate(gens):
-            prompt_idx = i // (n_temps * num_votes)
-            temp_idx = (i // num_votes) % n_temps
-            payloads.append(self._build_feature_payload(
-                rendered_prompt=rendered_prompts[prompt_idx],
-                gen=gen,
-                temperature=temperatures[temp_idx],
-            ))
-        return payloads

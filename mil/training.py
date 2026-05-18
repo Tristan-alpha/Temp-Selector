@@ -43,22 +43,19 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
     temp_bins = [float(x) for x in cfg["data"]["temp_bins"]]
     instance_dim = int(cfg["data"]["instance_dim"])
     hidden_dim = int(cfg["mil"]["model"]["hidden_dim"])
-    feature_mode = cfg["inference"].get("feature_mode", "basic")
+    feature_mode = cfg["inference"].get("feature_mode", "topk_logprobs")
 
     # Create extraction engine (shared across train + val)
-    extraction_logprobs = feature_mode in {"topk_logprobs", "all"}
     runner = None
-    if extraction_logprobs or feature_mode in {"hidden_states", "all"}:
-        from inference.vllm_runner import VLLMFeatureExporter
-        runner = VLLMFeatureExporter(
-            model_name_or_path=cfg["inference"]["model_name_or_path"],
-            max_new_tokens=int(cfg["inference"].get("max_new_tokens", 8192)),
-            parallel_size=parallel_size,
-            gpu_memory_utilization=float(cfg["inference"].get("gpu_memory_utilization", 0.90)),
-            feature_mode=feature_mode,
-            reserve_training_gpu=True,
-        )
-        logger.info("VLLMFeatureExporter ready for online feature extraction")
+    from inference.vllm_runner import VLLMFeatureExporter
+    runner = VLLMFeatureExporter(
+        model_name_or_path=cfg["inference"]["model_name_or_path"],
+        max_new_tokens=int(cfg["inference"].get("max_new_tokens", 8192)),
+        parallel_size=parallel_size,
+        gpu_memory_utilization=float(cfg["inference"].get("gpu_memory_utilization", 0.90)),
+        reserve_training_gpu=True,
+    )
+    logger.info("VLLMFeatureExporter ready for online feature extraction")
 
     dataset = BagDataset(data_path=data_path)
     logger.info("dataset_size=%d", len(dataset))
@@ -74,7 +71,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         if prompts:
             encoded = runner.tokenizer(prompts, add_special_tokens=False)
             for row, pids in zip(dataset.rows, encoded.input_ids):
-                resp_ids = [tf["token_id"] for tf in row.get("token_features", [])]
+                resp_ids = row["token_ids"]
                 row["_full_ids"] = pids + resp_ids
                 row["_prompt_len"] = len(pids)
             logger.info("pre_tokenized prompts batch_encoded=%d", len(prompts))
@@ -95,7 +92,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
     )
 
     max_tokens_per_batch = int(cfg["mil"]["training"].get("max_tokens_per_batch", 100000))
-    token_counts = [len(r.get("_full_ids", r.get("token_features", []))) for r in dataset.rows]
+    token_counts = [len(r["_full_ids"]) for r in dataset.rows]
     logger.info("max_tokens_per_batch=%d total_tokens=%d", max_tokens_per_batch, sum(token_counts))
 
     train_sampler = TokenBatchSampler(token_counts, max_tokens_per_batch, shuffle=True)
@@ -158,11 +155,11 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         if prompts:
             encoded = runner.tokenizer(prompts, add_special_tokens=False)
             for row, pids in zip(val_dataset.rows, encoded.input_ids):
-                resp_ids = [tf["token_id"] for tf in row.get("token_features", [])]
+                resp_ids = row["token_ids"]
                 row["_full_ids"] = pids + resp_ids
                 row["_prompt_len"] = len(pids)
 
-    val_token_counts = [len(r.get("_full_ids", r.get("token_features", []))) for r in val_dataset.rows]
+    val_token_counts = [len(r["_full_ids"]) for r in val_dataset.rows]
     val_sampler = TokenBatchSampler(val_token_counts, max_tokens_per_batch, shuffle=False)
     val_loader = DataLoader(
         val_dataset,

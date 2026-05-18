@@ -22,7 +22,7 @@ inference:
   num_votes: 8
   top_k_logprobs: 4096
   debug_token_check: false
-  feature_mode: basic
+  feature_mode: topk_logprobs
   use_math_chat_prompt: true
   system_prompt: |
     You are a math reasoning assistant.

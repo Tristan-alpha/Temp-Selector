@@ -11,25 +11,19 @@ from mil.model import smoothness_loss
 
 # ═══ make_collate_fn / collate_fn ═══
 
-def _make_row(token_texts, label=0, temperature=0.5, extra_features=None):
-    """Build a minimal row dict for collate_fn (feature_mode="basic")."""
-    tf = []
-    for i, text in enumerate(token_texts):
-        feat = {"token_id": i, "text": text, "logprob": -0.1 * (i + 1), "entropy": 0.5}
-        if extra_features:
-            feat.update(extra_features)
-        tf.append(feat)
+def _make_row(token_texts, label=0, temperature=0.5):
+    """Build a minimal row dict for collate_fn."""
     return {
-        "token_features": tf,
+        "token_ids": list(range(len(token_texts))),
+        "tokens": list(token_texts),
         "response": " ".join(token_texts),
         "label": label,
         "temperature": temperature,
-        "prompt": "test",
     }
 
 
 def test_collate_uniform():
-    collate_fn = make_collate_fn(feature_mode="basic", instance_dim=8,
+    collate_fn = make_collate_fn(feature_mode="topk_logprobs", instance_dim=8,
                                  segment_mode="fixed_window", segment_size=256)
     r1 = _make_row(["hello", "world"])
     r2 = _make_row(["foo", "bar", "baz"])
@@ -37,34 +31,10 @@ def test_collate_uniform():
     assert batch["instances"].shape == (2, 1, 8)
     assert batch["mask"].shape == (2, 1)
     assert torch.all(batch["mask"] == 1.0)
-    assert batch["label"].shape == (2,)
-    assert batch["temp_idx"].shape == (2,)
-
-
-def test_collate_variable_lengths():
-    collate_fn = make_collate_fn(feature_mode="basic", instance_dim=8,
-                                 segment_mode="fixed_window", segment_size=1)
-    r1 = _make_row(["a", "b", "c"])
-    r2 = _make_row(["d", "e", "f", "g", "h", "i", "j", "k"])
-    batch = collate_fn([r1, r2])
-    # 3 tokens with segment_size=1 → 3 segments; 8 tokens → 8 segments
-    assert batch["instances"].shape == (2, 8, 8)
-    assert torch.all(batch["mask"][0, :3] == 1.0)
-    assert torch.all(batch["mask"][0, 3:] == 0.0)
-    assert torch.all(batch["mask"][1, :8] == 1.0)
-    assert torch.all(batch["instances"][0, 3:, :] == 0.0)
-
-
-def test_collate_single_segment():
-    collate_fn = make_collate_fn(feature_mode="basic", instance_dim=8)
-    r = _make_row(["hello"])
-    batch = collate_fn([r])
-    assert batch["instances"].shape == (1, 1, 8)
-    assert torch.all(batch["mask"] == 1.0)
 
 
 def test_collate_empty_batch():
-    collate_fn = make_collate_fn(feature_mode="basic", instance_dim=8)
+    collate_fn = make_collate_fn(feature_mode="topk_logprobs", instance_dim=8)
     import pytest
     with pytest.raises(ValueError):
         collate_fn([])

@@ -16,7 +16,7 @@ import torch
 import torch.optim as optim
 import yaml
 
-from features.segmenter import build_segments, segment_pooling
+from features.segmenter import build_segment_obs_from_lp
 from utils.jsonl import sample_prefix
 from mil.model import MILModel
 from ppo.model import PolicyValueNet, sample_action, compute_gae, load_mil_encoder_for_warmstart
@@ -77,9 +77,8 @@ def train_ppo(
     num_votes = int(cfg["inference"].get("num_votes", 1))
     system_prompt = cfg["inference"].get("system_prompt", "")
     use_math_chat = bool(cfg["inference"].get("use_math_chat_prompt", True))
-    feature_mode = cfg["inference"].get("feature_mode", "basic")
-
-    hs_needed = feature_mode in {"hidden_states", "all"}
+    feature_mode = cfg["inference"].get("feature_mode", "topk_logprobs")
+    hs_needed = feature_mode == "hidden_states"
 
     max_iterations = int(cfg["ppo"]["training"]["max_iterations"])
     early_stop_patience = int(cfg["ppo"]["training"]["early_stop_patience"])
@@ -108,7 +107,6 @@ def train_ppo(
         max_new_tokens=max_new_tokens,
         parallel_size=parallel_size,
         gpu_memory_utilization=gpu_mem,
-        feature_mode=feature_mode,
         reserve_training_gpu=True,
     )
     tokenizer = runner.tokenizer
@@ -261,32 +259,11 @@ def train_ppo(
                     continue
 
                 # Build segment observation from per-token logprob/hidden tensors
-                lp_t = f["logprobs"]
-                hs_t = f["hidden_states"]
-                n_tok = len(new_tokens)
-
-                parts = [torch.tensor([[float(lp_t[k, 0]), 0.0] for k in range(n_tok)],
-                                       dtype=torch.float32)]
-                # Compute entropy from top-k logprobs
-                for k in range(n_tok):
-                    probs = torch.softmax(lp_t[k, 1:].float(), dim=0)
-                    ent = -(probs * torch.log(probs + 1e-12)).sum()
-                    parts[0][k, 1] = ent.item()
-                if hs_t is not None:
-                    parts.append(hs_t)
-                tok_vecs = torch.cat(parts, dim=1)  # [n_tok, D]
-                if tok_vecs.shape[1] < obs_dim:
-                    tok_vecs = torch.cat([tok_vecs,
-                        torch.zeros(n_tok, obs_dim - tok_vecs.shape[1])], dim=1)
-                else:
-                    tok_vecs = tok_vecs[:, :obs_dim]
-
-                # Segment pooling — one observation vector per segment
-                spans = build_segments(tokens=f["tokens"], mode="step",
-                                       segment_size=segment_size, response=f["text"])
-                obs = segment_pooling(tok_vecs.to(device), spans,
-                                      obs_dim, mode="mean",
-                                      segment_size=segment_size)
+                extra = [f["hidden_states"]] if f["hidden_states"] is not None else None
+                obs = build_segment_obs_from_lp(
+                    f["logprobs"], f["tokens"], f["text"],
+                    segment_size, obs_dim, device=device, extra_parts=extra,
+                )
                 segment_obs[i] = obs.cpu()
 
         for i in range(N):

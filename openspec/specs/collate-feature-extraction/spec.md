@@ -2,22 +2,21 @@
 
 ### Requirement: Unified extract_from_ids method
 
-`VLLMFeatureExporter` SHALL provide a single `extract_from_ids` method that replaces `extract_logprobs_from_ids` and `extract_hidden_from_ids`. The method SHALL accept `return_logprobs: bool`, `return_hidden: bool`, and `device: torch.device | None` parameters and SHALL make at most one `llm.generate()` call. Logprob computation SHALL be chunked (CHUNK_SIZE=1024) with per-chunk `apply_model` calls, concatenated on `device` (or CPU if `None`). The method SHALL return a dict with optional `"logprobs"` and `"hidden"` keys.
+`VLLMFeatureExporter` SHALL provide a single `extract_from_ids` method. Online extraction SHALL always be active — `_lazy_init` SHALL always configure speculative decode. `make_collate_fn` SHALL always call `extract_from_ids` when an extractor is available. The method SHALL accept `return_logprobs: bool`, `return_hidden: bool`, and `device: torch.device | None` parameters.
 
-#### Scenario: Both logprobs and hidden requested with training GPU cat
+#### Scenario: Always-on extraction
 
-- **WHEN** `extract_from_ids(full_ids, prompt_lens, temperatures=temps, return_logprobs=True, return_hidden=True, device=train_device)` is called
-- **THEN** a single `llm.generate()` call SHALL be made, logprob chunks SHALL be cat'd on `train_device`, and the returned dict SHALL contain both `"logprobs"` and `"hidden"` tensors
+- **WHEN** `make_collate_fn` is called with an extractor
+- **THEN** `extract_from_ids` SHALL be called to compute online features
 
-#### Scenario: Only logprobs requested
+### Requirement: Two feature modes
 
-- **WHEN** `return_logprobs=True, return_hidden=False`
-- **THEN** the returned dict SHALL contain only `"logprobs"` key
+The system SHALL support exactly two feature modes: `topk_logprobs` (extracts logprob + entropy + top-k logprobs per token) and `hidden_states` (extracts hidden states per token). The modes `basic` and `all` SHALL NOT exist.
 
-#### Scenario: Only hidden requested
+#### Scenario: Valid feature modes
 
-- **WHEN** `return_logprobs=False, return_hidden=True`
-- **THEN** the returned dict SHALL contain only `"hidden"` key
+- **WHEN** `feature_mode` is set
+- **THEN** it SHALL be either `"topk_logprobs"` or `"hidden_states"`
 
 ### Requirement: Warning on missing hidden states
 
@@ -58,3 +57,15 @@ All stages (MIL training, MIL eval, PPO training, build_dataset) SHALL use `VLLM
 **Reason**: Merged into `extract_from_ids`.
 
 **Migration**: Use `extract_from_ids(full_ids, prompt_lens, return_hidden=True)["hidden"]`.
+
+### Requirement: feature_mode basic
+
+**Reason**: Fake logprobs (-20.0) in JSONL replaced by always-on online extraction.
+
+**Migration**: Use `feature_mode: topk_logprobs` and `extract_from_ids(return_logprobs=True)`.
+
+### Requirement: feature_mode all
+
+**Reason**: Unused in any config. Both modes can be achieved separately.
+
+**Migration**: Use appropriate mode (`topk_logprobs` or `hidden_states`) depending on which features are needed.

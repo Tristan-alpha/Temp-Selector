@@ -194,20 +194,16 @@ def evaluate_mil(
         dynamic_head.load_state_dict(dynamic_state)
         dynamic_head.eval()
 
-    feature_mode = config["inference"].get("feature_mode", "basic")
+    feature_mode = config["inference"].get("feature_mode", "topk_logprobs")
 
-    extraction_logprobs = feature_mode in {"topk_logprobs", "all"}
-    runner = None
-    if extraction_logprobs or feature_mode in {"hidden_states", "all"}:
-        from inference.vllm_runner import VLLMFeatureExporter
-        runner = VLLMFeatureExporter(
-            model_name_or_path=config["inference"]["model_name_or_path"],
-            max_new_tokens=int(config["inference"].get("max_new_tokens", 8192)),
-            parallel_size=parallel_size,
-            gpu_memory_utilization=float(config["inference"].get("gpu_memory_utilization", 0.90)),
-            feature_mode=feature_mode,
-            reserve_training_gpu=True,
-        )
+    from inference.vllm_runner import VLLMFeatureExporter
+    runner = VLLMFeatureExporter(
+        model_name_or_path=config["inference"]["model_name_or_path"],
+        max_new_tokens=int(config["inference"].get("max_new_tokens", 8192)),
+        parallel_size=parallel_size,
+        gpu_memory_utilization=float(config["inference"].get("gpu_memory_utilization", 0.90)),
+        reserve_training_gpu=True,
+    )
 
     dataset = BagDataset(data_path=data_path)
 
@@ -219,7 +215,7 @@ def evaluate_mil(
         if prompts:
             encoded = runner.tokenizer(prompts, add_special_tokens=False)
             for row, pids in zip(dataset.rows, encoded.input_ids):
-                resp_ids = [tf["token_id"] for tf in row.get("token_features", [])]
+                resp_ids = row["token_ids"]
                 row["_full_ids"] = pids + resp_ids
                 row["_prompt_len"] = len(pids)
 
@@ -233,7 +229,7 @@ def evaluate_mil(
         temp_bins=temp_bins,
         train_device=device,
     )
-    token_counts = [len(r.get("_full_ids", r.get("token_features", []))) for r in dataset.rows]
+    token_counts = [len(r["_full_ids"]) for r in dataset.rows]
     eval_sampler = TokenBatchSampler(token_counts, max_tokens_per_batch, shuffle=False)
     loader = DataLoader(dataset, batch_sampler=eval_sampler, collate_fn=collate_fn, num_workers=0)
 

@@ -113,6 +113,52 @@ def segment_pooling(
 
 
 # ═══════════════════════════════════════════════════════════════
+# Shared helper for PPO feature extraction
+# ═══════════════════════════════════════════════════════════════
+
+def build_segment_obs_from_lp(
+    lp_tensor: torch.Tensor,
+    tokens: List[str],
+    text: str,
+    segment_size: int,
+    obs_dim: int,
+    device: torch.device | None = None,
+    extra_parts: List[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Convert ``generate_with_features`` logprob tensor into segment obs.
+
+    ``lp_tensor``: [n_tok, top_k+1] where col 0 = sampled logprob, cols 1: = top-k.
+    Returns [n_segments, obs_dim].
+    """
+    n_tok = lp_tensor.shape[0]
+    if n_tok == 0:
+        return torch.zeros(1, obs_dim, device=device)
+
+    base = torch.zeros(n_tok, 2, dtype=torch.float32)
+    base[:, 0] = lp_tensor[:, 0].float()
+    for k in range(n_tok):
+        probs = torch.softmax(lp_tensor[k, 1:].float(), dim=0)
+        base[k, 1] = -(probs * torch.log(probs + 1e-12)).sum()
+
+    parts = [base]
+    if extra_parts:
+        parts.extend(extra_parts)
+    tok_vecs = torch.cat(parts, dim=1)
+    if tok_vecs.shape[1] < obs_dim:
+        tok_vecs = torch.cat([
+            tok_vecs, torch.zeros(n_tok, obs_dim - tok_vecs.shape[1]),
+        ], dim=1)
+    else:
+        tok_vecs = tok_vecs[:, :obs_dim]
+
+    spans = build_segments(tokens=tokens, mode="step",
+                           segment_size=segment_size, response=text)
+    return segment_pooling(tok_vecs.to(device) if device is not None else tok_vecs,
+                           spans, obs_dim, mode="mean",
+                           segment_size=segment_size)
+
+
+# ═══════════════════════════════════════════════════════════════
 # Dispatcher
 # ═══════════════════════════════════════════════════════════════
 

@@ -76,19 +76,18 @@ def make_collate_fn(
     if temp_bins is None:
         temp_bins = [0.0]
     bin_map = {float(v): i for i, v in enumerate(temp_bins)}
-    need_hidden = feature_mode in {"hidden_states", "all"} and extractor is not None
-    need_logprobs = feature_mode in {"topk_logprobs", "all"} and extractor is not None
+    need_hidden = feature_mode == "hidden_states" and extractor is not None
+    need_logprobs = feature_mode == "topk_logprobs" and extractor is not None
+    has_extractor = extractor is not None
 
     def collate_fn(batch_rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         hidden_tensors = None
         logprob_tensors = None
-        if need_hidden or need_logprobs:
-            full_ids = [r["_full_ids"] for r in batch_rows]
-            prompt_lens = [r["_prompt_len"] for r in batch_rows]
-            temps = [float(r.get("temperature", 0.0)) for r in batch_rows]
-
+        if has_extractor:
             result = extractor.extract_from_ids(
-                full_ids, prompt_lens, temperatures=temps,
+                [r["_full_ids"] for r in batch_rows],
+                [r["_prompt_len"] for r in batch_rows],
+                temperatures=[float(r.get("temperature", 0.0)) for r in batch_rows],
                 return_logprobs=need_logprobs,
                 return_hidden=need_hidden,
                 device=train_device,
@@ -101,40 +100,33 @@ def make_collate_fn(
         temp_indices: List[int] = []
 
         for i, row in enumerate(batch_rows):
-            token_features = row.get("token_features", [])
-            if not token_features:
+            token_ids = row["token_ids"]
+            n = len(token_ids)
+            if n == 0:
                 instances_list.append(torch.zeros(1, instance_dim, device=train_device))
                 labels.append(float(row.get("label", 0)))
-                t_val = float(row.get("temperature", temp_bins[0]))
-                temp_indices.append(bin_map.get(t_val, 0))
+                temp_indices.append(bin_map.get(float(row.get("temperature", temp_bins[0]))))
                 continue
 
-            h_t = hidden_tensors[i] if hidden_tensors is not None else None
-            l_t = logprob_tensors[i] if logprob_tensors is not None else None
-            n = len(token_features)
-
-            parts = [torch.tensor([[float(tf.get("logprob", -20.0)), float(tf.get("entropy", 0.0))]
-                                   for tf in token_features], dtype=torch.float32)]
-            if l_t is not None:
-                parts.append(l_t[:n, 1:])  # skip col 0 — duplicate of JSONL logprob
-            if h_t is not None:
-                parts.append(h_t[:n])
-            t = torch.cat(parts, dim=1)
-            if t.shape[1] < instance_dim:
-                t = torch.cat([t, torch.zeros(n, instance_dim - t.shape[1])], dim=1)
+            if logprob_tensors is not None:
+                inst = build_segment_obs_from_lp(
+                    logprob_tensors[i][:n], row["tokens"], row["response"],
+                    segment_size, instance_dim, device=train_device,
+                    extra_parts=[hidden_tensors[i][:n]] if hidden_tensors is not None else None,
+                )
+            elif hidden_tensors is not None:
+                tok_vecs = hidden_tensors[i][:n]
+                if tok_vecs.shape[1] < instance_dim:
+                    tok_vecs = torch.cat([tok_vecs,
+                        torch.zeros(n, instance_dim - tok_vecs.shape[1])], dim=1)
+                else:
+                    tok_vecs = tok_vecs[:, :instance_dim]
+                spans = build_segments(tokens=row["tokens"], mode=segment_mode,
+                                       segment_size=segment_size, response=row["response"])
+                inst = segment_pooling(tok_vecs.to(train_device), spans, instance_dim,
+                                       mode=pooling_mode, segment_size=segment_size)
             else:
-                t = t[:, :instance_dim]
-
-            token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
-                           for tf in token_features]
-            response = row.get("response", "")
-            spans = build_segments(
-                tokens=token_texts, mode=segment_mode,
-                segment_size=segment_size, response=response,
-            )
-
-            inst = segment_pooling(t.to(train_device), spans, instance_dim,
-                                   mode=pooling_mode, segment_size=segment_size)
+                inst = torch.zeros(1, instance_dim, device=train_device)
             instances_list.append(inst)
             labels.append(float(row.get("label", 0)))
             t_val = float(row.get("temperature", temp_bins[0]))

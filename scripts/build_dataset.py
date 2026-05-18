@@ -12,10 +12,9 @@ from typing import Any, Dict, List
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml
+from vllm import LLM, SamplingParams
 
-from features.schema import BagSample
 from inference.vllm_runner import DEFAULT_MATH_SYSTEM_PROMPT
-from inference.vllm_runner import VLLMFeatureExporter
 from utils.answer_verifier import verify_answer, self_consistency_correct
 from utils.jsonl import write_jsonl
 from utils.exp_logger import log_exception, setup_experiment_logger
@@ -74,13 +73,25 @@ def build_dataset(
 
     inf_cfg = cfg["inference"]
 
-    exporter = VLLMFeatureExporter(
-        model_name_or_path=inf_cfg["model_name_or_path"],
-        max_new_tokens=inf_cfg["max_new_tokens"],
-        parallel_size=parallel_size,
-        gpu_memory_utilization=float(inf_cfg.get("gpu_memory_utilization", 0.90)),
-        feature_mode=inf_cfg.get("feature_mode", "basic"),
-    )
+    # Raw LLM — no speculative decode overhead for generation-only use
+    import torch
+    n_gpus = torch.cuda.device_count()
+    if n_gpus == 0:
+        raise RuntimeError("No GPUs available")
+    tp_size = parallel_size if parallel_size is not None else n_gpus
+    if tp_size < 1:
+        raise RuntimeError(f"Invalid parallel_size: {parallel_size}")
+
+    model_path = inf_cfg["model_name_or_path"]
+    max_new_tokens = int(inf_cfg["max_new_tokens"])
+    max_model_len = max_new_tokens + 2048
+    gpu_mem = float(inf_cfg.get("gpu_memory_utilization", 0.90))
+    llm = LLM(model=model_path, tensor_parallel_size=tp_size,
+              max_model_len=max_model_len, gpu_memory_utilization=gpu_mem)
+    tokenizer = llm.get_tokenizer()
+
+    use_math_chat = bool(inf_cfg.get("use_math_chat_prompt", True))
+    system_prompt = inf_cfg.get("system_prompt", DEFAULT_MATH_SYSTEM_PROMPT)
 
     rows_prepared: List[Dict[str, Any]] = []
     for row in prompts:
@@ -91,169 +102,133 @@ def build_dataset(
         if gold_answer is None:
             raise ValueError("Each input row must contain gold 'answer' for auto-labeling.")
         sample_base = row.get("sample_id") or row.get("unique_id") or str(uuid.uuid4())
-        rows_prepared.append(
-            {
-                "question": question,
-                "gold_answer": str(gold_answer),
-                "sample_base": sample_base,
-                "source": row.get("source", "unknown"),
-                "subject": row.get("subject", ""),
-                "level": row.get("level", ""),
-            }
-        )
+        rows_prepared.append({
+            "question": question,
+            "gold_answer": str(gold_answer),
+            "sample_base": sample_base,
+            "source": row.get("source", "unknown"),
+            "subject": row.get("subject", ""),
+            "level": row.get("level", ""),
+        })
 
     num_votes = int(inf_cfg.get("num_votes", 1))
     if num_votes < 1:
         raise ValueError(f"num_votes must be >= 1, got {num_votes}")
     logger.info("num_votes=%d majority_voting=%s", num_votes, "enabled" if num_votes > 1 else "disabled")
 
-    out_file = Path(output_path)
-    out_file.parent.mkdir(parents=True, exist_ok=True)
     all_temps = [float(t) for t in inf_cfg["temperature_grid"]]
     n_temps = len(all_temps)
     total_rows = len(rows_prepared)
-    all_questions = [r["question"] for r in rows_prepared]
 
+    # Render prompts
+    rendered_prompts: List[str] = []
+    for q in rows_prepared:
+        question = q["question"]
+        if use_math_chat:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question},
+            ]
+            try:
+                rp = tokenizer.apply_chat_template(messages, tokenize=False,
+                                                    add_generation_prompt=True,
+                                                    enable_thinking=False)
+            except Exception:
+                rp = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{question}\n\n[ASSISTANT]\n"
+        else:
+            rp = question
+        rendered_prompts.append(rp)
+
+    # Interleave: prompt0@T0, prompt0@T1, ..., prompt1@T0, ...
+    all_prompts: List[str] = []
+    all_params: List[SamplingParams] = []
+    for rp in rendered_prompts:
+        for temp in all_temps:
+            all_prompts.append(rp)
+            all_params.append(SamplingParams(n=num_votes, temperature=temp,
+                                              max_tokens=max_new_tokens,
+                                              top_p=1.0, top_k=0))
+
+    logger.info("multi_temp start n_prompts=%d n_temps=%d total_requests=%d",
+                 total_rows, n_temps, len(all_prompts))
+    outputs = llm.generate(all_prompts, all_params, use_tqdm=True)
+    logger.info("multi_temp done total_outputs=%d", len(outputs))
+
+    # Build sample dicts
+    all_sample_dicts: List[Dict[str, Any]] = []
     n_samples = 0
     n_positive = 0
     n_individual_correct = 0
 
-    # ------------------------------------------------------------------
-    # Generate all temperatures.  vLLM uses APC for KV-cache sharing;
-    # SGLang uses radix cache; API backend uses per-temperature loop.
-    # ------------------------------------------------------------------
-    logger.info("multi_temp start n_prompts=%d n_temps=%d total_requests=%d",
-                 total_rows, n_temps, total_rows * n_temps)
-    exported_batch = exporter.export_token_features_multi_temp(
-        prompts=all_questions,
-        temperatures=all_temps,
-        top_k_logprobs=int(inf_cfg["top_k_logprobs"]),
-        use_math_chat_prompt=bool(inf_cfg.get("use_math_chat_prompt", True)),
-        system_prompt=inf_cfg.get("system_prompt", DEFAULT_MATH_SYSTEM_PROMPT),
-        num_votes=num_votes,
-    )
-    logger.info("multi_temp done total_outputs=%d", len(exported_batch))
+    for q_idx, row_obj in enumerate(rows_prepared):
+        for t_idx, temp in enumerate(all_temps):
+            req_idx = q_idx * n_temps + t_idx
+            req_out = outputs[req_idx]
 
-    # ------------------------------------------------------------------
-    fmode = inf_cfg.get("feature_mode", "basic")
+            vote_texts: List[str] = []
+            vote_token_ids: List[List[int]] = []
+            vote_tokens: List[List[str]] = []
+            vote_correct: List[int] = []
 
-    # Build sample dicts.  For hidden_states/all mode we collect them
-    # in memory, split by group, and write train/val/test directly.
-    # For basic/topk_logprobs we write all_dataset.jsonl inline.
-    # ------------------------------------------------------------------
-    if fmode in {"hidden_states", "all"}:
-        # --- Merged build+split: write train/val/test JSONL (no safetensors sidecar).
-        #     Hidden states are extracted on-demand during MIL training via
-        #     SGLangRunner. ---
-        all_sample_dicts: List[Dict[str, Any]] = []
+            for v, out in enumerate(req_out.outputs):
+                vote_texts.append(out.text)
+                vote_ids = out.token_ids
+                vote_token_ids.append(vote_ids)
+                vote_tokens.append([tokenizer.decode([tid]) if tokenizer else ""
+                                     for tid in vote_ids])
+                vote_correct.append(
+                    1 if verify_answer(prediction=out.text, gold=row_obj["gold_answer"]) else 0)
 
-        for q_idx, row_obj in enumerate(rows_prepared):
-            prompt_start = q_idx * n_temps * num_votes
-            for t_idx, temp in enumerate(all_temps):
-                vote_start = prompt_start + t_idx * num_votes
-                vote_exports = exported_batch[vote_start : vote_start + num_votes]
-                vote_correct = [
-                    1 if verify_answer(prediction=ex["response"], gold=row_obj["gold_answer"]) else 0
-                    for ex in vote_exports
-                ]
-                n_individual_correct += sum(vote_correct)
-                n_correct = sum(vote_correct)
-                responses = [ex["response"] for ex in vote_exports]
-                majority_correct = self_consistency_correct(responses, row_obj["gold_answer"])
-                majority_label = 0 if majority_correct else 1
+            n_individual_correct += sum(vote_correct)
+            n_correct = sum(vote_correct)
+            majority_correct = self_consistency_correct(vote_texts, row_obj["gold_answer"])
+            majority_label = 0 if majority_correct else 1
 
-                for v, exported in enumerate(vote_exports):
-                    n_samples += 1
-                    n_positive += (1 - majority_label)
-                    token_features = exported["token_features"]
-                    for tf in token_features:
-                        tf.topk_logprobs = None
-                    vid_suffix = f"_v{v}" if num_votes > 1 else ""
+            for v in range(num_votes):
+                n_samples += 1
+                if majority_label == 0:
+                    n_positive += 1
+                vid_suffix = f"_v{v}" if num_votes > 1 else ""
+                sample = {
+                    "sample_id": f"{row_obj['sample_base']}_t{temp}{vid_suffix}",
+                    "prompt": row_obj["question"],
+                    "response": vote_texts[v],
+                    "label": majority_label,
+                    "temperature": temp,
+                    "token_ids": vote_token_ids[v],
+                    "tokens": vote_tokens[v],
+                    "metadata": {
+                        "source": row_obj["source"],
+                        "subject": row_obj["subject"],
+                        "level": row_obj["level"],
+                        "gold_answer": row_obj["gold_answer"],
+                        "rendered_prompt": rendered_prompts[q_idx],
+                        "vote_id": v,
+                        "num_votes": num_votes,
+                        "individual_correct": bool(vote_correct[v]),
+                        "votes_correct": n_correct,
+                        "votes_total": num_votes,
+                    },
+                }
+                all_sample_dicts.append(sample)
 
-                    sample = BagSample(
-                        sample_id=f"{row_obj['sample_base']}_t{temp}{vid_suffix}",
-                        prompt=row_obj["question"],
-                        response=exported["response"],
-                        label=majority_label,
-                        temperature=temp,
-                        token_features=token_features,
-                        segment_spans=[],
-                        metadata={
-                            "feature_mode": inf_cfg["feature_mode"],
-                            "source": row_obj["source"],
-                            "subject": row_obj["subject"],
-                            "level": row_obj["level"],
-                            "gold_answer": row_obj["gold_answer"],
-                            "rendered_prompt": exported.get("prompt", row_obj["question"]),
-                            "vote_id": v,
-                            "num_votes": num_votes,
-                            "individual_correct": bool(vote_correct[v]),
-                            "votes_correct": n_correct,
-                            "votes_total": num_votes,
-                        },
-                    )
-                    all_sample_dicts.append(sample.to_dict())
-
-        # Split by group (same logic as split_jsonl.py)
+    # Split and write
+    if train_out and val_out and test_out:
         if not (0.0 < val_ratio < 1.0) or not (0.0 < test_ratio < 1.0) or (val_ratio + test_ratio >= 1.0):
             raise ValueError(f"Invalid split ratios: val={val_ratio} test={test_ratio}")
         train_val_rows, test_rows = split_by_group(all_sample_dicts, test_ratio, split_seed, group_by)
         val_frac = val_ratio / (1.0 - test_ratio)
         train_rows, val_rows = split_by_group(train_val_rows, val_frac, split_seed + 1, group_by)
-
         logger.info("split train=%d val=%d test=%d", len(train_rows), len(val_rows), len(test_rows))
-
         write_jsonl(train_out, train_rows)
         write_jsonl(val_out, val_rows)
         write_jsonl(test_out, test_rows)
     else:
-        # --- Legacy flow: write all_dataset.jsonl inline (no sidecar) ---
+        out_file = Path(output_path)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
         with out_file.open("w", encoding="utf-8") as f:
-            for q_idx, row_obj in enumerate(rows_prepared):
-                prompt_start = q_idx * n_temps * num_votes
-                for t_idx, temp in enumerate(all_temps):
-                    vote_start = prompt_start + t_idx * num_votes
-                    vote_exports = exported_batch[vote_start : vote_start + num_votes]
-                    vote_correct = [
-                        1 if verify_answer(prediction=ex["response"], gold=row_obj["gold_answer"]) else 0
-                        for ex in vote_exports
-                    ]
-                    n_individual_correct += sum(vote_correct)
-                    n_correct = sum(vote_correct)
-                    responses = [ex["response"] for ex in vote_exports]
-                    majority_correct = self_consistency_correct(responses, row_obj["gold_answer"])
-                    majority_label = 0 if majority_correct else 1
-
-                    for v, exported in enumerate(vote_exports):
-                        n_samples += 1
-                        n_positive += (1 - majority_label)
-                        token_features = exported["token_features"]
-                        for tf in token_features:
-                            tf.topk_logprobs = None
-                        vid_suffix = f"_v{v}" if num_votes > 1 else ""
-                        sample = BagSample(
-                            sample_id=f"{row_obj['sample_base']}_t{temp}{vid_suffix}",
-                            prompt=row_obj["question"],
-                            response=exported["response"],
-                            label=majority_label,
-                            temperature=temp,
-                            token_features=token_features,
-                            segment_spans=[],
-                            metadata={
-                                "feature_mode": inf_cfg["feature_mode"],
-                                "source": row_obj["source"],
-                                "subject": row_obj["subject"],
-                                "level": row_obj["level"],
-                                "gold_answer": row_obj["gold_answer"],
-                                "rendered_prompt": exported.get("prompt", row_obj["question"]),
-                                "vote_id": v,
-                                "num_votes": num_votes,
-                                "individual_correct": bool(vote_correct[v]),
-                                "votes_correct": n_correct,
-                                "votes_total": num_votes,
-                            },
-                        )
-                        f.write(json.dumps(sample.to_dict(), ensure_ascii=False) + "\n")
+            for row in all_sample_dicts:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     logger.info(
         "dataset_done run_name=%s n_samples=%d positive_ratio=%.6f individual_accuracy=%.4f num_votes=%d log_path=%s",
