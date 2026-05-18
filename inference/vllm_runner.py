@@ -109,10 +109,78 @@ class VLLMFeatureExporter:
         self._lazy_init()
         return self._tokenizer
 
-    def generate_raw(self, prompts, sampling_params):
-        """Forward to ``llm.generate()``.  For per-segment PPO generation."""
+    def generate_with_features(
+        self,
+        prompts: List[str],
+        temperatures: List[float],
+        segment_size: int,
+        top_k: int = 4096,
+        return_hidden: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Generate ``segment_size`` tokens per prompt and return per-token features.
+
+        Returns one dict per prompt with keys: token_ids, tokens, text,
+        logprobs (tensor [n, top_k+1]), hidden_states (tensor [n, hidden_dim]
+        or None), finish_reason.
+        """
         self._lazy_init()
-        return self._llm.generate(prompts, sampling_params, use_tqdm=False)
+        from vllm import SamplingParams
+        from safetensors import safe_open
+
+        params = [SamplingParams(temperature=t, max_tokens=segment_size,
+                                  logprobs=top_k, top_p=1.0, top_k=0)
+                  for t in temperatures]
+        outputs = self._llm.generate(prompts, params, use_tqdm=False)
+
+        results: List[Dict[str, Any]] = []
+        for out in outputs:
+            o0 = out.outputs[0]
+            token_ids = o0.token_ids
+            n = len(token_ids)
+            tokens = [self._tokenizer.decode([tid]) if self._tokenizer else ""
+                      for tid in token_ids]
+            finish_reason = getattr(o0, "finish_reason", None)
+
+            lp_tensor: Optional[torch.Tensor] = None
+            if o0.logprobs and n > 0:
+                lp_rows = []
+                for idx, tid in enumerate(token_ids):
+                    lp_dict = o0.logprobs[idx] if idx < len(o0.logprobs) else None
+                    if lp_dict is None:
+                        lp_rows.append(torch.full((top_k + 1,), -20.0))
+                        continue
+                    sampled = lp_dict.get(tid)
+                    sampled_lp = float(sampled.logprob if hasattr(sampled, "logprob") else sampled) \
+                        if sampled is not None else -20.0
+                    vals = sorted(
+                        [float(v.logprob if hasattr(v, "logprob") else v) for v in lp_dict.values()],
+                        reverse=True,
+                    )[:top_k]
+                    row = [sampled_lp] + vals
+                    if len(row) < top_k + 1:
+                        row += [-20.0] * (top_k + 1 - len(row))
+                    lp_rows.append(torch.tensor(row, dtype=torch.float32))
+                lp_tensor = torch.stack(lp_rows)  # [n, top_k+1]
+
+            hs_tensor: Optional[torch.Tensor] = None
+            if return_hidden:
+                hs_path = out.kv_transfer_params.get("hidden_states_path")
+                if hs_path is not None:
+                    with safe_open(hs_path, "pt") as f:
+                        hs = f.get_tensor("hidden_states")  # [seq_len, 1, hidden_dim]
+                    os.remove(hs_path)
+                    hs_1d = hs[:, -1, :]                       # [seq_len, hidden_dim]
+                    hs_tensor = hs_1d[-n:].float()             # [n, hidden_dim]
+
+            results.append({
+                "token_ids": token_ids,
+                "tokens": tokens,
+                "text": o0.text,
+                "logprobs": lp_tensor,
+                "hidden_states": hs_tensor,
+                "finish_reason": finish_reason,
+            })
+        return results
 
     def _lazy_init(self) -> None:
         if self._llm is not None:

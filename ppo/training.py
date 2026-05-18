@@ -8,20 +8,15 @@ Usage (single-process; vLLM tensor parallelism handles multi-GPU):
 from __future__ import annotations
 
 import argparse
-import gc
 import json
-import math
 import random
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import yaml
 
-from features.segmenter import segment_pooling
-from features.vectorizer import token_to_vec, compute_entropy, mean_pool_obs
+from features.segmenter import build_segments, segment_pooling
 from utils.jsonl import sample_prefix
 from mil.model import MILModel
 from ppo.model import PolicyValueNet, sample_action, compute_gae, load_mil_encoder_for_warmstart
@@ -32,78 +27,6 @@ from inference.vllm_runner import VLLMFeatureExporter
 def _load_config(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
-
-def _load_prompts(path: str, logger=None) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                if logger:
-                    logger.warning("skipping malformed JSON at line %d", line_no)
-    return rows
-
-
-def _extract_segment_obs(token_ids: List[int], logprobs_list: List[Any],
-                         obs_dim: int, top_k: int,
-                         hidden_states: Optional[List[List[float]]] = None,
-                         feature_mode: str = "basic") -> Optional[torch.Tensor]:
-    """Mean-pool per-token features into one segment observation vector.
-
-    When hidden_states is provided (feature_mode=hidden_states or all),
-    mean-pools the hidden state vectors and concatenates with standard
-    logprob/entropy/topk_logprobs features (or returns hidden-only for
-    hidden_states mode).
-    """
-    if not token_ids or not logprobs_list:
-        return None
-
-    # Standard logprob features
-    token_obs: List[torch.Tensor] = []
-    for tid, lp_item in zip(token_ids, logprobs_list):
-        if lp_item is None:
-            continue
-        if isinstance(lp_item, dict):
-            selected_obj = lp_item.get(tid)
-            if selected_obj is None:
-                selected_lp = float(max(lp_item.values(), key=lambda v: v.logprob).logprob) if lp_item else -20.0
-            else:
-                selected_lp = float(selected_obj.logprob)
-            logprob_vals = sorted([float(v.logprob) for v in lp_item.values()], reverse=True)[:top_k]
-        else:
-            selected_lp = float(getattr(lp_item, 'logprob', -20.0))
-            logprob_vals = [selected_lp] * top_k
-        entropy_val = compute_entropy(logprob_vals)
-        obs = token_to_vec({"logprob": selected_lp, "entropy": entropy_val}, obs_dim,
-                           extracted={"topk_logprobs": torch.tensor(logprob_vals, dtype=torch.float32)})
-        token_obs.append(obs)
-
-    std_vec: Optional[torch.Tensor] = None
-    if feature_mode != "hidden_states":
-        if not token_obs:
-            return None
-        std_vec = mean_pool_obs(token_obs, obs_dim)
-
-    # Hidden state features
-    if hidden_states is not None and feature_mode in {"hidden_states", "all"}:
-        n_hs = len(hidden_states)
-        if n_hs == 0:
-            return std_vec
-        hs_tensor = torch.tensor(hidden_states, dtype=torch.float32)
-        hs_pooled = hs_tensor.mean(dim=0)
-        if feature_mode == "hidden_states":
-            return hs_pooled
-        # all: concatenate
-        if std_vec is not None:
-            return torch.cat([std_vec, hs_pooled])
-        return hs_pooled
-
-    return std_vec
 
 
 def load_train_prompts(dataset_path: str) -> list:
@@ -156,7 +79,6 @@ def train_ppo(
     use_math_chat = bool(cfg["inference"].get("use_math_chat_prompt", True))
     feature_mode = cfg["inference"].get("feature_mode", "basic")
 
-    hs_layer_ids = [int(x) for x in cfg["inference"].get("eagle_aux_hidden_state_layer_ids", [28])]
     hs_needed = feature_mode in {"hidden_states", "all"}
 
     max_iterations = int(cfg["ppo"]["training"]["max_iterations"])
@@ -181,22 +103,16 @@ def train_ppo(
     model_path = cfg["inference"]["model_name_or_path"]
     gpu_mem = float(cfg["inference"].get("gpu_memory_utilization", 0.90))
 
-    if parallel_size is not None:
-        tp_size = parallel_size
-    else:
-        tp_size = torch.cuda.device_count()
-    if tp_size < 1:
-        raise RuntimeError(f"Invalid parallel_size: {parallel_size}")
-
     runner = VLLMFeatureExporter(
         model_name_or_path=model_path,
         max_new_tokens=max_new_tokens,
-        parallel_size=tp_size,
+        parallel_size=parallel_size,
         gpu_memory_utilization=gpu_mem,
         feature_mode=feature_mode,
+        reserve_training_gpu=True,
     )
     tokenizer = runner.tokenizer
-    logger.info("VLLMFeatureExporter ready parallel_size=%d", tp_size)
+    logger.info("VLLMFeatureExporter ready")
 
     n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
     device = torch.device(f"cuda:{max(0, n_gpu - 1)}") if n_gpu > 0 else torch.device("cpu")
@@ -261,7 +177,7 @@ def train_ppo(
         except Exception:
             return f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{question}\n\n[ASSISTANT]\n"
 
-    from utils.answer_verifier import verify_answer, self_consistency_correct
+    from utils.answer_verifier import self_consistency_correct
 
     best_val_value = float("inf")
     patience_counter = 0
@@ -278,8 +194,6 @@ def train_ppo(
         generated: List[List[str]] = [[""] * V for _ in range(N)]
         active = [True] * N
         segment_obs: List[Optional[torch.Tensor]] = [None] * N
-        ep_prefixes: List[str] = [rendered[i] for i in range(N)]  # accumulated for HS extraction
-
         ep_obs: List[List[torch.Tensor]] = [[] for _ in range(N)]
         ep_actions: List[List[torch.Tensor]] = [[] for _ in range(N)]
         ep_logprobs: List[List[torch.Tensor]] = [[] for _ in range(N)]
@@ -287,11 +201,10 @@ def train_ppo(
         ep_correct: List[int] = [-1] * N  # 1 = majority correct, 0 = majority wrong, -1 = unknown
 
         max_rounds = max_new_tokens // segment_size + 1
-        from vllm import SamplingParams
 
         for _seg_idx in range(max_rounds):
             round_prompts = []
-            round_params = []
+            round_temps: List[float] = []
             round_indices = []
 
             for i in range(N):
@@ -321,46 +234,60 @@ def train_ppo(
                     ep_logprobs[i].append(logp.cpu())
                     ep_values[i].append(value.squeeze(0).cpu())
 
-                round_params.append(SamplingParams(
-                    n=V, temperature=temp, max_tokens=segment_size, logprobs=top_k_logprobs,
-                    top_p=1.0, top_k=0,
-                ))
+                round_temps.append(temp)
                 round_indices.append(i)
 
             if not round_indices:
                 break
 
-            seg_hidden_map: Dict[int, Optional[List[List[float]]]] = {}
-            hs_requests: List[Tuple[int, List[int], object, str]] = []
-
-            outputs = runner.generate_raw(round_prompts, round_params)
+            feats = runner.generate_with_features(
+                round_prompts, round_temps, segment_size,
+                top_k=top_k_logprobs, return_hidden=hs_needed,
+            )
 
             for j, i in enumerate(round_indices):
-                req_outputs = outputs[j].outputs
-                for v in range(min(V, len(req_outputs))):
-                    generated[i][v] += req_outputs[v].text
-                out0 = req_outputs[0]
-                new_tokens = out0.token_ids
-                finish_reason = getattr(out0, 'finish_reason', None)
+                f = feats[j]
+                new_tokens = f["token_ids"]
+                finish_reason = f["finish_reason"]
+
+                # Append generated text to all vote slots (V=1 for now, or copy)
+                for v in range(min(V, 1)):
+                    generated[i][v] += f["text"]
+
                 if (tokenizer.eos_token_id is not None and tokenizer.eos_token_id in new_tokens) or \
                    finish_reason == 'stop' or not new_tokens:
                     active[i] = False
                     ep_correct[i] = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
                     continue
-                if out0.logprobs:
-                    seg_text = req_outputs[0].text
-                    if seg_text:
-                        ep_prefixes[i] += seg_text
-                    hs_requests.append((i, new_tokens, out0, seg_text))
 
-            # Compute segment observations
-            for i, new_tokens, out0, _ in hs_requests:
-                obs = _extract_segment_obs(
-                    new_tokens, out0.logprobs, obs_dim, top_k_logprobs,
-                    hidden_states=seg_hidden_map.get(i),
-                    feature_mode=feature_mode,
-                )
-                segment_obs[i] = torch.tensor(obs, dtype=torch.float32) if obs else None
+                # Build segment observation from per-token logprob/hidden tensors
+                lp_t = f["logprobs"]
+                hs_t = f["hidden_states"]
+                n_tok = len(new_tokens)
+
+                parts = [torch.tensor([[float(lp_t[k, 0]), 0.0] for k in range(n_tok)],
+                                       dtype=torch.float32)]
+                # Compute entropy from top-k logprobs
+                for k in range(n_tok):
+                    probs = torch.softmax(lp_t[k, 1:].float(), dim=0)
+                    ent = -(probs * torch.log(probs + 1e-12)).sum()
+                    parts[0][k, 1] = ent.item()
+                if hs_t is not None:
+                    parts.append(hs_t)
+                tok_vecs = torch.cat(parts, dim=1)  # [n_tok, D]
+                if tok_vecs.shape[1] < obs_dim:
+                    tok_vecs = torch.cat([tok_vecs,
+                        torch.zeros(n_tok, obs_dim - tok_vecs.shape[1])], dim=1)
+                else:
+                    tok_vecs = tok_vecs[:, :obs_dim]
+
+                # Segment pooling — one observation vector per segment
+                spans = build_segments(tokens=f["tokens"], mode="step",
+                                       segment_size=segment_size, response=f["text"])
+                obs = segment_pooling(tok_vecs.to(device), spans,
+                                      obs_dim, mode="mean",
+                                      segment_size=segment_size)
+                segment_obs[i] = obs.cpu()
 
         for i in range(N):
             if ep_correct[i] == -1:
