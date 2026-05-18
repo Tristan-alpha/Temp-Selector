@@ -15,13 +15,13 @@ logging:
 data:
   instance_dim: 4098
   temp_bins: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
-  segment_mode: step
-  segment_size: 256
+  segment_mode: fixed_window
+  segment_size: 512
   segment_pooling: mean
 
 inference:
   model_name_or_path: /home/xuezhe/models/Qwen3-8B
-  gpu_memory_utilization: 0.60
+  gpu_memory_utilization: 0.90
   max_new_tokens: 8192
   temperature_grid: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
   use_math_chat_prompt: true
@@ -49,7 +49,8 @@ mil:
     use_position: false
     use_gru: false
   training:
-    max_tokens_per_batch: 100000
+    instance_loss: pure     # topk | pure | soft_pseudo_label | contrastive
+    max_tokens_per_batch: 131072
     lr: 2.0e-4
     max_epochs: 50
     early_stop_patience: 5

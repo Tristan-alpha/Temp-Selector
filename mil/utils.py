@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from features.segmenter import build_segments, segment_pooling
+from features.segmenter import build_segment_obs_from_lp, build_segments, segment_pooling
 
 
 class TokenBatchSampler(Sampler):
