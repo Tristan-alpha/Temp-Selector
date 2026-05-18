@@ -15,7 +15,7 @@ import yaml
 from vllm import LLM, SamplingParams
 
 from inference.vllm_runner import DEFAULT_MATH_SYSTEM_PROMPT
-from utils.answer_verifier import verify_answer, self_consistency_correct
+from utils.answer_verifier import extract_final_answer, verify_answer, self_consistency_correct
 from utils.jsonl import write_jsonl
 from utils.exp_logger import log_exception, setup_experiment_logger
 from utils.jsonl import add_groupby_arg, split_by_group
@@ -54,7 +54,6 @@ def build_dataset(
     test_out: str = "",
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
-    split_seed: int = 42,
     group_by: str = "sample_prefix",
     run_name: str | None = None,
     log_dir: str = "logs",
@@ -142,12 +141,13 @@ def build_dataset(
     # Interleave: prompt0@T0, prompt0@T1, ..., prompt1@T0, ...
     all_prompts: List[str] = []
     all_params: List[SamplingParams] = []
+    gen_seed = int(cfg.get("seed", 42))
     for rp in rendered_prompts:
         for temp in all_temps:
             all_prompts.append(rp)
             all_params.append(SamplingParams(n=num_votes, temperature=temp,
                                               max_tokens=max_new_tokens,
-                                              top_p=1.0, top_k=0))
+                                              top_p=1.0, top_k=0, seed=gen_seed))
 
     logger.info("multi_temp start n_prompts=%d n_temps=%d total_requests=%d",
                  total_rows, n_temps, len(all_prompts))
@@ -169,6 +169,7 @@ def build_dataset(
             vote_token_ids: List[List[int]] = []
             vote_tokens: List[List[str]] = []
             vote_correct: List[int] = []
+            vote_extracted: List[str | None] = []
 
             for v, out in enumerate(req_out.outputs):
                 vote_texts.append(out.text)
@@ -178,6 +179,7 @@ def build_dataset(
                                      for tid in vote_ids])
                 vote_correct.append(
                     1 if verify_answer(prediction=out.text, gold=row_obj["gold_answer"]) else 0)
+                vote_extracted.append(extract_final_answer(out.text))
 
             n_individual_correct += sum(vote_correct)
             n_correct = sum(vote_correct)
@@ -206,6 +208,7 @@ def build_dataset(
                         "vote_id": v,
                         "num_votes": num_votes,
                         "individual_correct": bool(vote_correct[v]),
+                        "extracted_answer": vote_extracted[v],
                         "votes_correct": n_correct,
                         "votes_total": num_votes,
                     },
@@ -216,9 +219,10 @@ def build_dataset(
     if train_out and val_out and test_out:
         if not (0.0 < val_ratio < 1.0) or not (0.0 < test_ratio < 1.0) or (val_ratio + test_ratio >= 1.0):
             raise ValueError(f"Invalid split ratios: val={val_ratio} test={test_ratio}")
-        train_val_rows, test_rows = split_by_group(all_sample_dicts, test_ratio, split_seed, group_by)
+        seed = int(cfg.get("seed", 42))
+        train_val_rows, test_rows = split_by_group(all_sample_dicts, test_ratio, seed, group_by)
         val_frac = val_ratio / (1.0 - test_ratio)
-        train_rows, val_rows = split_by_group(train_val_rows, val_frac, split_seed + 1, group_by)
+        train_rows, val_rows = split_by_group(train_val_rows, val_frac, seed + 1, group_by)
         logger.info("split train=%d val=%d test=%d", len(train_rows), len(val_rows), len(test_rows))
         write_jsonl(train_out, train_rows)
         write_jsonl(val_out, val_rows)
@@ -251,7 +255,6 @@ def main() -> None:
     parser.add_argument("--test-output", default=None, help="Override paths.test_dataset from config")
     parser.add_argument("--val-ratio", type=float, default=None)
     parser.add_argument("--test-ratio", type=float, default=None)
-    parser.add_argument("--split-seed", type=int, default=None)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--parallel-size", type=int, default=None)
@@ -267,13 +270,12 @@ def main() -> None:
     split_cfg = cfg.get("split", {})
     val_ratio = args.val_ratio if args.val_ratio is not None else float(split_cfg.get("val_ratio", 0.1))
     test_ratio = args.test_ratio if args.test_ratio is not None else float(split_cfg.get("test_ratio", 0.1))
-    split_seed = args.split_seed if args.split_seed is not None else int(cfg.get("seed", 42))
     try:
         build_dataset(
             args.config, input_path, output_path,
             train_out=train_out, val_out=val_out, test_out=test_out,
             val_ratio=val_ratio, test_ratio=test_ratio,
-            split_seed=split_seed, group_by=args.group_by,
+            group_by=args.group_by,
             run_name=args.run_name, log_dir=args.log_dir,
             parallel_size=args.parallel_size,
         )

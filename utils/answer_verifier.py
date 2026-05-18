@@ -33,17 +33,23 @@ def _parse(text: str, *, strip: bool = False) -> Any:
 
 
 def verify_answer(prediction: str, gold: str) -> bool:
-    """Check if a full prediction text is mathematically equivalent to gold.
-
-    Used for per-vote ``individual_correct`` statistics.
-    """
+    """Check if the last \\boxed{...} in prediction matches gold."""
     try:
         with _time_limit(_TIMEOUT_SEC):
-            gold_parsed = _parse(gold, strip=True)
-            pred_parsed = _parse(prediction)
+            gold_parsed = _parse("$" + gold + "$", strip=True)
+            boxed = _extract_brace_content(prediction, r"\boxed")
+            if not boxed:
+                return False
+            pred_parsed = _parse("$" + boxed[-1] + "$", strip=True)
             return bool(verify(gold_parsed, pred_parsed))
     except (TimeoutError, Exception):
         return False
+
+
+def extract_final_answer(text: str) -> str | None:
+    """Return the raw content of the last \\boxed{...} in text, or None."""
+    boxed = _extract_brace_content(text, r"\boxed")
+    return boxed[-1] if boxed else None
 
 
 # ═══════════════════════  answer extraction  ═══════════════════════

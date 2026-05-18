@@ -5,6 +5,8 @@ from utils.answer_verifier import (
     _extract_last_dollar,
     _extract_last_number,
     extract_answer,
+    extract_final_answer,
+    verify_answer,
     verify_answer_by_value,
     self_consistency_correct,
 )
@@ -214,3 +216,42 @@ def test_sc_all_empty_extraction():
     assert self_consistency_correct(
         ["gibberish", "nonsense", "blah"], "3"
     ) is False
+
+
+# ═══════════════════════  unit: verify_answer  ═══════════════════════
+
+def test_verify_answer_last_boxed():
+    """Only the last \\boxed{...} is used; no fallback."""
+    assert verify_answer(
+        r"First \boxed{wrong} then \boxed{42}", "42") is True
+
+
+def test_verify_answer_left_right_equivalent():
+    """\\boxed{(3, \\frac{\\pi}{2})} matches \\left( 3, \\frac{\\pi}{2} \\right)."""
+    gold = r"\left( 3, \frac{\pi}{2} \right)"
+    pred = r"The answer is \boxed{(3, \frac{\pi}{2})}."
+    assert verify_answer(pred, gold) is True
+
+
+def test_verify_answer_no_boxed():
+    """No \\boxed{} at all → False."""
+    assert verify_answer("The answer is 42.", "42") is False
+
+
+def test_verify_answer_frac_equivalent():
+    """\\frac{1}{2} vs 1/2."""
+    assert verify_answer(r"\boxed{\frac{1}{2}}", "1/2") is True
+
+
+# ═══════════════════════  unit: extract_final_answer  ═══════════════════════
+
+def test_extract_final_answer_simple():
+    assert extract_final_answer(r"\boxed{42}") == "42"
+
+
+def test_extract_final_answer_last_wins():
+    assert extract_final_answer(r"\boxed{7} and \boxed{42}") == "42"
+
+
+def test_extract_final_answer_no_boxed():
+    assert extract_final_answer("no answer here") is None
