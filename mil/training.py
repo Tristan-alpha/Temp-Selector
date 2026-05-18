@@ -180,7 +180,8 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def train(config_path: str, data_path: str, run_name: str | None = None, log_dir: str = "logs") -> None:
+def train(config_path: str, data_path: str, run_name: str | None = None, log_dir: str = "logs",
+          parallel_size: int | None = None) -> None:
     cfg = load_config(config_path)
     logger, log_path, final_run_name = setup_experiment_logger(
         component="mil_training",
@@ -205,7 +206,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         runner = VLLMFeatureExporter(
             model_name_or_path=cfg["inference"]["model_name_or_path"],
             max_new_tokens=int(cfg["inference"].get("max_new_tokens", 8192)),
-            parallel_size=cfg["inference"].get("parallel_size"),
+            parallel_size=parallel_size,
             gpu_memory_utilization=float(cfg["inference"].get("gpu_memory_utilization", 0.90)),
             feature_mode=feature_mode,
             reserve_training_gpu=True,
@@ -536,11 +537,13 @@ def main() -> None:
     parser.add_argument("--data", default=None, help="Override paths.train_dataset from config")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
+    parser.add_argument("--parallel-size", type=int, default=None)
     args = parser.parse_args()
     cfg = load_config(args.config)
     data_path = args.data or cfg["paths"]["train_dataset"]
     try:
-        train(config_path=args.config, data_path=data_path, run_name=args.run_name, log_dir=args.log_dir)
+        train(config_path=args.config, data_path=data_path, run_name=args.run_name,
+              log_dir=args.log_dir, parallel_size=args.parallel_size)
     except Exception as exc:
         cfg = load_config(args.config)
         logger, _, _ = setup_experiment_logger(

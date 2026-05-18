@@ -59,6 +59,7 @@ def build_dataset(
     group_by: str = "sample_prefix",
     run_name: str | None = None,
     log_dir: str = "logs",
+    parallel_size: int | None = None,
 ) -> None:
     cfg = load_config(config_path)
     logger, log_path, final_run_name = setup_experiment_logger(
@@ -76,7 +77,7 @@ def build_dataset(
     exporter = VLLMFeatureExporter(
         model_name_or_path=inf_cfg["model_name_or_path"],
         max_new_tokens=inf_cfg["max_new_tokens"],
-        parallel_size=inf_cfg.get("parallel_size"),
+        parallel_size=parallel_size,
         gpu_memory_utilization=float(inf_cfg.get("gpu_memory_utilization", 0.90)),
         feature_mode=inf_cfg.get("feature_mode", "basic"),
     )
@@ -278,6 +279,7 @@ def main() -> None:
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
+    parser.add_argument("--parallel-size", type=int, default=None)
     add_groupby_arg(parser)
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -294,6 +296,7 @@ def main() -> None:
             val_ratio=args.val_ratio, test_ratio=args.test_ratio,
             split_seed=args.split_seed, group_by=args.group_by,
             run_name=args.run_name, log_dir=args.log_dir,
+            parallel_size=args.parallel_size,
         )
     except Exception as exc:
         cfg = load_config(args.config)

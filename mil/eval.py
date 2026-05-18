@@ -159,6 +159,7 @@ def evaluate_mil(
     config: Dict[str, Any],
     device: torch.device,
     eval_temp: bool = False,
+    parallel_size: int | None = None,
 ) -> Dict[str, Any]:
     """Comprehensive MIL model evaluation."""
     ckpt = torch.load(mil_ckpt, map_location=device, weights_only=False)
@@ -202,7 +203,7 @@ def evaluate_mil(
         runner = VLLMFeatureExporter(
             model_name_or_path=config["inference"]["model_name_or_path"],
             max_new_tokens=int(config["inference"].get("max_new_tokens", 8192)),
-            parallel_size=config["inference"].get("parallel_size"),
+            parallel_size=parallel_size,
             gpu_memory_utilization=float(config["inference"].get("gpu_memory_utilization", 0.90)),
             feature_mode=feature_mode,
             reserve_training_gpu=True,
@@ -410,6 +411,7 @@ def main() -> None:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--eval-temp", action="store_true", default=False)
+    parser.add_argument("--parallel-size", type=int, default=None)
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -426,7 +428,8 @@ def main() -> None:
 
     device = torch.device(args.device)
     logger.info("data=%s mil_ckpt=%s device=%s", data_path, mil_ckpt, device)
-    metrics = evaluate_mil(mil_ckpt, data_path, config, device, eval_temp=args.eval_temp)
+    metrics = evaluate_mil(mil_ckpt, data_path, config, device, eval_temp=args.eval_temp,
+                           parallel_size=args.parallel_size)
     logger.info("mil_metrics=%s", json.dumps(metrics, indent=2, default=str))
 
     print("\n" + "=" * 60)

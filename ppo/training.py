@@ -131,7 +131,7 @@ def train_ppo(
     config_path: str,
     train_path: str,
     mil_ckpt: str | None = None,
-    parallel_size: int | str = "auto",
+    parallel_size: int | None = None,
     run_name: str | None = None,
     log_dir: str = "logs",
 ) -> None:
@@ -181,16 +181,12 @@ def train_ppo(
     model_path = cfg["inference"]["model_name_or_path"]
     gpu_mem = float(cfg["inference"].get("gpu_memory_utilization", 0.90))
 
-    if isinstance(parallel_size, str) and parallel_size == "auto":
-        import os as _os
-        visible = _os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-        if visible:
-            devices = [d.strip() for d in visible.split(",") if d.strip() and d.strip() != "-1"]
-            tp_size = max(1, len(devices))
-        else:
-            tp_size = 1
+    if parallel_size is not None:
+        tp_size = parallel_size
     else:
-        tp_size = max(1, int(parallel_size))
+        tp_size = torch.cuda.device_count()
+    if tp_size < 1:
+        raise RuntimeError(f"Invalid parallel_size: {parallel_size}")
 
     runner = VLLMFeatureExporter(
         model_name_or_path=model_path,
@@ -507,10 +503,9 @@ def main() -> None:
     cfg = _load_config(args.config)
     train_path = args.train_data or cfg["paths"]["train_dataset"]
     mil_ckpt = args.mil_ckpt or cfg["paths"]["mil_ckpt"]
-    inf = cfg.get("inference", {})
-    psize = args.parallel_size or inf.get("parallel_size", "auto")
     try:
-        train_ppo(args.config, train_path, mil_ckpt=mil_ckpt, parallel_size=psize, run_name=args.run_name, log_dir=args.log_dir)
+        train_ppo(args.config, train_path, mil_ckpt=mil_ckpt,
+                  parallel_size=args.parallel_size, run_name=args.run_name, log_dir=args.log_dir)
     except Exception as exc:
         cfg = _load_config(args.config)
         logger, _, _ = setup_experiment_logger(component="train_ppo", run_name=args.run_name, log_dir=args.log_dir, config=cfg)
