@@ -25,7 +25,8 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 | `scripts/build_dataset.py` | Stage 1 entry: vLLM multi-temp gen, majority voting. For hidden_states/all mode: merged build+split writes train/val/test JSONL+safetensors directly |
 | `scripts/split_jsonl.py` | Group-aware train/eval split; propagates safetensors sidecar |
 | `utils/jsonl.py` | Shared JSONL helpers (`sample_prefix`, `row_group_key`, `load_jsonl`, `write_jsonl`, `split_by_group`) |
-| `configs/` | 5 YAML configs: `base.yaml` + 4 ablation variants |
+| `configs/dataset/` | Dataset generation configs (paths, inference, split) |
+| `configs/training/` | MIL + PPO training configs (data, mil, ppo, inference) |
 
 ## Key data flow
 
@@ -79,10 +80,10 @@ STAGES=build,split GPU_DEVICES=0,1 bash scripts/run_pipeline.sh
 
 **Run an ablation experiment:**
 ```bash
-CONFIG=configs/arch_mlp_only.yaml GPU_DEVICES=0,1 bash scripts/run_pipeline.sh
+CONFIG=configs/training/arch_mlp_only.yaml GPU_DEVICES=0,1 bash scripts/run_pipeline.sh
 ```
 
-**Add a new ablation:** Create `configs/my_ablation.yaml` from `base.yaml`, change the parameter you want to test, then run with `CONFIG=configs/my_ablation.yaml`.
+**Add a new ablation:** Create `configs/training/my_ablation.yaml` from `base.yaml`, change the parameter you want to test, then run with `CONFIG=configs/training/my_ablation.yaml`.
 
 **Run only MIL training after rebuilding data:**
 ```bash

@@ -63,3 +63,12 @@ The `parallel_size` value SHALL NOT be read from YAML config files.
 
 - **WHEN** `VLLMFeatureExporter(model_name_or_path=...)` is called with no GPU-related parameters
 - **THEN** all available GPUs SHALL be used for vLLM with no reservation
+
+### Requirement: Config directory structure
+
+Config files SHALL be organized into `configs/dataset/` and `configs/training/`. Dataset configs SHALL include a `split:` section with `val_ratio` and `test_ratio`. `build_dataset.py` SHALL read split parameters from config, with CLI args as overrides. Split seed SHALL reuse the global `seed` key.
+
+#### Scenario: Split params from config
+
+- **WHEN** `build_dataset.py` is invoked with `--config configs/dataset/full.yaml`
+- **THEN** `val_ratio` and `test_ratio` SHALL be read from config `split:` section; seed SHALL use global `seed`

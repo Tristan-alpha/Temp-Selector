@@ -249,9 +249,9 @@ def main() -> None:
     parser.add_argument("--train-output", default=None, help="Override paths.train_dataset from config")
     parser.add_argument("--val-output", default=None, help="Override paths.val_dataset from config")
     parser.add_argument("--test-output", default=None, help="Override paths.test_dataset from config")
-    parser.add_argument("--val-ratio", type=float, default=0.1)
-    parser.add_argument("--test-ratio", type=float, default=0.1)
-    parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument("--val-ratio", type=float, default=None)
+    parser.add_argument("--test-ratio", type=float, default=None)
+    parser.add_argument("--split-seed", type=int, default=None)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--parallel-size", type=int, default=None)
@@ -264,12 +264,16 @@ def main() -> None:
     train_out = args.train_output or paths_cfg.get("train_dataset", str(Path(output_path).parent / "train.jsonl"))
     val_out = args.val_output or paths_cfg.get("val_dataset", str(Path(output_path).parent / "val.jsonl"))
     test_out = args.test_output or paths_cfg.get("test_dataset", str(Path(output_path).parent / "test.jsonl"))
+    split_cfg = cfg.get("split", {})
+    val_ratio = args.val_ratio if args.val_ratio is not None else float(split_cfg.get("val_ratio", 0.1))
+    test_ratio = args.test_ratio if args.test_ratio is not None else float(split_cfg.get("test_ratio", 0.1))
+    split_seed = args.split_seed if args.split_seed is not None else int(cfg.get("seed", 42))
     try:
         build_dataset(
             args.config, input_path, output_path,
             train_out=train_out, val_out=val_out, test_out=test_out,
-            val_ratio=args.val_ratio, test_ratio=args.test_ratio,
-            split_seed=args.split_seed, group_by=args.group_by,
+            val_ratio=val_ratio, test_ratio=test_ratio,
+            split_seed=split_seed, group_by=args.group_by,
             run_name=args.run_name, log_dir=args.log_dir,
             parallel_size=args.parallel_size,
         )

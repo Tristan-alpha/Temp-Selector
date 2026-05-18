@@ -11,8 +11,8 @@ fi
 # ===================================================================
 # Environment variables (all overridable)
 # ===================================================================
-CONFIG=${CONFIG:-configs/base.yaml}
-DATASET_CONFIG=${DATASET_CONFIG:-configs/dataset.yaml}
+CONFIG=${CONFIG:-configs/training/base.yaml}
+DATASET_CONFIG=${DATASET_CONFIG:-configs/dataset/full.yaml}
 RAW_INPUT=${RAW_INPUT:-data/prompts.jsonl}
 ALL_DATASET=${ALL_DATASET:-datasets/all.jsonl}
 TRAIN_DATASET=${TRAIN_DATASET:-datasets/train.jsonl}
@@ -112,7 +112,7 @@ fi
 
 if stage_enabled "build"; then
     run_stage "build_dataset" \
-        python scripts/build_dataset.py --config "$DATASET_CONFIG" --backend "$BACKEND" \
+        python scripts/build_dataset.py --config "$DATASET_CONFIG" \
             --run-name "$RUN_NAME" --log-dir "$LOG_DIR"
 else
     echo "[skip] build_dataset"
