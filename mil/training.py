@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import time
 from typing import Any, Dict, List
 
 import torch
@@ -11,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 import yaml
 from torch.utils.data import DataLoader, Dataset, Sampler
+from tqdm import tqdm
 
 from features.segmenter import build_segments, segment_pooling
 from features.vectorizer import token_to_vec
@@ -93,7 +93,6 @@ def make_collate_fn(
     need_logprobs = feature_mode in {"topk_logprobs", "all"} and extractor is not None
 
     def collate_fn(batch_rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        _t = [time.perf_counter()]
         hidden_tensors = None
         logprob_tensors = None
         if need_hidden or need_logprobs:
@@ -105,13 +104,11 @@ def make_collate_fn(
             if need_logprobs:
                 temps = [float(r.get("temperature", 0.0)) for r in batch_rows]
                 logprob_tensors = extractor.extract_logprobs_from_ids(full_ids, prompt_lens, temperatures=temps)
-        _t.append(time.perf_counter())  # _t[1] = after SGLand extract
 
         instances_list: List[torch.Tensor] = []
         labels: List[float] = []
         temp_indices: List[int] = []
 
-        _sub_t = [0.0, 0.0, 0.0]  # build_tensor, build_segments, segment_pooling
         for i, row in enumerate(batch_rows):
             token_features = row.get("token_features", [])
             if not token_features:
@@ -125,7 +122,6 @@ def make_collate_fn(
             l_t = logprob_tensors[i] if logprob_tensors is not None else None
             n = len(token_features)
 
-            _t0 = time.perf_counter()
             parts = [torch.tensor([[float(tf.get("logprob", -20.0)), float(tf.get("entropy", 0.0))]
                                    for tf in token_features], dtype=torch.float32)]
             if l_t is not None:
@@ -137,9 +133,7 @@ def make_collate_fn(
                 t = torch.cat([t, torch.zeros(n, instance_dim - t.shape[1])], dim=1)
             else:
                 t = t[:, :instance_dim]
-            _sub_t[0] += time.perf_counter() - _t0
 
-            _t0 = time.perf_counter()
             token_texts = [tf.get("text", "") if isinstance(tf, dict) else getattr(tf, "text", "")
                            for tf in token_features]
             response = row.get("response", "")
@@ -147,22 +141,17 @@ def make_collate_fn(
                 tokens=token_texts, mode=segment_mode,
                 segment_size=segment_size, response=response,
             )
-            _sub_t[1] += time.perf_counter() - _t0
 
-            _t0 = time.perf_counter()
             if train_device is not None and train_device.type == "cuda":
                 inst = segment_pooling(t.to(train_device), spans, instance_dim,
                                        mode=pooling_mode, segment_size=segment_size).cpu()
             else:
                 inst = segment_pooling(t, spans, instance_dim,
                                        mode=pooling_mode, segment_size=segment_size)
-            _sub_t[2] += time.perf_counter() - _t0
             instances_list.append(inst)
             labels.append(float(row.get("label", 0)))
             t_val = float(row.get("temperature", temp_bins[0]))
             temp_indices.append(bin_map.get(t_val, 0))
-
-        _t.append(time.perf_counter())  # _t[2] = after token→segment loop
 
         max_k = max(inst.shape[0] for inst in instances_list)
         d = instances_list[0].shape[1]
@@ -177,21 +166,10 @@ def make_collate_fn(
             x[i, :k] = inst
             mask[i, :k] = 1.0
 
-        _t.append(time.perf_counter())  # _t[3] = after pad
-
         batch_tokens = sum(len(r.get("_full_ids", r.get("token_features", []))) for r in batch_rows)
-        _coll_timings = {
-            "extract_s": _t[1] - _t[0],
-            "token2seg_s": _t[2] - _t[1],
-            "pad_s": _t[3] - _t[2],
-            "total_s": _t[3] - _t[0],
-            "tok2seg_build_s": _sub_t[0],
-            "tok2seg_seg_s": _sub_t[1],
-            "tok2seg_pool_s": _sub_t[2],
-        }
 
         return {"instances": x, "mask": mask, "label": y, "temp_idx": t,
-                "_batch_tokens": batch_tokens, "_coll_timings": _coll_timings}
+                "_batch_tokens": batch_tokens}
 
     return collate_fn
 
@@ -386,10 +364,10 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
             dynamic_head.train()
 
         sum_loss = 0.0
-        cumul_tokens = 0
         total_tokens = sum(token_counts)
-        for batch_idx, batch in enumerate(loader):
-            t0 = time.perf_counter()
+        pbar = tqdm(total=total_tokens, desc=f"Epoch {epoch + 1}/{max_epochs}",
+                     unit="tok", dynamic_ncols=True)
+        for batch in loader:
             x = batch["instances"].to(device)
             mask = batch["mask"].to(device)
             y = batch["label"].to(device)
@@ -401,7 +379,6 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
             inst_logit = out["inst_logit"]
             bag_repr = out["bag_repr"]
             inst_repr = out["encoder_out"]
-            t1 = time.perf_counter()
 
             loss_bag = bce(bag_logit, y)
 
@@ -495,30 +472,22 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             optimizer.step()
-            t2 = time.perf_counter()
 
             _batch_loss = float(loss.item())
             _batch_bag = float(loss_bag.item())
             _batch_inst = float(loss_inst.item())
             _batch_tokens = batch.get("_batch_tokens", 0)
-            _ct = batch.get("_coll_timings", {})
             sum_loss += _batch_loss
 
             del x, mask, y, t, out, loss, loss_bag, loss_inst, batch
 
-            cumul_tokens += _batch_tokens
-            logger.info("epoch=%d batch=%d tokens=%d/%d bags=%d loss=%.4f bag=%.4f inst=%.4f | "
-                         "coll[extract=%.2fs tok2seg=%.2fs(build=%.2f seg=%.2f pool=%.2f) "
-                         "pad=%.3fs] fwd=%.2fs bwd=%.2fs",
-                         epoch + 1, batch_idx + 1,
-                         cumul_tokens, total_tokens,
-                         bags,
-                         _batch_loss, _batch_bag, _batch_inst,
-                         _ct.get("extract_s", 0), _ct.get("token2seg_s", 0),
-                         _ct.get("tok2seg_build_s", 0), _ct.get("tok2seg_seg_s", 0),
-                         _ct.get("tok2seg_pool_s", 0), _ct.get("pad_s", 0),
-                         t1 - t0, t2 - t1)
+            pbar.update(_batch_tokens)
+            pbar.set_postfix(loss=f"{_batch_loss:.4f}",
+                             bag=f"{_batch_bag:.4f}",
+                             inst=f"{_batch_inst:.4f}",
+                             bags=bags)
 
+        pbar.close()
         avg = sum_loss / max(1, len(loader))
 
         # ---- validation + early stopping ----
