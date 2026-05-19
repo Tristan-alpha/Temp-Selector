@@ -124,6 +124,7 @@ def build_segment_obs_from_lp(
     obs_dim: int,
     device: torch.device | None = None,
     extra_parts: List[torch.Tensor] | None = None,
+    segment_mode: str = "fixed_window",
 ) -> torch.Tensor:
     """Convert ``generate_with_features`` logprob tensor into segment obs.
 
@@ -150,7 +151,7 @@ def build_segment_obs_from_lp(
     else:
         tok_vecs = tok_vecs[:, :obs_dim]
 
-    spans = build_segments(tokens=tokens, mode="step",
+    spans = build_segments(tokens=tokens, mode=segment_mode,
                            segment_size=segment_size, response=text)
     return segment_pooling(tok_vecs.to(device) if device is not None else tok_vecs,
                            spans, obs_dim, mode="mean",

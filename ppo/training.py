@@ -72,6 +72,7 @@ def train_ppo(
     temp_bins = [float(x) for x in cfg["data"]["temp_bins"]]
     n_actions = len(temp_bins)
     segment_size = int(cfg["data"]["segment_size"])
+    segment_mode = cfg["data"].get("segment_mode", "fixed_window")
     max_new_tokens = int(cfg["inference"]["max_new_tokens"])
     top_k_logprobs = int(cfg["inference"]["top_k_logprobs"])
     num_votes = int(cfg["inference"].get("num_votes", 1))
@@ -204,11 +205,12 @@ def train_ppo(
             round_prompts = []
             round_temps: List[float] = []
             round_indices = []
+            round_dup: List[int] = []  # v-slot per expanded prompt
 
             for i in range(N):
                 if not active[i]:
                     continue
-                round_prompts.append(rendered[i] + generated[i][0])
+                base = rendered[i] + generated[i][0]
 
                 if segment_obs[i] is None:
                     # First segment: no prior generated tokens → no features to
@@ -222,7 +224,7 @@ def train_ppo(
                     ep_logprobs[i].append(torch.tensor(0.0))
                     ep_values[i].append(torch.tensor(0.0))
                 else:
-                    obs_t = segment_obs[i].unsqueeze(0).to(device)
+                    obs_t = segment_obs[i][-1:].to(device)  # last segment represents latest step
                     with torch.no_grad():
                         logits, value = policy(obs_t)
                         action, logp = sample_action(logits.squeeze(0))
@@ -232,25 +234,28 @@ def train_ppo(
                     ep_logprobs[i].append(logp.cpu())
                     ep_values[i].append(value.squeeze(0).cpu())
 
-                round_temps.append(temp)
-                round_indices.append(i)
+                for v in range(V):
+                    round_prompts.append(base)
+                    round_temps.append(temp)
+                    round_indices.append(i)
+                    round_dup.append(v)
 
             if not round_indices:
                 break
 
             feats = runner.generate_with_features(
                 round_prompts, round_temps, segment_size,
-                top_k=top_k_logprobs, return_hidden=hs_needed,
+                top_k=top_k_logprobs,
+                return_logprobs=True,
+                return_hidden=hs_needed,
             )
 
-            for j, i in enumerate(round_indices):
+            for j, (i, v) in enumerate(zip(round_indices, round_dup)):
                 f = feats[j]
                 new_tokens = f["token_ids"]
                 finish_reason = f["finish_reason"]
 
-                # Append generated text to all vote slots (V=1 for now, or copy)
-                for v in range(min(V, 1)):
-                    generated[i][v] += f["text"]
+                generated[i][v] += f["text"]
 
                 if (tokenizer.eos_token_id is not None and tokenizer.eos_token_id in new_tokens) or \
                    finish_reason == 'stop' or not new_tokens:
@@ -258,13 +263,15 @@ def train_ppo(
                     ep_correct[i] = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
                     continue
 
-                # Build segment observation from per-token logprob/hidden tensors
-                extra = [f["hidden_states"]] if f["hidden_states"] is not None else None
-                obs = build_segment_obs_from_lp(
-                    f["logprobs"], f["tokens"], f["text"],
-                    segment_size, obs_dim, device=device, extra_parts=extra,
-                )
-                segment_obs[i] = obs.cpu()
+                if v == 0:
+                    # Only slot 0 drives the next policy decision
+                    extra = [f["hidden_states"]] if f["hidden_states"] is not None else None
+                    obs = build_segment_obs_from_lp(
+                        f["logprobs"], f["tokens"], f["text"],
+                        segment_size, obs_dim, device=device, extra_parts=extra,
+                        segment_mode=segment_mode,
+                    )
+                    segment_obs[i] = obs.cpu()
 
         for i in range(N):
             if ep_correct[i] == -1:
@@ -300,7 +307,7 @@ def train_ppo(
                 else:
                     reward = 0.0
                     if mil_model is not None and shaping_coef > 0:
-                        seg_obs_t = ep_obs[i][t].unsqueeze(0).unsqueeze(0).to(device)
+                        seg_obs_t = ep_obs[i][t].unsqueeze(0).to(device)
                         with torch.no_grad():
                             mil_out = mil_model(seg_obs_t)
                         reward = shaping_coef * float((1.0 - torch.sigmoid(mil_out["inst_logit"])).item())

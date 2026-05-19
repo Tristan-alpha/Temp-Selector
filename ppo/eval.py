@@ -69,6 +69,7 @@ class OnlineTemperatureEvaluator:
         parallel_size: int | None = None,
     ):
         self.segment_size = int(config["data"]["segment_size"])
+        self.segment_mode = config["data"].get("segment_mode", "fixed_window")
         self.max_new_tokens = int(config["inference"]["max_new_tokens"])
         self.obs_dim = int(config["data"]["instance_dim"])
         self.hidden_dim = int(config["ppo"]["model"]["hidden_dim"])
@@ -130,17 +131,18 @@ class OnlineTemperatureEvaluator:
             round_prompts: List[str] = []
             round_temps: List[float] = []
             round_indices: List[int] = []
+            round_dup: List[int] = []  # v-slot per expanded prompt
 
             for i in range(N):
                 if not active[i]:
                     continue
-                round_prompts.append(rendered[i] + generated[i][0])
+                base = rendered[i] + generated[i][0]
 
                 if strategy == "ppo":
                     if _seg_idx == 0 or segment_obs[i] is None:
                         temp = 0.7
                     else:
-                        obs_t = torch.tensor(segment_obs[i], dtype=torch.float32).unsqueeze(0)
+                        obs_t = torch.tensor(segment_obs[i][-1], dtype=torch.float32).unsqueeze(0)
                         with torch.no_grad():
                             logits, _ = self.policy(obs_t)
                             action = logits.argmax(dim=-1).item()
@@ -151,23 +153,27 @@ class OnlineTemperatureEvaluator:
                     temp = rng.choice(self.temp_bins)
 
                 all_temps[i].append(temp)
-                round_temps.append(temp)
-                round_indices.append(i)
+                for v in range(V):
+                    round_prompts.append(base)
+                    round_temps.append(temp)
+                    round_indices.append(i)
+                    round_dup.append(v)
 
             if not round_indices:
                 break
 
             feats = self.runner.generate_with_features(
                 round_prompts, round_temps, self.segment_size,
-                top_k=self.top_k_logprobs, n=V,
+                top_k=self.top_k_logprobs,
+                return_logprobs=True,
             )
 
-            for j, i in enumerate(round_indices):
+            for j, (i, v) in enumerate(zip(round_indices, round_dup)):
                 f = feats[j]
-                for v in range(min(V, len(f["all_texts"]))):
-                    generated[i][v] += f["all_texts"][v]
+                generated[i][v] += f["text"]
 
-                n_segments[i] += 1
+                if v == 0:
+                    n_segments[i] += 1
 
                 if (self.tokenizer.eos_token_id is not None and
                     self.tokenizer.eos_token_id in f["token_ids"]) or \
@@ -175,10 +181,11 @@ class OnlineTemperatureEvaluator:
                     active[i] = False
                     continue
 
-                if f["logprobs"] is not None:
+                if f["logprobs"] is not None and v == 0:
                     obs = build_segment_obs_from_lp(
                         f["logprobs"], f["tokens"], f["text"],
                         self.segment_size, self.obs_dim,
+                        segment_mode=self.segment_mode,
                     )
                     segment_obs[i] = obs.tolist()
 

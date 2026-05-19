@@ -142,11 +142,11 @@ def test_extract_dollar_over_number():
 
 
 def test_extract_empty_text():
-    assert extract_answer("") == ""
+    assert extract_answer("") is None
 
 
 def test_extract_unparseable():
-    assert extract_answer("gibberish with no structure") == ""
+    assert extract_answer("gibberish with no structure") is None
 
 
 # ═══════════════════════  unit: verify_answer_by_value  ═══════════════════════

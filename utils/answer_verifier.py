@@ -135,7 +135,7 @@ def _normalize_parsed(parsed: Any) -> str:
     return str(parsed)
 
 
-def extract_answer(text: str) -> str:
+def extract_answer(text: str) -> str | None:
     """Extract a normalized math expression from LLM-generated text.
 
     Three-tier fallback, returning the first non-empty result:
@@ -144,7 +144,7 @@ def extract_answer(text: str) -> str:
     3. Last number (integer or decimal) — fallback for plain-text answers.
 
     Every extracted answer is normalized through ``math_verify.parse()``.
-    Returns an empty string if all extraction fails.
+    Returns None if all extraction fails.
     """
     try:
         # Tier 1: last \boxed{...} with proper brace matching
@@ -171,20 +171,23 @@ def extract_answer(text: str) -> str:
             if result:
                 return result
 
-        return ""
+        return None
     except Exception:
-        return ""
+        return None
 
 
 # ═══════════════════════  verification  ═══════════════════════
 
-def verify_answer_by_value(prediction: str, gold: str) -> bool:
+def verify_answer_by_value(prediction: str | None, gold: str) -> bool:
     """Check if a normalized answer string is mathematically equivalent to gold.
 
     Both arguments are assumed to be answer expressions (not full response text).
     Automatically wraps in ``$...$`` for LaTeX parsing.
     Uses ``math_verify.parse()`` + ``math_verify.verify()``.
+    Returns False if prediction is None or empty.
     """
+    if not prediction:
+        return False
     try:
         with _time_limit(_TIMEOUT_SEC):
             gold_parsed = _parse("$" + gold.strip() + "$", strip=True)
@@ -201,6 +204,8 @@ def self_consistency_correct(responses: List[str], gold: str) -> bool:
     answer, and compares to gold using ``math_verify.verify()``.
     Returns True if the most common extracted answer matches gold.
     """
-    extracted = [extract_answer(r) for r in responses]
+    extracted = [a for r in responses if (a := extract_answer(r)) is not None]
+    if not extracted:
+        return False
     mode_answer = Counter(extracted).most_common(1)[0][0]
     return verify_answer_by_value(mode_answer, gold)

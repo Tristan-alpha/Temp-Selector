@@ -52,13 +52,11 @@ class VLLMFeatureExporter:
     def __init__(self, model_name_or_path: str, max_new_tokens: int = 256,
                  parallel_size: int | None = None,
                  gpu_memory_utilization: float = 0.90,
-                 max_logprobs: int = 4096,
                  reserve_training_gpu: bool = False):
         self.model_name_or_path = model_name_or_path
         self.max_new_tokens = max_new_tokens
         self.parallel_size = parallel_size if isinstance(parallel_size, int) else None
         self.gpu_memory_utilization = gpu_memory_utilization
-        self.max_logprobs = max_logprobs
         self.reserve_training_gpu = reserve_training_gpu
         self._llm = None
         self._tokenizer = None
@@ -98,76 +96,82 @@ class VLLMFeatureExporter:
         temperatures: List[float],
         segment_size: int,
         top_k: int = 4096,
+        return_logprobs: bool = False,
         return_hidden: bool = False,
-        n: int = 1,
+        device: torch.device | None = None,
     ) -> List[Dict[str, Any]]:
         """Generate ``segment_size`` tokens per prompt and return per-token features.
 
+        Two-pass: Pass 1 generates tokens; Pass 2 calls ``extract_from_ids``
+        on the full sequence (prompt + generated) to obtain correct hidden states
+        (speculative decode only captures prefill, not decode tokens).
+
         Returns one dict per prompt with keys: token_ids, tokens, text,
-        all_texts (list of all ``n`` output texts), logprobs (tensor
-        [n_tok, top_k+1] from first output), hidden_states (tensor or None),
-        finish_reason.
+        logprobs (tensor [n_tok, top_k+1] or None), hidden_states
+        (tensor or None), finish_reason.
         """
         self._lazy_init()
         from vllm import SamplingParams
-        from safetensors import safe_open
 
-        params = [SamplingParams(n=n, temperature=t, max_tokens=segment_size,
-                                  logprobs=top_k, top_p=1.0, top_k=0)
+        # ── Pass 1: generate ──
+        params = [SamplingParams(temperature=t, max_tokens=segment_size,
+                                  top_p=1.0, top_k=0)
                   for t in temperatures]
         outputs = self._llm.generate(prompts, params, use_tqdm=False)
 
-        results: List[Dict[str, Any]] = []
+        # Collect per-sample metadata for Pass 2
+        need_hs = return_logprobs or return_hidden
+        full_ids_list: List[List[int]] = []
+        prompt_lens: List[int] = []
+        per_sample: List[Dict[str, Any]] = []  # stash non-feature fields
+
         for out in outputs:
             o0 = out.outputs[0]
+            # Discard Pass 1 hidden state tempfile — speculative decode always
+            # writes them, but they only cover prompt tokens and are unused.
+            hs_path = out.kv_transfer_params.get("hidden_states_path")
+            if hs_path is not None:
+                try:
+                    os.remove(hs_path)
+                except OSError:
+                    pass
+
             token_ids = o0.token_ids
-            n_tok = len(token_ids)
-            tokens = [self._tokenizer.decode([tid]) if self._tokenizer else ""
-                      for tid in token_ids]
-            finish_reason = getattr(o0, "finish_reason", None)
-            all_texts = [o.text for o in out.outputs]
-
-            lp_tensor: Optional[torch.Tensor] = None
-            if o0.logprobs and n_tok > 0:
-                lp_rows = []
-                for idx, tid in enumerate(token_ids):
-                    lp_dict = o0.logprobs[idx] if idx < len(o0.logprobs) else None
-                    if lp_dict is None:
-                        lp_rows.append(torch.full((top_k + 1,), -20.0))
-                        continue
-                    sampled = lp_dict.get(tid)
-                    sampled_lp = float(sampled.logprob if hasattr(sampled, "logprob") else sampled) \
-                        if sampled is not None else -20.0
-                    vals = sorted(
-                        [float(v.logprob if hasattr(v, "logprob") else v) for v in lp_dict.values()],
-                        reverse=True,
-                    )[:top_k]
-                    row = [sampled_lp] + vals
-                    if len(row) < top_k + 1:
-                        row += [-20.0] * (top_k + 1 - len(row))
-                    lp_rows.append(torch.tensor(row, dtype=torch.float32))
-                lp_tensor = torch.stack(lp_rows)  # [n_tok, top_k+1]
-
-            hs_tensor: Optional[torch.Tensor] = None
-            if return_hidden:
-                hs_path = out.kv_transfer_params.get("hidden_states_path")
-                if hs_path is not None:
-                    try:
-                        with safe_open(hs_path, "pt") as f:
-                            hs = f.get_tensor("hidden_states")  # [seq_len, 1, hidden_dim]
-                    finally:
-                        os.remove(hs_path)
-                    hs_1d = hs[:, -1, :]                       # [seq_len, hidden_dim]
-                    hs_tensor = hs_1d[-n_tok:].float()         # [n_tok, hidden_dim]
-
-            results.append({
+            prompt_ids = out.prompt_token_ids
+            full_ids = prompt_ids + token_ids
+            full_ids_list.append(full_ids)
+            prompt_lens.append(len(prompt_ids))
+            per_sample.append({
                 "token_ids": token_ids,
-                "tokens": tokens,
+                "tokens": [self._tokenizer.decode([tid]) if self._tokenizer else ""
+                          for tid in token_ids],
                 "text": o0.text,
-                "all_texts": all_texts,
+                "finish_reason": getattr(o0, "finish_reason", None),
+            })
+
+        # ── Pass 2: extract features via prefill ──
+        feat_lp: List[torch.Tensor] = []
+        feat_hs: List[torch.Tensor] = []
+        if need_hs:
+            extracted = self.extract_from_ids(
+                full_ids_list, prompt_lens, temperatures,
+                top_k=top_k,
+                return_logprobs=return_logprobs,
+                return_hidden=return_hidden,
+                device=device,
+            )
+            feat_lp = extracted.get("logprobs", [])
+            feat_hs = extracted.get("hidden", [])
+
+        # ── Assemble results ──
+        results: List[Dict[str, Any]] = []
+        for i, sample in enumerate(per_sample):
+            lp_tensor = feat_lp[i] if i < len(feat_lp) else None
+            hs_tensor = feat_hs[i].float() if i < len(feat_hs) else None
+            results.append({
+                **sample,
                 "logprobs": lp_tensor,
                 "hidden_states": hs_tensor,
-                "finish_reason": finish_reason,
             })
         return results
 
@@ -194,7 +198,6 @@ class VLLMFeatureExporter:
             tensor_parallel_size=tp_size,
             max_model_len=max_model_len,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            max_logprobs=self.max_logprobs,
             speculative_config={
                 "method": "extract_hidden_states",
                 "num_speculative_tokens": 1,
