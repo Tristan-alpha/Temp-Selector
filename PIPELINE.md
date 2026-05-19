@@ -54,20 +54,21 @@ tf-mil/
 
 ## 核心概念：标签语义
 
-| label | 含义 | MIL 术语 |
-|---|---|---|
-| `0` | 回答**正确**，所有 segment 都无错误 | **负 bag** |
-| `1` | 回答**错误**，至少一个 segment 出错 | **正 bag** |
+每个样本有两个标签字段：
 
-翻转是为了让 MIL attention 自然聚焦于"最像错误的 segment"。
+| 字段 | 含义 | 使用者 |
+|---|---|---|
+| `individual_label` | 0=该条回答正确, 1=该条回答错误 (per-response) | MIL 训练/评估 |
+| `voting_label` | 0=多数投票正确, 1=多数投票错误 (majority vote) | PPO 温度偏置初始化 |
 
 ### Majority Voting
 
-每个 (prompt, temperature) 组合生成 `num_votes` 路回答。通过 self-consistency 多数投票决定 label：
+每个 (prompt, temperature) 组合生成 `num_votes` 路回答。通过 self-consistency 多数投票决定 voting_label：
 
 1. 从每票回答中提取最后一个 `\boxed{...}` 内容
 2. 取出现次数最多的众数答案
-3. 众数答案等同于标准答案 → label=0，否则 label=1
+3. 众数答案等同于标准答案 → voting_label=0，否则 voting_label=1
+4. individual_label 由每条回答自身是否正确决定，与多数投票结果无关
 
 ---
 
@@ -107,7 +108,8 @@ JSONL 行格式：
   "sample_id": "q1_t0.5_v0",
   "prompt": "original question",
   "response": "generated answer text",
-  "label": 0,
+  "individual_label": 0,
+  "voting_label": 0,
   "temperature": 0.5,
   "token_ids": [123, 456, ...],
   "tokens": ["Hello", " world", ...],

@@ -57,7 +57,7 @@ Stage 3: PolicyValueNet(segment_obs) → temperature action
 
 ## Common pitfalls
 
-- **Label semantics**: `label=0` means correct (negative bag), `label=1` means error (positive bag). This is flipped from standard MIL convention. The `ep_correct` variable in PPO training is the opposite (1=correct). Do NOT mix them.
+- **Label fields**: `individual_label` (0=correct, 1=error — per-response correctness, used by MIL). `voting_label` (0=correct, 1=error — majority-vote result, used by PPO temperature bias). MIL code has inline comments (`# label=1: positive bag (contains errors)`) at every branch. `ep_correct` in PPO is 1=correct.
 - **segment_obs is None on first segment**: In PPO training/eval, the first segment has no prior token features to observe. A dummy action (temp=0.7, action=0) is recorded but safely skipped during batch construction (`range(1, n_steps)`).
 - **Even vote ties**: `num_votes=8` in config. Majority threshold `(V+1)//2=4` means 4-4 ties are labeled "correct". Use odd vote counts to avoid this.
 - **Config section scoping**: `mil.model.hidden_dim` and `ppo.model.hidden_dim` are separate keys. The evaluator reads `ppo.model.hidden_dim` — do not use `model.hidden_dim` (that section was deleted).

@@ -78,11 +78,10 @@ Done flags prevent advantage propagation across episode boundaries. Advantages s
 
 First segment has no prior observation. Default T=0.7, dummy values (zero obs, zero logprob) keep episode lists aligned. Skipped during PPO batch construction via `range(1, n_steps)`.
 
-## ep_correct vs MIL label
+## Label conventions
 
-| Variable | 1 means | 0 means |
-|---|---|---|
-| `label` (MIL) | error | correct |
-| `ep_correct` (PPO) | correct | wrong |
-
-**Opposite conventions** — the naming makes this explicit.
+| Variable | 1 means | 0 means | Used by |
+|---|---|---|---|
+| `individual_label` | error | correct | MIL training/eval |
+| `voting_label` | error | correct | PPO temperature bias (via `load_temperature_labels`) |
+| `ep_correct` | correct | wrong | PPO training/eval (runtime-computed) |

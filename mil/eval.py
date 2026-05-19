@@ -274,9 +274,9 @@ def evaluate_mil(
                 inst_i = out["inst_logit"][i, :n_valid].cpu()
                 attn_i = out["attn_w"][i, :n_valid].cpu()
 
-                if y[i].item() > 0.5:
+                if y[i].item() > 0.5:  # label=1: positive bag (contains errors)
                     inst_pos_vals.extend(inst_i.tolist())
-                else:
+                else:  # label=0: negative bag (no errors)
                     inst_neg_vals.extend(inst_i.tolist())
 
                 all_attn_weights.append(attn_i)
@@ -343,7 +343,7 @@ def evaluate_mil(
             assert sum(n_inst_per_sample) == inst_labels_cat.size(0)
             n_dyn_samples = len(all_dyn_inst_logits)
             dyn_bag_labels = bag_labels[:n_dyn_samples]
-            error_mask = (dyn_bag_labels > 0.5).repeat_interleave(
+            error_mask = (dyn_bag_labels > 0.5).repeat_interleave(  # >0.5: positive bag (contains errors)
                 torch.tensor(n_inst_per_sample)
             )
             inst_preds_cat = inst_logits_cat.argmax(dim=-1)

@@ -96,13 +96,13 @@ build → mil → eval → ppo → eval_ol
     MIL assessment before PPO
 ```
 
-- **Stage 1** — Raw vLLM generates all responses at 15 temperatures (APC shares prompt KV-cache). Majority-vote label. Labels: 0 = correct (negative bag), 1 = error (positive bag).
+- **Stage 1** — Raw vLLM generates all responses at 15 temperatures (APC shares prompt KV-cache). Outputs `individual_label` (per-response correctness, for MIL) and `voting_label` (majority-vote result, for PPO bias). Both use 0=correct, 1=error.
 - **Stage 2** — MIL learns to localise errors via always-on online feature extraction. `inst_head` output becomes PPO shaping reward; encoder weights warm-start PPO backbone.
 - **Stage 3** — Policy controls vLLM generation temperature segment-by-segment. Majority-vote terminal reward + MIL shaping reward. PPO clip update.
 
 ## Key design decisions
 
-1. **Flipped labels** — 0 = correct (negative bag), 1 = error (positive bag). Attention naturally focuses on error-like segments.
+1. **Split labels** — `individual_label` for MIL (per-response error signal), `voting_label` for PPO bias (majority-vote result). Code uses inline comments instead of "flipped" warnings.
 2. **Online feature extraction** — Logprobs and hidden states extracted during training via `extract_from_ids`, never stored in JSONL.
 3. **Always-on speculative decode** — `_lazy_init` always configures extract_hidden_states for vLLM.
 4. **Online PPO** — Offline data cannot learn causal action→reward; the policy must truly control generation.

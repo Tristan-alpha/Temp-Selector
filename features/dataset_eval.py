@@ -16,7 +16,7 @@ from utils.jsonl import strip_vote_suffix
 
 def evaluate_dataset(data_path: str) -> Dict[str, Any]:
     total = 0
-    positive = 0
+    voting_correct = 0
     individual_correct = 0
     temp_counts: Dict[float, int] = defaultdict(int)
     temp_correct: Dict[float, int] = defaultdict(int)
@@ -32,21 +32,22 @@ def evaluate_dataset(data_path: str) -> Dict[str, Any]:
                 continue
             row = json.loads(line)
             total += 1
-            label = int(row.get("label", 0))         # 0=correct, 1=error
-            correct = 1 - label                       # flip for stats
+            voting_label = int(row.get("voting_label", 0))     # 0=correct, 1=error
+            voting_correct_bool = 1 - voting_label             # flip: 1=correct
             temp = float(row.get("temperature", 0.0))
-            positive += correct
+            voting_correct += voting_correct_bool
             temp_counts[temp] = temp_counts.get(temp, 0) + 1
-            if correct:
+            if voting_correct_bool:
                 temp_correct[temp] = temp_correct.get(temp, 0) + 1
 
-            indiv = row.get("metadata", {}).get("individual_correct")
-            if indiv is not None:
+            individual_label = row.get("individual_label")
+            if individual_label is not None:
                 has_voting = True
-                individual_correct += int(indiv)
-                temp_individual_correct[temp] = temp_individual_correct.get(temp, 0) + int(indiv)
+                indiv_correct = 1 - int(individual_label)  # flip: 1=correct
+                individual_correct += indiv_correct
+                temp_individual_correct[temp] = temp_individual_correct.get(temp, 0) + indiv_correct
                 base_id = strip_vote_suffix(row.get("sample_id", ""))
-                vote_groups[(base_id, temp)].append(int(indiv))
+                vote_groups[(base_id, temp)].append(indiv_correct)
 
     per_temp_acc = {}
     for t, cnt in sorted(temp_counts.items()):
@@ -62,8 +63,8 @@ def evaluate_dataset(data_path: str) -> Dict[str, Any]:
 
     result: Dict[str, Any] = {
         "n_samples": total,
-        "positive_ratio": safe_div(positive, total),
-        "negative_ratio": safe_div(total - positive, total),
+        "voting_accuracy": safe_div(voting_correct, total),
+        "voting_error_ratio": safe_div(total - voting_correct, total),
         "per_temperature_breakdown": per_temp_acc,
     }
 
@@ -81,7 +82,7 @@ def evaluate_dataset(data_path: str) -> Dict[str, Any]:
         result["majority_voting"] = {
             "num_votes": num_votes_per_group,
             "n_groups": len(vote_groups),
-            "majority_positive_ratio": safe_div(sum(group_labels), len(group_labels)),
+            "majority_accuracy": safe_div(sum(group_labels), len(group_labels)),
             "mean_individual_accuracy": float(np.mean(group_indiv_accs)),
             "individual_sample_accuracy": safe_div(individual_correct, total),
         }
@@ -98,8 +99,8 @@ def evaluate_dataset(data_path: str) -> Dict[str, Any]:
 def load_temperature_labels(data_path: str) -> Dict[float, List[int]]:
     """Return per-temperature *correctness* lists from a dataset JSONL file.
 
-    Label format: 0 = correct, 1 = error.  This function flips so that
-    returned values are 1 = correct, 0 = error (for accuracy computation).
+    Reads voting_label (0=correct, 1=error — majority vote result).
+    Flips so that returned values are 1=correct, 0=error (for PPO accuracy).
     """
     temp_labels: Dict[float, List[int]] = defaultdict(list)
     with open(data_path, "r", encoding="utf-8") as f:
@@ -108,7 +109,7 @@ def load_temperature_labels(data_path: str) -> Dict[float, List[int]]:
                 continue
             row = json.loads(line)
             temp = float(row.get("temperature", 0.0))
-            label = int(row.get("label", 0))
+            label = int(row.get("voting_label", 0))
             temp_labels[temp].append(1 - label)  # flip: 0→1 (correct), 1→0 (error)
     return dict(temp_labels)
 
@@ -145,11 +146,11 @@ def main() -> None:
     logger.info("dataset_eval_complete run_name=%s", final_run_name)
 
     print(f"\nDataset: {result['n_samples']} samples, "
-          f"positive ratio={result.get('positive_ratio', 0):.3f}")
+          f"voting accuracy={result.get('voting_accuracy', 0):.3f}")
     mv = result.get("majority_voting")
     if mv:
-        print(f"  Majority Voting: {mv['num_votes']} votes × {mv['n_groups']} groups")
-        print(f"  Majority accuracy: {mv['majority_positive_ratio']:.4f}")
+        print(f"  Majority Voting: {mv['num_votes']} votes x {mv['n_groups']} groups")
+        print(f"  Majority accuracy: {mv['majority_accuracy']:.4f}")
         bt = mv.get("best_temperature_majority", {})
         print(f"  Best temp: {bt.get('temperature', '?')} → accuracy={bt.get('accuracy', 0):.4f}")
     print()

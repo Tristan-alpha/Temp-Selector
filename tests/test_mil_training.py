@@ -17,7 +17,7 @@ def _make_row(token_texts, label=0, temperature=0.5):
         "token_ids": list(range(len(token_texts))),
         "tokens": list(token_texts),
         "response": " ".join(token_texts),
-        "label": label,
+        "individual_label": label,
         "temperature": temperature,
     }
 

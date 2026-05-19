@@ -7,12 +7,14 @@ Given a math reasoning chain split into segments, MIL answers two questions:
 1. **Bag-level**: Is this whole answer wrong? (`bag_logit`)
 2. **Instance-level**: Which specific segments are likely wrong? (`inst_logit`)
 
-Labels flipped from standard MIL:
+MIL reads `individual_label` (per-response correctness):
 
-| label | meaning | MIL term |
+| individual_label | meaning | MIL term |
 |---|---|---|
-| 0 | answer correct | negative bag |
-| 1 | answer wrong, ≥1 segment wrong | positive bag |
+| 0 | answer correct | negative bag (no errors) |
+| 1 | answer wrong, ≥1 segment wrong | positive bag (contains errors) |
+
+Every `> 0.5` branch carries an inline comment (`# label=1: positive bag (contains errors)`) to make the convention explicit.
 
 ## Online feature extraction
 

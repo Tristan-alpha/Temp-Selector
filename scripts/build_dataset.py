@@ -157,7 +157,7 @@ def build_dataset(
     # Build sample dicts
     all_sample_dicts: List[Dict[str, Any]] = []
     n_samples = 0
-    n_positive = 0
+    n_voting_correct = 0
     n_individual_correct = 0
 
     for q_idx, row_obj in enumerate(rows_prepared):
@@ -188,14 +188,15 @@ def build_dataset(
 
             for v in range(num_votes):
                 n_samples += 1
-                if majority_label == 0:
-                    n_positive += 1
+                if majority_correct:
+                    n_voting_correct += 1
                 vid_suffix = f"_v{v}" if num_votes > 1 else ""
                 sample = {
                     "sample_id": f"{row_obj['sample_base']}_t{temp}{vid_suffix}",
                     "prompt": row_obj["question"],
                     "response": vote_texts[v],
-                    "label": majority_label,
+                    "individual_label": 0 if vote_correct[v] else 1,
+                    "voting_label": majority_label,
                     "temperature": temp,
                     "token_ids": vote_token_ids[v],
                     "tokens": vote_tokens[v],
@@ -235,10 +236,10 @@ def build_dataset(
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     logger.info(
-        "dataset_done run_name=%s n_samples=%d positive_ratio=%.6f individual_accuracy=%.4f num_votes=%d log_path=%s",
+        "dataset_done run_name=%s n_samples=%d voting_accuracy=%.6f individual_accuracy=%.4f num_votes=%d log_path=%s",
         final_run_name,
         n_samples,
-        (float(n_positive) / max(1, n_samples)),
+        (float(n_voting_correct) / max(1, n_samples)),
         (float(n_individual_correct) / max(1, n_samples)),
         num_votes,
         log_path,

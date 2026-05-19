@@ -104,7 +104,7 @@ def make_collate_fn(
             n = len(token_ids)
             if n == 0:
                 instances_list.append(torch.zeros(1, instance_dim, device=train_device))
-                labels.append(float(row.get("label", 0)))
+                labels.append(float(row.get("individual_label", 0)))
                 temp_indices.append(bin_map.get(float(row.get("temperature", temp_bins[0]))))
                 continue
 
@@ -128,7 +128,7 @@ def make_collate_fn(
             else:
                 inst = torch.zeros(1, instance_dim, device=train_device)
             instances_list.append(inst)
-            labels.append(float(row.get("label", 0)))
+            labels.append(float(row.get("individual_label", 0)))
             t_val = float(row.get("temperature", temp_bins[0]))
             temp_indices.append(bin_map.get(t_val, 0))
 

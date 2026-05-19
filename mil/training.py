@@ -123,7 +123,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         params += list(global_head.parameters()) + list(dynamic_head.parameters())
     optimizer = optim.Adam(params, lr=float(cfg["mil"]["training"]["lr"]))
 
-    n_pos = sum(1 for r in dataset.rows if float(r.get("label", 0)) > 0.5)
+    n_pos = sum(1 for r in dataset.rows if float(r.get("individual_label", 0)) > 0.5)
     n_neg = len(dataset.rows) - n_pos
     pos_weight = torch.tensor([(n_neg / max(1, n_pos)) ** 0.5], device=device)
     logger.info("bce_pos_weight=%.4f (n_wrong=%d n_correct=%d)", pos_weight.item(), n_pos, n_neg)
@@ -188,9 +188,9 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
                     if n_valid == 0:
                         continue
                     bag_mean = inst[i, :n_valid].mean().item()
-                    if y_v[i].item() > 0.5:
+                    if y_v[i].item() > 0.5:  # label=1: positive bag (contains errors)
                         pos_means.append(bag_mean)
-                    else:
+                    else:  # label=0: negative bag (no errors)
                         neg_means.append(bag_mean)
         mil.train()
         if pos_means and neg_means:
@@ -238,7 +238,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
                     continue
                 scores = inst_logit[i, :n_valid]  # [n_valid]
 
-                if y[i].item() > 0.5:
+                if y[i].item() > 0.5:  # label=1: positive bag (contains errors)
                     # ---- positive bag (wrong answer) ----
                     if instance_loss_method == "topk":
                         k = max(1, n_valid // 3)
@@ -288,7 +288,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
                         inst_loss_total += loss_val
                         inst_count += 1
 
-                else:
+                else:  # label=0: negative bag (no errors)
                     # ---- negative bag (correct answer) ----
                     if instance_loss_method == "contrastive":
                         loss_neg = scores.pow(2).mean()
