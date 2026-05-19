@@ -152,9 +152,11 @@ class VLLMFeatureExporter:
             if return_hidden:
                 hs_path = out.kv_transfer_params.get("hidden_states_path")
                 if hs_path is not None:
-                    with safe_open(hs_path, "pt") as f:
-                        hs = f.get_tensor("hidden_states")  # [seq_len, 1, hidden_dim]
-                    os.remove(hs_path)
+                    try:
+                        with safe_open(hs_path, "pt") as f:
+                            hs = f.get_tensor("hidden_states")  # [seq_len, 1, hidden_dim]
+                    finally:
+                        os.remove(hs_path)
                     hs_1d = hs[:, -1, :]                       # [seq_len, hidden_dim]
                     hs_tensor = hs_1d[-n_tok:].float()         # [n_tok, hidden_dim]
 
@@ -290,9 +292,11 @@ class VLLMFeatureExporter:
                 if return_hidden:
                     hidden_results.append(torch.zeros(1, 4096))
                 continue
-            with safe_open(hs_path, "pt") as f:
-                hs = f.get_tensor("hidden_states")  # [seq_len, 1, hidden_dim]
-            os.remove(hs_path)
+            try:
+                with safe_open(hs_path, "pt") as f:
+                    hs = f.get_tensor("hidden_states")  # [seq_len, 1, hidden_dim]
+            finally:
+                os.remove(hs_path)
 
             token_ids = full_ids[i][p_len:]
             n_resp = len(token_ids)

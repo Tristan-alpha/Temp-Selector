@@ -403,7 +403,6 @@ def main() -> None:
     parser.add_argument("--config", required=True, help="Path to YAML config")
     parser.add_argument("--data", default=None, help="Override paths.test_dataset from config")
     parser.add_argument("--mil-ckpt", default=None, help="Override paths.mil_ckpt from config")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--eval-temp", action="store_true", default=False)
@@ -422,8 +421,9 @@ def main() -> None:
         config={"data": data_path, "mil_ckpt": mil_ckpt},
     )
 
-    device = torch.device(args.device)
-    logger.info("data=%s mil_ckpt=%s device=%s", data_path, mil_ckpt, device)
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    device = torch.device(f"cuda:{max(0, n_gpu - 1)}") if n_gpu > 0 else torch.device("cpu")
+    logger.info("device=%s n_gpu=%d", device, n_gpu)
     metrics = evaluate_mil(mil_ckpt, data_path, config, device, eval_temp=args.eval_temp,
                            parallel_size=args.parallel_size)
     logger.info("mil_metrics=%s", json.dumps(metrics, indent=2, default=str))
