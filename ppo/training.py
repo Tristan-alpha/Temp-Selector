@@ -87,7 +87,7 @@ def train_ppo(
     ppo_epochs = int(cfg["ppo"]["training"]["ppo_epochs"])
     mini_batch_size = int(cfg["ppo"]["training"]["mini_batch_size"])
     policy_hidden_dim = int(cfg["ppo"]["model"]["hidden_dim"])
-    val_ratio = float(cfg["ppo"]["training"].get("val_ratio", 0.2))
+    val_size = int(cfg["ppo"]["training"].get("val_size", 16))
     clip_eps = float(cfg["ppo"]["training"]["clip_eps"])
     value_coef = float(cfg["ppo"]["training"]["value_coef"])
     entropy_coef = float(cfg["ppo"]["training"]["entropy_coef"])
@@ -98,6 +98,11 @@ def train_ppo(
 
     all_prompts = load_train_prompts(train_path)
     logger.info("train_prompts=%d", len(all_prompts))
+
+    val_prompts = load_train_prompts(cfg["paths"]["val_dataset"])
+    val_rng = random.Random(seed)
+    val_fixed = val_rng.sample(val_prompts, min(val_size, len(val_prompts)))
+    logger.info("val_fixed=%d", len(val_fixed))
 
     # ---- Inference engine ----
     model_path = cfg["inference"]["model_name_or_path"]
@@ -122,15 +127,13 @@ def train_ppo(
     # Best-fixed temperature for pi head init
     best_fixed_temp_idx = n_actions // 2
     from features.dataset_eval import load_temperature_labels
-    temp_labels = load_temperature_labels(cfg["paths"]["val_dataset"])
+    temp_labels = load_temperature_labels(train_path)
     if temp_labels:
         per_temp_acc = {t: sum(lbls) / len(lbls) for t, lbls in temp_labels.items() if lbls}
         if per_temp_acc:
             best_temp = max(per_temp_acc, key=per_temp_acc.get)
-            for i, t in enumerate(temp_bins):
-                if abs(t - best_temp) < 1e-6:
-                    best_fixed_temp_idx = i
-                    break
+            temp_to_idx = {t: i for i, t in enumerate(temp_bins)}
+            best_fixed_temp_idx = temp_to_idx.get(best_temp, n_actions // 2)
     logger.info("best_fixed_temp=%.1f idx=%d", temp_bins[best_fixed_temp_idx], best_fixed_temp_idx)
 
     mil_model = None
@@ -166,7 +169,7 @@ def train_ppo(
 
     from utils.answer_verifier import self_consistency_correct
 
-    best_val_value = float("inf")
+    best_val_value = float("-inf")
     patience_counter = 0
     best_state: dict | None = None
 
@@ -317,15 +320,12 @@ def train_ppo(
 
         total_steps = len(all_obs)
         perm = torch.randperm(total_steps)
-        n_train = int(total_steps * (1.0 - val_ratio))
-        train_idx = perm[:n_train]
-        val_idx = perm[n_train:]
 
         sum_policy = 0.0; sum_value = 0.0; sum_entropy = 0.0; n_updates = 0
         for _ in range(ppo_epochs):
-            for start in range(0, n_train, mini_batch_size):
-                end = min(start + mini_batch_size, n_train)
-                mb_idx = train_idx[start:end]
+            for start in range(0, total_steps, mini_batch_size):
+                end = min(start + mini_batch_size, total_steps)
+                mb_idx = perm[start:end]
 
                 logits, values = policy(obs_t[mb_idx])
                 dist = torch.distributions.Categorical(logits=logits)
@@ -354,40 +354,98 @@ def train_ppo(
         avg_value = sum_value / max(1, n_updates)
         avg_entropy = sum_entropy / max(1, n_updates)
 
-        val_value = 0.0
-        if len(val_idx) > 0:
-            with torch.no_grad():
-                _logits_val, values_val = policy(obs_t[val_idx])
-                val_value = ((ret[val_idx] - values_val) ** 2).mean().item()
-
         mean_reward = rew_t.mean().item()
-        online_acc = sum(ep_correct) / max(1, len(ep_correct))
+        train_acc = sum(ep_correct) / max(1, len(ep_correct))
+
+        # ---- val rollout on fixed set ----
+        val_acc = 0.0
+        if val_fixed:
+            val_N = len(val_fixed)
+            val_rendered = [
+                runner.render_messages(runner.build_math_messages(
+                    p.get("question") or p.get("problem") or p.get("prompt", ""),
+                    system_prompt=system_prompt,
+                )) if use_math_chat else (p.get("question") or p.get("problem") or p.get("prompt", ""))
+                for p in val_fixed
+            ]
+            val_gold = [p.get("answer", "") for p in val_fixed]
+            val_generated: List[List[str]] = [[""] * V for _ in range(val_N)]
+            val_active: List[List[bool]] = [[True] * V for _ in range(val_N)]
+            val_seg_obs: List[List[Optional[torch.Tensor]]] = [[None] * V for _ in range(val_N)]
+
+            with torch.no_grad():
+                for _seg_idx in range(max_rounds):
+                    val_prompts: List[str] = []
+                    val_temps: List[float] = []
+                    val_map: List[Tuple[int, int]] = []
+
+                    for i in range(val_N):
+                        for v in range(V):
+                            if not val_active[i][v]:
+                                continue
+                            val_prompts.append(val_rendered[i] + val_generated[i][v])
+
+                            if val_seg_obs[i][v] is None:
+                                temp = 0.7
+                            else:
+                                obs_t = val_seg_obs[i][v][-1:].to(device)
+                                logits, _ = policy(obs_t)
+                                action = logits.argmax(dim=-1).item()
+                                temp = temp_bins[action]
+                            val_seg_obs[i][v] = None  # don't store for val
+                            val_temps.append(temp)
+                            val_map.append((i, v))
+
+                    if not val_map:
+                        break
+
+                    val_feats = runner.generate_with_features(
+                        val_prompts, val_temps, segment_size,
+                        top_k=top_k_logprobs,
+                        return_logprobs=False,
+                        return_hidden=False,
+                    )
+
+                    for j, (i, v) in enumerate(val_map):
+                        f = val_feats[j]
+                        val_generated[i][v] += f["text"]
+                        new_tokens = f["token_ids"]
+                        finish_reason = f["finish_reason"]
+                        if (tokenizer.eos_token_id is not None and tokenizer.eos_token_id in new_tokens) or \
+                           finish_reason == 'stop' or not new_tokens:
+                            val_active[i][v] = False
+
+            val_correct = sum(
+                1 if self_consistency_correct(val_generated[i], val_gold[i]) else 0
+                for i in range(val_N)
+            )
+            val_acc = val_correct / val_N
 
         logger.info(
-            "iter=%d loss=%.4f policy=%.4f value=%.4f val_value=%.4f entropy=%.4f reward=%.4f acc=%.4f steps=%d updates=%d",
+            "iter=%d loss=%.4f policy=%.4f value=%.4f entropy=%.4f reward=%.4f train_acc=%.4f val_acc=%.4f steps=%d updates=%d",
             it + 1,
             avg_policy + value_coef * avg_value - entropy_coef * avg_entropy,
-            avg_policy, avg_value, val_value, avg_entropy,
-            mean_reward, online_acc, total_steps, n_updates,
+            avg_policy, avg_value, avg_entropy,
+            mean_reward, train_acc, val_acc, total_steps, n_updates,
         )
 
-        # ---- early stopping on val_value ----
-        if val_value < best_val_value:
-            best_val_value = val_value
+        # ---- early stopping on val accuracy ----
+        if val_acc > best_val_value:
+            best_val_value = val_acc
             patience_counter = 0
             best_state = {"policy_value": {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}, "config": cfg}
-            logger.info("new_best val_value=%.4f", best_val_value)
+            logger.info("new_best val_acc=%.4f", best_val_value)
         else:
             patience_counter += 1
             if patience_counter >= early_stop_patience:
-                logger.info("early_stop val_value=%.4f best=%.4f", val_value, best_val_value)
+                logger.info("early_stop val_acc=%.4f best=%.4f", val_acc, best_val_value)
                 break
 
     if best_state is None:
         best_state = {"policy_value": {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}, "config": cfg}
     ckpt_path = cfg["paths"]["ppo_ckpt"]
     torch.save(best_state, ckpt_path)
-    logger.info("saved_checkpoint=%s best_val_value=%.4f run_name=%s", ckpt_path, best_val_value, final_run_name)
+    logger.info("saved_checkpoint=%s best_val_acc=%.4f run_name=%s", ckpt_path, best_val_value, final_run_name)
 
 
 def main() -> None:
