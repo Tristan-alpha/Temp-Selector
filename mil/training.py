@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from mil.model import MILModel, DynamicTempHead, GlobalTempHead, smoothness_loss
-from mil.utils import BagDataset, TokenBatchSampler, make_collate_fn
+from mil.utils import BagDataset, make_collate_fn, SegmentCacheDataset, make_cached_collate_fn, token_batches
 from utils.exp_logger import log_exception, setup_experiment_logger
 
 
@@ -91,16 +91,34 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         train_device=device,
     )
 
-    max_tokens_per_batch = int(cfg["mil"]["training"].get("max_tokens_per_batch", 100000))
-    token_counts = [len(r["_full_ids"]) for r in dataset.rows]
-    logger.info("max_tokens_per_batch=%d total_tokens=%d", max_tokens_per_batch, sum(token_counts))
+    # ---- Pre-compute segment features for training set ----
+    max_tokens_per_batch = int(cfg["mil"]["training"].get("max_tokens_per_batch", 131072))
+    segment_cache: List[Dict[str, Any]] = []
+    train_batches = token_batches(dataset.rows, max_tokens_per_batch)
+    logger.info("precomputing train features n_rows=%d n_batches=%d max_tokens_per_batch=%d",
+                 len(dataset), len(train_batches), max_tokens_per_batch)
+    for indices in tqdm(train_batches, desc="Precompute train features"):
+        batch_rows = [dataset[i] for i in indices]
+        batch = collate_fn(batch_rows)
+        x = batch["instances"].cpu()
+        y = batch["label"].cpu()
+        t = batch["temp_idx"].cpu()
+        mask = batch["mask"].cpu()
+        for i in range(x.shape[0]):
+            n_valid = int(mask[i].sum().item())
+            segment_cache.append({
+                "instances": x[i, :n_valid].clone(),
+                "label": float(y[i].item()),
+                "temp_idx": int(t[i].item()),
+            })
+    logger.info("precomputed train segment_cache_size=%d", len(segment_cache))
 
-    train_sampler = TokenBatchSampler(token_counts, max_tokens_per_batch, shuffle=True)
+    train_batch_size = int(cfg["mil"]["training"].get("batch_size", 32))
+    cached_collate = make_cached_collate_fn(segment_cache, instance_dim, device)
     loader = DataLoader(
-        dataset,
-        batch_sampler=train_sampler,
-        collate_fn=collate_fn,
-        num_workers=0,
+        SegmentCacheDataset(len(segment_cache)),
+        batch_size=train_batch_size, shuffle=True,
+        collate_fn=cached_collate, num_workers=0,
     )
 
     mil = MILModel(
@@ -159,13 +177,31 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
                 row["_full_ids"] = pids + resp_ids
                 row["_prompt_len"] = len(pids)
 
-    val_token_counts = [len(r["_full_ids"]) for r in val_dataset.rows]
-    val_sampler = TokenBatchSampler(val_token_counts, max_tokens_per_batch, shuffle=False)
+    # ---- Pre-compute segment features for validation set ----
+    val_segment_cache: List[Dict[str, Any]] = []
+    val_batches = token_batches(val_dataset.rows, max_tokens_per_batch)
+    logger.info("precomputing val features n_rows=%d n_batches=%d", len(val_dataset), len(val_batches))
+    for indices in tqdm(val_batches, desc="Precompute val features"):
+        batch_rows = [val_dataset[i] for i in indices]
+        batch = collate_fn(batch_rows)
+        x = batch["instances"].cpu()
+        y = batch["label"].cpu()
+        t = batch["temp_idx"].cpu()
+        mask = batch["mask"].cpu()
+        for i in range(x.shape[0]):
+            n_valid = int(mask[i].sum().item())
+            val_segment_cache.append({
+                "instances": x[i, :n_valid].clone(),
+                "label": float(y[i].item()),
+                "temp_idx": int(t[i].item()),
+            })
+    logger.info("precomputed val segment_cache_size=%d", len(val_segment_cache))
+
+    val_cached_collate = make_cached_collate_fn(val_segment_cache, instance_dim, device)
     val_loader = DataLoader(
-        val_dataset,
-        batch_sampler=val_sampler,
-        collate_fn=collate_fn,
-        num_workers=0,
+        SegmentCacheDataset(len(val_segment_cache)),
+        batch_size=train_batch_size, shuffle=False,
+        collate_fn=val_cached_collate, num_workers=0,
     )
 
     def _validate() -> float:
@@ -209,9 +245,8 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
             dynamic_head.train()
 
         sum_loss = 0.0
-        total_tokens = sum(token_counts)
-        pbar = tqdm(total=total_tokens, desc=f"Epoch {epoch + 1}/{max_epochs}",
-                     unit="tok", dynamic_ncols=True)
+        pbar = tqdm(total=len(loader), desc=f"Epoch {epoch + 1}/{max_epochs}",
+                     unit="batch", dynamic_ncols=True)
         for batch in loader:
             x = batch["instances"]
             mask = batch["mask"]
@@ -321,12 +356,11 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
             _batch_loss = float(loss.item())
             _batch_bag = float(loss_bag.item())
             _batch_inst = float(loss_inst.item())
-            _batch_tokens = batch.get("_batch_tokens", 0)
             sum_loss += _batch_loss
 
             del x, mask, y, t, out, loss, loss_bag, loss_inst, batch
 
-            pbar.update(_batch_tokens)
+            pbar.update(1)
             pbar.set_postfix(loss=f"{_batch_loss:.4f}",
                              bag=f"{_batch_bag:.4f}",
                              inst=f"{_batch_inst:.4f}",

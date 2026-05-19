@@ -16,16 +16,21 @@ MIL reads `individual_label` (per-response correctness):
 
 Every `> 0.5` branch carries an inline comment (`# label=1: positive bag (contains errors)`) to make the convention explicit.
 
-## Online feature extraction
+## Segment feature pre-computation
 
-Features are NOT stored in JSONL. Collate_fn always does online extraction:
+Features are extracted once before training and cached in system RAM:
 
 ```
-BagDataset loads JSONL → pre-tokenize prompts
-make_collate_fn:
-  extractor.extract_from_ids(full_ids, prompt_lens, temperatures, return_logprobs, return_hidden)
-  build_segment_obs_from_lp → [logprob, entropy, top-k logprobs] cat hidden
-  segment_pooling → [K, instance_dim] instance matrix
+Pre-computation (once before epoch loop):
+  BagDataset loads JSONL → pre-tokenize prompts
+  make_collate_fn (with extractor):
+    extractor.extract_from_ids(...)  ← vLLM prefill, expensive
+    build_segment_obs_from_lp → segment_pooling → [K, instance_dim]
+  → segment_cache[i] = {instances, label, temp_idx}  (system RAM, ~3-13 GB)
+
+Training (every epoch):
+  SegmentCacheDataset → make_cached_collate_fn:
+    cache lookup → pad → stack  ← no vLLM calls
 ```
 
 Two feature modes:

@@ -49,6 +49,7 @@ mil:
     use_gru: true
   training:
     instance_loss: pure     # topk | pure | soft_pseudo_label | contrastive
+    batch_size: 32
     max_tokens_per_batch: 131072
     lr: 2.0e-4
     max_epochs: 50

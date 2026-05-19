@@ -12,7 +12,7 @@ Dynamic temperature selection for LLM math reasoning. MIL learns to localise err
 | `features/dataset_eval.py` | `evaluate_dataset()`, `load_temperature_labels()` |
 | `inference/vllm_runner.py` | `VLLMFeatureExporter` — generation + `extract_from_ids` + `generate_with_features` |
 | `mil/model.py` | `MILModel`, temp heads, `smoothness_loss` |
-| `mil/utils.py` | `BagDataset`, `TokenBatchSampler`, `make_collate_fn` — shared MIL data utilities |
+| `mil/utils.py` | `BagDataset`, `make_collate_fn`, `SegmentCacheDataset`, `make_cached_collate_fn` — shared MIL data utilities |
 | `mil/training.py` | `train()` — Stage 2 training loop |
 | `mil/eval.py` | `evaluate_mil()` — Stage 2 evaluation |
 | `ppo/model.py` | `PolicyValueNet`, `compute_gae`, `sample_action`, warm-start |

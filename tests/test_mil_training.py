@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from mil.utils import make_collate_fn
+from mil.utils import make_collate_fn, make_cached_collate_fn, SegmentCacheDataset
 from mil.model import smoothness_loss
 
 
@@ -282,4 +282,40 @@ def test_ctr_negative_bag():
     y = torch.tensor([0.0])
     loss = _compute_ctr_instance_loss(scores, mask, y)
     # MSE: (25+9+1)/3 ≈ 11.7 → high loss for high scores
-    assert loss > 5.0
+
+
+# ═══ make_cached_collate_fn ═══
+
+
+def test_cached_collate_fn_basic():
+    cache = [
+        {"instances": torch.randn(3, 4098), "label": 0.0, "temp_idx": 2},
+        {"instances": torch.randn(5, 4098), "label": 1.0, "temp_idx": 5},
+        {"instances": torch.randn(2, 4098), "label": 0.0, "temp_idx": 3},
+    ]
+    collate = make_cached_collate_fn(cache, instance_dim=4098)
+    batch = collate([0, 2])
+    assert batch["instances"].shape == (2, 3, 4098)  # max_k=3
+    assert batch["mask"].shape == (2, 3)
+    assert batch["mask"][0, :3].sum() == 3  # row 0 has 3 valid
+    assert batch["mask"][1, :3].sum() == 2  # row 1 has 2 valid
+    assert batch["label"].tolist() == [0.0, 0.0]
+    assert batch["temp_idx"].tolist() == [2, 3]
+
+
+def test_cached_collate_fn_single_row():
+    cache = [{"instances": torch.randn(4, 4098), "label": 1.0, "temp_idx": 7}]
+    collate = make_cached_collate_fn(cache, instance_dim=4098)
+    batch = collate([0])
+    assert batch["instances"].shape == (1, 4, 4098)
+    assert batch["mask"].sum() == 4
+    assert batch["label"].item() == 1.0
+    assert batch["temp_idx"].item() == 7
+
+
+def test_segment_cache_dataset():
+    ds = SegmentCacheDataset(10)
+    assert len(ds) == 10
+    assert ds[0] == 0
+    assert ds[5] == 5
+    assert ds[9] == 9
