@@ -12,7 +12,7 @@ import argparse
 import json
 import random
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import yaml
@@ -118,48 +118,46 @@ class OnlineTemperatureEvaluator:
         gold_answers = [p.get("answer", "") for p in prompts_data]
 
         generated: List[List[str]] = [[""] * V for _ in range(N)]
-        active = [True] * N
-        segment_obs: List[Optional[List[float]]] = [None] * N
+        active: List[List[bool]] = [[True] * V for _ in range(N)]
+        segment_obs: List[List[Optional[List[float]]]] = [[None] * V for _ in range(N)]
         all_temps: List[List[float]] = [[] for _ in range(N)]
         n_segments: List[int] = [0] * N
 
         from utils.answer_verifier import self_consistency_correct
 
-        max_rounds = self.max_new_tokens // self.segment_size + 1
+        max_rounds = self.max_new_tokens // self.segment_size
 
         for _seg_idx in range(max_rounds):
             round_prompts: List[str] = []
             round_temps: List[float] = []
-            round_indices: List[int] = []
-            round_dup: List[int] = []  # v-slot per expanded prompt
+            round_map: List[Tuple[int, int]] = []  # (prompt_idx, chain_idx)
 
             for i in range(N):
-                if not active[i]:
-                    continue
-                base = rendered[i] + generated[i][0]
-
-                if strategy == "ppo":
-                    if _seg_idx == 0 or segment_obs[i] is None:
-                        temp = 0.7
-                    else:
-                        obs_t = torch.tensor(segment_obs[i][-1], dtype=torch.float32).unsqueeze(0)
-                        with torch.no_grad():
-                            logits, _ = self.policy(obs_t)
-                            action = logits.argmax(dim=-1).item()
-                        temp = self.temp_bins[action]
-                elif strategy == "best-fixed":
-                    temp = best_fixed_temp
-                else:
-                    temp = rng.choice(self.temp_bins)
-
-                all_temps[i].append(temp)
                 for v in range(V):
-                    round_prompts.append(base)
-                    round_temps.append(temp)
-                    round_indices.append(i)
-                    round_dup.append(v)
+                    if not active[i][v]:
+                        continue
+                    round_prompts.append(rendered[i] + generated[i][v])
 
-            if not round_indices:
+                    if strategy == "ppo":
+                        if _seg_idx == 0 or segment_obs[i][v] is None:
+                            temp = 0.7
+                        else:
+                            obs_t = torch.tensor(segment_obs[i][v][-1], dtype=torch.float32).unsqueeze(0)
+                            with torch.no_grad():
+                                logits, _ = self.policy(obs_t)
+                                action = logits.argmax(dim=-1).item()
+                            temp = self.temp_bins[action]
+                    elif strategy == "best-fixed":
+                        temp = best_fixed_temp
+                    else:
+                        temp = rng.choice(self.temp_bins)
+
+                    if v == 0:
+                        all_temps[i].append(temp)
+                    round_temps.append(temp)
+                    round_map.append((i, v))
+
+            if not round_map:
                 break
 
             feats = self.runner.generate_with_features(
@@ -168,7 +166,7 @@ class OnlineTemperatureEvaluator:
                 return_logprobs=True,
             )
 
-            for j, (i, v) in enumerate(zip(round_indices, round_dup)):
+            for j, (i, v) in enumerate(round_map):
                 f = feats[j]
                 generated[i][v] += f["text"]
 
@@ -178,16 +176,16 @@ class OnlineTemperatureEvaluator:
                 if (self.tokenizer.eos_token_id is not None and
                     self.tokenizer.eos_token_id in f["token_ids"]) or \
                    f["finish_reason"] == 'stop' or not f["token_ids"]:
-                    active[i] = False
+                    active[i][v] = False
                     continue
 
-                if f["logprobs"] is not None and v == 0:
+                if f["logprobs"] is not None:
                     obs = build_segment_obs_from_lp(
                         f["logprobs"], f["tokens"], f["text"],
                         self.segment_size, self.obs_dim,
                         segment_mode=self.segment_mode,
                     )
-                    segment_obs[i] = obs.tolist()
+                    segment_obs[i][v] = obs.tolist()
 
         result = OnlineResult()
         for i in range(N):

@@ -63,7 +63,7 @@ ppo:
   training:
     max_iterations: 200
     early_stop_patience: 10
-    online_rollout_size: 128
+    online_rollout_size: 64
     ppo_epochs: 8
     mini_batch_size: 32
     val_ratio: 0.2

@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.optim as optim
@@ -164,18 +164,6 @@ def train_ppo(
 
     opt = optim.Adam(policy.parameters(), lr=lr)
 
-    def render_prompt(question: str) -> str:
-        if not use_math_chat:
-            return question
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question},
-        ]
-        try:
-            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        except Exception:
-            return f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{question}\n\n[ASSISTANT]\n"
-
     from utils.answer_verifier import self_consistency_correct
 
     best_val_value = float("inf")
@@ -186,61 +174,65 @@ def train_ppo(
         rng = random.Random(seed + it * 1000)
         batch_prompts = rng.sample(all_prompts, min(rollout_size, len(all_prompts)))
         N = len(batch_prompts)
-        rendered = [render_prompt(p.get("question") or p.get("problem") or p.get("prompt", "")) for p in batch_prompts]
+        rendered = [
+            runner.render_messages(runner.build_math_messages(
+                p.get("question") or p.get("problem") or p.get("prompt", ""),
+                system_prompt=system_prompt,
+            )) if use_math_chat else (p.get("question") or p.get("problem") or p.get("prompt", ""))
+            for p in batch_prompts
+        ]
         gold_answers = [p.get("answer", "") for p in batch_prompts]
 
         V = num_votes
         generated: List[List[str]] = [[""] * V for _ in range(N)]
-        active = [True] * N
-        segment_obs: List[Optional[torch.Tensor]] = [None] * N
-        ep_obs: List[List[torch.Tensor]] = [[] for _ in range(N)]
-        ep_actions: List[List[torch.Tensor]] = [[] for _ in range(N)]
-        ep_logprobs: List[List[torch.Tensor]] = [[] for _ in range(N)]
-        ep_values: List[List[torch.Tensor]] = [[] for _ in range(N)]
+        active: List[List[bool]] = [[True] * V for _ in range(N)]
+        segment_obs: List[List[Optional[torch.Tensor]]] = [[None] * V for _ in range(N)]
+        ep_obs: List[List[List[torch.Tensor]]] = [[[] for _ in range(V)] for _ in range(N)]
+        ep_actions: List[List[List[torch.Tensor]]] = [[[] for _ in range(V)] for _ in range(N)]
+        ep_logprobs: List[List[List[torch.Tensor]]] = [[[] for _ in range(V)] for _ in range(N)]
+        ep_values: List[List[List[torch.Tensor]]] = [[[] for _ in range(V)] for _ in range(N)]
         ep_correct: List[int] = [-1] * N  # 1 = majority correct, 0 = majority wrong, -1 = unknown
 
-        max_rounds = max_new_tokens // segment_size + 1
+        max_rounds = max_new_tokens // segment_size
 
         for _seg_idx in range(max_rounds):
-            round_prompts = []
+            round_prompts: List[str] = []
             round_temps: List[float] = []
-            round_indices = []
-            round_dup: List[int] = []  # v-slot per expanded prompt
+            round_map: List[Tuple[int, int]] = []  # (prompt_idx, chain_idx)
 
             for i in range(N):
-                if not active[i]:
-                    continue
-                base = rendered[i] + generated[i][0]
-
-                if segment_obs[i] is None:
-                    # First segment: no prior generated tokens → no features to
-                    # build an observation from.  Use a fixed default temperature.
-                    # The dummy values below are safely skipped during PPO batch
-                    # construction (range(1, n_steps)) — they only keep the
-                    # per-episode lists aligned so t=0 is the first decision.
-                    temp = 0.7
-                    ep_obs[i].append(torch.zeros(obs_dim))
-                    ep_actions[i].append(torch.tensor(0))
-                    ep_logprobs[i].append(torch.tensor(0.0))
-                    ep_values[i].append(torch.tensor(0.0))
-                else:
-                    obs_t = segment_obs[i][-1:].to(device)  # last segment represents latest step
-                    with torch.no_grad():
-                        logits, value = policy(obs_t)
-                        action, logp = sample_action(logits.squeeze(0))
-                    temp = temp_bins[int(action.item())]
-                    ep_obs[i].append(segment_obs[i].cpu())
-                    ep_actions[i].append(action.cpu())
-                    ep_logprobs[i].append(logp.cpu())
-                    ep_values[i].append(value.squeeze(0).cpu())
-
                 for v in range(V):
-                    round_prompts.append(base)
-                    round_temps.append(temp)
-                    round_indices.append(i)
-                    round_dup.append(v)
+                    if not active[i][v]:
+                        continue
+                    round_prompts.append(rendered[i] + generated[i][v])
 
-            if not round_indices:
+                    if segment_obs[i][v] is None:
+                        # First segment: no prior generated tokens → no features
+                        # to build an observation from.  Use a fixed default
+                        # temperature.  The dummy values below are safely skipped
+                        # during PPO batch construction (range(1, n_steps)) — they
+                        # only keep the per-chain lists aligned so t=0 is the
+                        # first decision.
+                        temp = 0.7
+                        ep_obs[i][v].append(torch.zeros(obs_dim))
+                        ep_actions[i][v].append(torch.tensor(0))
+                        ep_logprobs[i][v].append(torch.tensor(0.0))
+                        ep_values[i][v].append(torch.tensor(0.0))
+                    else:
+                        obs_t = segment_obs[i][v][-1:].to(device)
+                        with torch.no_grad():
+                            logits, value = policy(obs_t)
+                            action, logp = sample_action(logits.squeeze(0))
+                        temp = temp_bins[int(action.item())]
+                        ep_obs[i][v].append(segment_obs[i][v].cpu())
+                        ep_actions[i][v].append(action.cpu())
+                        ep_logprobs[i][v].append(logp.cpu())
+                        ep_values[i][v].append(value.squeeze(0).cpu())
+
+                    round_temps.append(temp)
+                    round_map.append((i, v))
+
+            if not round_map:
                 break
 
             feats = runner.generate_with_features(
@@ -250,7 +242,7 @@ def train_ppo(
                 return_hidden=hs_needed,
             )
 
-            for j, (i, v) in enumerate(zip(round_indices, round_dup)):
+            for j, (i, v) in enumerate(round_map):
                 f = feats[j]
                 new_tokens = f["token_ids"]
                 finish_reason = f["finish_reason"]
@@ -259,31 +251,27 @@ def train_ppo(
 
                 if (tokenizer.eos_token_id is not None and tokenizer.eos_token_id in new_tokens) or \
                    finish_reason == 'stop' or not new_tokens:
-                    active[i] = False
-                    ep_correct[i] = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
+                    active[i][v] = False
                     continue
 
-                if v == 0:
-                    # Only slot 0 drives the next policy decision
-                    extra = [f["hidden_states"]] if f["hidden_states"] is not None else None
-                    obs = build_segment_obs_from_lp(
-                        f["logprobs"], f["tokens"], f["text"],
-                        segment_size, obs_dim, device=device, extra_parts=extra,
-                        segment_mode=segment_mode,
-                    )
-                    segment_obs[i] = obs.cpu()
+                extra = [f["hidden_states"]] if f["hidden_states"] is not None else None
+                obs = build_segment_obs_from_lp(
+                    f["logprobs"], f["tokens"], f["text"],
+                    segment_size, obs_dim, device=device, extra_parts=extra,
+                    segment_mode=segment_mode,
+                )
+                segment_obs[i][v] = obs.cpu()
 
         for i in range(N):
             if ep_correct[i] == -1:
                 ep_correct[i] = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
 
         # ---- Build PPO batch ----
-        # Walk each episode's recorded steps.  range(1, n_steps) skips t=0
+        # Each chain is an independent episode.  range(1, n_steps) skips t=0
         # (the first segment, which had no prior observation to base a decision
-        # on).  The last step of each episode is marked done=True and receives
-        # the terminal majority-vote reward (±1); intermediate steps receive 0
-        # (or a MIL shaping reward if available).  done flags prevent GAE from
-        # propagating advantage across episode boundaries.
+        # on).  The last step of each chain is marked done=True and receives
+        # the terminal majority-vote reward (±1) shared across all chains of
+        # the same prompt.  Intermediate steps receive 0 (or MIL shaping reward).
         all_obs: List[torch.Tensor] = []
         all_actions: List[torch.Tensor] = []
         all_logprobs: List[torch.Tensor] = []
@@ -292,26 +280,27 @@ def train_ppo(
         all_values: List[torch.Tensor] = []
 
         for i in range(N):
-            n_steps = len(ep_actions[i])
-            if n_steps <= 1:
-                continue
-            for t in range(1, n_steps):
-                all_obs.append(ep_obs[i][t])
-                all_actions.append(ep_actions[i][t])
-                all_logprobs.append(ep_logprobs[i][t])
-                all_values.append(ep_values[i][t])
-                done = (t == n_steps - 1)
-                all_dones.append(float(done))
-                if done:
-                    reward = 1.0 if ep_correct[i] > 0 else -1.0
-                else:
-                    reward = 0.0
-                    if mil_model is not None and shaping_coef > 0:
-                        seg_obs_t = ep_obs[i][t].unsqueeze(0).to(device)
-                        with torch.no_grad():
-                            mil_out = mil_model(seg_obs_t)
-                        reward = shaping_coef * float((1.0 - torch.sigmoid(mil_out["inst_logit"])).item())
-                all_rewards.append(reward)
+            for v in range(V):
+                n_steps = len(ep_actions[i][v])
+                if n_steps <= 1:
+                    continue
+                for t in range(1, n_steps):
+                    all_obs.append(ep_obs[i][v][t])
+                    all_actions.append(ep_actions[i][v][t])
+                    all_logprobs.append(ep_logprobs[i][v][t])
+                    all_values.append(ep_values[i][v][t])
+                    done = (t == n_steps - 1)
+                    all_dones.append(float(done))
+                    if done:
+                        reward = 1.0 if ep_correct[i] > 0 else -1.0
+                    else:
+                        reward = 0.0
+                        if mil_model is not None and shaping_coef > 0:
+                            seg_obs_t = ep_obs[i][v][t].unsqueeze(0).to(device)
+                            with torch.no_grad():
+                                mil_out = mil_model(seg_obs_t)
+                            reward = shaping_coef * float((1.0 - torch.sigmoid(mil_out["inst_logit"])).item())
+                    all_rewards.append(reward)
 
         if len(all_obs) < mini_batch_size:
             logger.info("iter=%d too_few_steps=%d skipping_update", it + 1, len(all_obs))
