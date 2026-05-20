@@ -117,42 +117,51 @@ def load_temperature_labels(data_path: str) -> Dict[float, List[int]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Dataset statistics and majority-voting analysis.")
     parser.add_argument("--config", required=True, help="Path to YAML config")
-    parser.add_argument("--data", default=None, help="Override paths.test_dataset from config")
-    parser.add_argument("--output", default="datasets/eval_stats.json", help="Path to save JSON results")
+    parser.add_argument("--output-dir", default="datasets", help="Directory to save per-split JSON results")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    data_path = args.data or cfg["paths"]["test_dataset"]
+
+    splits = [
+        ("train", cfg["paths"]["train_dataset"]),
+        ("val", cfg["paths"]["val_dataset"]),
+        ("test", cfg["paths"]["test_dataset"]),
+    ]
 
     logger, _log_path, final_run_name = setup_experiment_logger(
         component="dataset_eval",
         run_name=args.run_name,
         log_dir=args.log_dir,
-        config={"data": data_path},
+        config={"splits": [s[0] for s in splits]},
     )
 
-    result = evaluate_dataset(data_path)
-    logger.info("dataset_stats=%s", json.dumps(result, indent=2))
-
     from pathlib import Path as _Path
-    out_path = _Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, default=str)
-    logger.info("eval_stats_saved=%s", str(out_path))
-    logger.info("dataset_eval_complete run_name=%s", final_run_name)
+    out_dir = _Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nDataset: {result['n_samples']} samples, "
-          f"voting accuracy={result.get('voting_accuracy', 0):.3f}")
-    mv = result.get("majority_voting")
-    if mv:
-        print(f"  Majority Voting: {mv['num_votes']} votes x {mv['n_groups']} groups")
-        print(f"  Majority accuracy: {mv['majority_accuracy']:.4f}")
-        bt = mv.get("best_temperature_majority", {})
-        print(f"  Best temp: {bt.get('temperature', '?')} → accuracy={bt.get('accuracy', 0):.4f}")
+    for split_name, data_path in splits:
+        result = evaluate_dataset(data_path)
+        logger.info("dataset_stats split=%s %s", split_name, json.dumps(result, indent=2))
+
+        out_path = out_dir / f"eval_stats_{split_name}.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, default=str)
+        logger.info("eval_stats_saved=%s", str(out_path))
+
+        print(f"\n=== {split_name} ({data_path}) ===")
+        print(f"  Samples: {result['n_samples']}, "
+              f"voting accuracy={result.get('voting_accuracy', 0):.3f}")
+        mv = result.get("majority_voting")
+        if mv:
+            print(f"  Majority Voting: {mv['num_votes']} votes x {mv['n_groups']} groups, "
+                  f"accuracy={mv['majority_accuracy']:.4f}")
+            bt = mv.get("best_temperature_majority", {})
+            print(f"  Best temp: {bt.get('temperature', '?')} → accuracy={bt.get('accuracy', 0):.4f}")
+
+    logger.info("dataset_eval_complete run_name=%s", final_run_name)
     print()
 
 

@@ -46,3 +46,13 @@ For a given row, `individual_label` and `voting_label` MAY have different values
 - **WHEN** `build_dataset.py` generates a sample row
 - **THEN** the row dict SHALL contain keys `individual_label` and `voting_label`
 - **AND** the row dict SHALL NOT contain key `label`
+
+### Requirement: dataset_eval.py evaluates all splits
+
+`features/dataset_eval.py` `main()` SHALL evaluate `train_dataset`, `val_dataset`, and `test_dataset` from config in order.
+
+#### Scenario: Multi-split evaluation
+
+- **WHEN** `python features/dataset_eval.py --config configs/training/base.yaml` is run
+- **THEN** all three splits SHALL be analyzed in order
+- **AND** per-split results SHALL be printed and saved to `eval_stats_{split}.json`
