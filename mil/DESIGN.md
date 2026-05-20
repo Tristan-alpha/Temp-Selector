@@ -33,9 +33,13 @@ Training (every epoch):
     cache lookup → pad → stack  ← no vLLM calls
 ```
 
-Two feature modes:
-- `topk_logprobs`: logprob + entropy + top-4096 logprobs → instance_dim=4098
-- `hidden_states`: Qwen3-8B hidden states → instance_dim=4096
+Two feature modes, both producing exactly 4098-dim per-token vectors via `build_segment_obs_from_lp`:
+
+- `topk_logprobs`: `[sampled_logprob, entropy, topk_logprob_0..topk_logprob_4095]` (2+4096=4098, no zero-padding)
+- `hidden_states`: `[sampled_logprob, entropy, hidden_dim_0..hidden_dim_4095]` (2+4096=4098, no zero-padding)
+
+Both modes use logprobs (always extracted). `build_segment_obs_from_lp` accepts `include_topk` to
+control whether the top-k array or hidden states fill the 4096 dims after logprob+entropy.
 
 ## Model architecture
 

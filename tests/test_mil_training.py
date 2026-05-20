@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from mil.utils import make_collate_fn, make_cached_collate_fn, SegmentCacheDataset
 from mil.model import smoothness_loss
+from features.segmenter import build_segment_obs_from_lp
 
 
 # ═══ make_collate_fn / collate_fn ═══
@@ -319,3 +320,63 @@ def test_segment_cache_dataset():
     assert ds[0] == 0
     assert ds[5] == 5
     assert ds[9] == 9
+
+
+# ═══ concat pooling end-to-end ═══
+
+
+def test_build_segment_obs_concat():
+    """concat mode: output dims = segment_size × obs_dim, not just obs_dim."""
+    obs_dim = 64
+    seg_size = 64
+    n_tok = 200
+    lp = torch.randn(n_tok, 4097)  # topk_logprobs format: [n_tok, top_k+1]
+    tokens = ["a"] * n_tok
+    text = " ".join(tokens)
+
+    obs = build_segment_obs_from_lp(
+        lp, tokens, text,
+        segment_size=seg_size, obs_dim=obs_dim,
+        pooling_mode="concat",
+    )
+    # ceil(200 / 64) = 4 segments, each 64*64=4096 dims
+    assert obs.shape == (4, 4096), f"Expected (4, 4096), got {obs.shape}"
+
+
+def test_build_segment_obs_concat_vs_mean_shape():
+    """concat produces segment_size×obs_dim; mean produces obs_dim."""
+    obs_dim = 64
+    seg_size = 64
+    lp = torch.randn(128, 4097)
+    tokens = ["x"] * 128
+    text = "x " * 128
+
+    concat_obs = build_segment_obs_from_lp(
+        lp, tokens, text,
+        segment_size=seg_size, obs_dim=obs_dim,
+        pooling_mode="concat",
+    )
+    mean_obs = build_segment_obs_from_lp(
+        lp, tokens, text,
+        segment_size=seg_size, obs_dim=obs_dim,
+        pooling_mode="mean",
+    )
+    # concat: 2 segments, each seg_size*obs_dim = 4096
+    assert concat_obs.shape == (2, 4096)
+    # mean: 2 segments, each obs_dim = 64
+    assert mean_obs.shape == (2, 64)
+
+
+def test_collate_fn_concat_pooling_mode_accepted():
+    """make_collate_fn accepts pooling_mode='concat' without error."""
+    collate = make_collate_fn(
+        feature_mode="topk_logprobs",
+        instance_dim=64,
+        segment_mode="fixed_window",
+        segment_size=64,
+        pooling_mode="concat",
+    )
+    r1 = _make_row(["hello", "world"])
+    batch = collate([r1])
+    assert "instances" in batch
+    assert "mask" in batch

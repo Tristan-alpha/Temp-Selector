@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 import torch
 from torch.utils.data import Dataset
 
-from features.segmenter import build_segment_obs_from_lp, build_segments, segment_pooling
+from features.segmenter import build_segment_obs_from_lp
 
 
 def token_batches(rows: List[Dict[str, Any]], max_tokens: int) -> List[List[int]]:
@@ -69,7 +69,7 @@ def make_collate_fn(
         temp_bins = [0.0]
     bin_map = {float(v): i for i, v in enumerate(temp_bins)}
     need_hidden = feature_mode == "hidden_states" and extractor is not None
-    need_logprobs = feature_mode == "topk_logprobs" and extractor is not None
+    need_logprobs = feature_mode in ("topk_logprobs", "hidden_states") and extractor is not None
     has_extractor = extractor is not None
 
     def collate_fn(batch_rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -101,22 +101,14 @@ def make_collate_fn(
                 continue
 
             if logprob_tensors is not None:
+                extra = [hidden_tensors[i][:n]] if hidden_tensors is not None else None
                 inst = build_segment_obs_from_lp(
                     logprob_tensors[i][:n], row["tokens"], row["response"],
                     segment_size, instance_dim, device=train_device,
-                    extra_parts=[hidden_tensors[i][:n]] if hidden_tensors is not None else None,
+                    extra_parts=extra,
+                    include_topk=(feature_mode == "topk_logprobs"),
+                    pooling_mode=pooling_mode,
                 )
-            elif hidden_tensors is not None:
-                tok_vecs = hidden_tensors[i][:n]
-                if tok_vecs.shape[1] < instance_dim:
-                    tok_vecs = torch.cat([tok_vecs,
-                        torch.zeros(n, instance_dim - tok_vecs.shape[1])], dim=1)
-                else:
-                    tok_vecs = tok_vecs[:, :instance_dim]
-                spans = build_segments(tokens=row["tokens"], mode=segment_mode,
-                                       segment_size=segment_size, response=row["response"])
-                inst = segment_pooling(tok_vecs.to(train_device), spans, instance_dim,
-                                       mode=pooling_mode, segment_size=segment_size)
             else:
                 inst = torch.zeros(1, instance_dim, device=train_device)
             instances_list.append(inst)

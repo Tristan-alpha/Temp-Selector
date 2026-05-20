@@ -11,12 +11,29 @@
 
 ### Requirement: Two feature modes
 
-The system SHALL support exactly two feature modes: `topk_logprobs` (extracts logprob + entropy + top-k logprobs per token) and `hidden_states` (extracts hidden states per token). The modes `basic` and `all` SHALL NOT exist.
+The system SHALL support exactly two feature modes. Both modes SHALL produce per-token feature vectors of exactly `instance_dim` dims:
+
+- `topk_logprobs`: `[sampled_logprob, entropy, topk_logprob_0..topk_logprob_{top_k-1}]` (2 + top_k dims)
+- `hidden_states`: `[sampled_logprob, entropy, hidden_0..hidden_{hidden_dim-1}]` (2 + hidden_dim dims)
+
+Both modes SHALL use `build_segment_obs_from_lp` → `segment_pooling` as the single construction pipeline. `build_segment_obs_from_lp` SHALL accept an `include_topk: bool` parameter to control whether top-k logprobs are appended. The modes `basic` and `all` SHALL NOT exist.
 
 #### Scenario: Valid feature modes
 
 - **WHEN** `feature_mode` is set
 - **THEN** it SHALL be either `"topk_logprobs"` or `"hidden_states"`
+
+#### Scenario: topk_logprobs mode includes top-k logprobs directly
+
+- **WHEN** `feature_mode` is `"topk_logprobs"` and `build_segment_obs_from_lp` is called with `include_topk=True`
+- **THEN** the per-token vector SHALL include all top-k logprobs values
+- **AND** no dimensions SHALL be zero-padded (2 + top_k = instance_dim)
+
+#### Scenario: hidden_states mode includes logprobs and hidden
+
+- **WHEN** `feature_mode` is `"hidden_states"`
+- **THEN** `make_collate_fn` SHALL request both logprobs and hidden states from `extract_from_ids`
+- **AND** segment vectors SHALL be built via `build_segment_obs_from_lp(lp, extra_parts=[hidden], include_topk=False)` — same composition as PPO
 
 ### Requirement: Warning on missing hidden states
 
@@ -36,6 +53,16 @@ The system SHALL log a warning via `logging.getLogger(__name__)` when `hidden_st
 - **WHEN** `make_collate_fn` builds a batch dict
 - **THEN** `batch["label"]` SHALL be a float tensor constructed from `row["individual_label"]` values
 - **AND** missing `individual_label` SHALL default to `0.0`
+
+### Requirement: build_segment_obs_from_lp accepts pooling_mode
+
+`build_segment_obs_from_lp` SHALL accept a `pooling_mode: str = "mean"` parameter and SHALL forward it to `segment_pooling(mode=pooling_mode)`.
+
+#### Scenario: concat pooling via config
+
+- **WHEN** `data.segment_pooling` is `"concat"` and `make_collate_fn` calls `build_segment_obs_from_lp`
+- **THEN** the pooling mode SHALL be forwarded to `segment_pooling(mode="concat")`
+- **AND** the resulting instance tensor SHALL have shape `[K, segment_size * instance_dim]`
 
 ### Requirement: make_cached_collate_fn exists alongside make_collate_fn
 

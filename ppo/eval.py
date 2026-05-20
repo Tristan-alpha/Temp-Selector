@@ -184,6 +184,7 @@ class OnlineTemperatureEvaluator:
                         f["logprobs"], f["tokens"], f["text"],
                         self.segment_size, self.obs_dim,
                         segment_mode=self.segment_mode,
+                        include_topk=True,
                     )
                     segment_obs[i][v] = obs.tolist()
 

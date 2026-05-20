@@ -262,6 +262,7 @@ def train_ppo(
                     f["logprobs"], f["tokens"], f["text"],
                     segment_size, obs_dim, device=device, extra_parts=extra,
                     segment_mode=segment_mode,
+                    include_topk=(not hs_needed),
                 )
                 segment_obs[i][v] = obs.cpu()
 

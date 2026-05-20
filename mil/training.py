@@ -121,8 +121,16 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         collate_fn=cached_collate, num_workers=0,
     )
 
+    pooling_mode = cfg["data"].get("segment_pooling", "mean")
+    segment_size_for_model = int(cfg["data"].get("segment_size", 32))
+    if pooling_mode == "concat":
+        model_input_dim = instance_dim * segment_size_for_model
+    else:
+        model_input_dim = instance_dim
+    logger.info("pooling_mode=%s model_input_dim=%d", pooling_mode, model_input_dim)
+
     mil = MILModel(
-        input_dim=instance_dim, hidden_dim=hidden_dim,
+        input_dim=model_input_dim, hidden_dim=hidden_dim,
         aggregator=cfg["mil"]["model"].get("aggregator", "attention"),
         use_position=cfg["mil"]["model"].get("use_position", True),
         use_gru=cfg["mil"]["model"].get("use_gru", True),

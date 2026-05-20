@@ -125,22 +125,30 @@ def build_segment_obs_from_lp(
     device: torch.device | None = None,
     extra_parts: List[torch.Tensor] | None = None,
     segment_mode: str = "fixed_window",
+    include_topk: bool = False,
+    pooling_mode: str = "mean",
 ) -> torch.Tensor:
     """Convert ``generate_with_features`` logprob tensor into segment obs.
 
     ``lp_tensor``: [n_tok, top_k+1] where col 0 = sampled logprob, cols 1: = top-k.
     Returns [n_segments, obs_dim].
+
+    When ``include_topk``, the full top-k logprobs are appended to the feature
+    vector (2 + top_k dims).  When False, only logprob + entropy form the base
+    (2 dims), with ``extra_parts`` appended before padding.
     """
     n_tok = lp_tensor.shape[0]
     if n_tok == 0:
         return torch.zeros(1, obs_dim, device=device)
 
-    base = torch.zeros(n_tok, 2, dtype=torch.float32)
-    base[:, 0] = lp_tensor[:, 0].float()
     lp = lp_tensor[:, 1:].float()
-    base[:, 1] = -(torch.exp(lp) * lp).sum(dim=1)
+    sampled = lp_tensor[:, 0:1].float()                        # [n_tok, 1]
+    entropy = -(torch.exp(lp) * lp).sum(dim=1, keepdim=True)  # [n_tok, 1]
 
-    parts = [base]
+    if include_topk:
+        parts = [sampled, entropy, lp]                         # [n_tok, 2+top_k]
+    else:
+        parts = [torch.cat([sampled, entropy], dim=1)]         # [n_tok, 2]
     if extra_parts:
         parts.extend(extra_parts)
     tok_vecs = torch.cat(parts, dim=1)
@@ -154,7 +162,7 @@ def build_segment_obs_from_lp(
     spans = build_segments(tokens=tokens, mode=segment_mode,
                            segment_size=segment_size, response=text)
     return segment_pooling(tok_vecs.to(device) if device is not None else tok_vecs,
-                           spans, obs_dim, mode="mean",
+                           spans, obs_dim, mode=pooling_mode,
                            segment_size=segment_size)
 
 
