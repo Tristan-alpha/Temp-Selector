@@ -166,13 +166,19 @@ def evaluate_mil(
     dynamic_state = ckpt.get("dynamic_head", {}) if eval_temp else {}
 
     instance_dim = int(config["data"]["instance_dim"])
+    segment_size = int(config["data"].get("segment_size", 32))
+    pooling_mode = config["data"].get("segment_pooling", "mean")
+    if pooling_mode == "concat":
+        model_input_dim = instance_dim * segment_size
+    else:
+        model_input_dim = instance_dim
     hidden_dim = int(config["mil"]["model"]["hidden_dim"])
     temp_bins = [float(x) for x in config["data"]["temp_bins"]]
     n_temps = len(temp_bins)
     max_tokens_per_batch = int(config["mil"]["training"].get("max_tokens_per_batch", 131072))
 
     mil = MILModel(
-        input_dim=instance_dim, hidden_dim=hidden_dim,
+        input_dim=model_input_dim, hidden_dim=hidden_dim,
         aggregator=config["mil"]["model"].get("aggregator", "attention"),
         use_position=config["mil"]["model"].get("use_position", True),
         use_gru=config["mil"]["model"].get("use_gru", True),

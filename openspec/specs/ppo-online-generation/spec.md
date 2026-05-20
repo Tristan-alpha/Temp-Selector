@@ -79,6 +79,16 @@
 - **THEN** it SHALL use per-temperature accuracy derived from `voting_label` (majority-vote correctness)
 - **AND** the result SHALL be the same as before (same data, different field name)
 
+### Requirement: PPO supports concat pooling mode
+
+`ppo/training.py` and `ppo/eval.py` SHALL read `data.segment_pooling` from config. When `segment_pooling == "concat"`, `obs_dim` SHALL be `instance_dim * segment_size` and `build_segment_obs_from_lp` SHALL receive `pooling_mode="concat"`.
+
+#### Scenario: PPO training with concat pooling
+
+- **WHEN** `data.segment_pooling` is `"concat"` in config
+- **THEN** `train_ppo` SHALL set `obs_dim = instance_dim * segment_size`
+- **AND** `build_segment_obs_from_lp` SHALL be called with `pooling_mode="concat"`
+
 ## REMOVED Requirements
 
 ### Requirement: generate_raw

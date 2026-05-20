@@ -64,6 +64,12 @@ The system SHALL log a warning via `logging.getLogger(__name__)` when `hidden_st
 - **THEN** the pooling mode SHALL be forwarded to `segment_pooling(mode="concat")`
 - **AND** the resulting instance tensor SHALL have shape `[K, segment_size * instance_dim]`
 
+#### Scenario: concat drops incomplete last segment
+
+- **WHEN** `pooling_mode == "concat"` and a segment has fewer than `segment_size` tokens
+- **THEN** the segment SHALL be skipped (dropped) from the output
+- **AND** the output SHALL contain only fully-filled segments
+
 ### Requirement: make_cached_collate_fn exists alongside make_collate_fn
 
 `mil/utils.py` SHALL export `make_cached_collate_fn(segment_cache, instance_dim, train_device)`. This factory SHALL return a collate function that reads pre-computed segment tensors, labels, and temp indices from `segment_cache` (a list of dicts). The returned collate_fn SHALL pad instances to max K within the batch and output the same dict format as `make_collate_fn`.

@@ -88,24 +88,23 @@ def test_segment_pooling_concat():
 
 
 def test_segment_pooling_concat_padding():
+    """concat: segment with < segment_size tokens is dropped; empty → zero vector."""
     dim = 2
     seg_size = 5
     t = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
     spans = [Segment(start=0, end=1, segment_id=0)]
     out = segment_pooling(t, spans, dim, mode="concat", segment_size=seg_size)
-    assert out.shape == (1, seg_size * dim)
-    assert out[0, 0].item() == 1.0
-    assert out[0, 1].item() == 2.0
-    assert torch.all(out[0, 2:] == 0.0)
+    assert out.shape == (1, dim)  # dropped, fallback zero
 
 
 def test_segment_pooling_concat_truncation():
+    """concat: 3 tokens >= segment_size=2, kept as-is (no more zero-padding/truncation)."""
     dim = 2
     seg_size = 2
     t = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
     spans = [Segment(start=0, end=3, segment_id=0)]
     out = segment_pooling(t, spans, dim, mode="concat", segment_size=seg_size)
-    assert out.shape == (1, seg_size * dim)
+    assert out.shape == (1, 6)  # 3 tokens × 2 dims, no truncation to 4
 
 
 def test_segment_pooling_from_build_segments():

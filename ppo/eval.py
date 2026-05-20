@@ -71,7 +71,9 @@ class OnlineTemperatureEvaluator:
         self.segment_size = int(config["data"]["segment_size"])
         self.segment_mode = config["data"].get("segment_mode", "fixed_window")
         self.max_new_tokens = int(config["inference"]["max_new_tokens"])
-        self.obs_dim = int(config["data"]["instance_dim"])
+        instance_dim = int(config["data"]["instance_dim"])
+        self.pooling_mode = config["data"].get("segment_pooling", "mean")
+        self.obs_dim = instance_dim * self.segment_size if self.pooling_mode == "concat" else instance_dim
         self.hidden_dim = int(config["ppo"]["model"]["hidden_dim"])
         self.temp_bins = [float(x) for x in config["data"]["temp_bins"]]
         self.n_actions = len(self.temp_bins)
@@ -185,6 +187,7 @@ class OnlineTemperatureEvaluator:
                         self.segment_size, self.obs_dim,
                         segment_mode=self.segment_mode,
                         include_topk=True,
+                        pooling_mode=self.pooling_mode,
                     )
                     segment_obs[i][v] = obs.tolist()
 

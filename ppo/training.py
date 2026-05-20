@@ -67,11 +67,13 @@ def train_ppo(
     random.seed(seed)
     torch.manual_seed(seed)
 
-    obs_dim = int(cfg["data"]["instance_dim"])
+    instance_dim = int(cfg["data"]["instance_dim"])
+    segment_size = int(cfg["data"]["segment_size"])
+    pooling_mode = cfg["data"].get("segment_pooling", "mean")
+    obs_dim = instance_dim * segment_size if pooling_mode == "concat" else instance_dim
     hidden_dim = int(cfg["mil"]["model"]["hidden_dim"])
     temp_bins = [float(x) for x in cfg["data"]["temp_bins"]]
     n_actions = len(temp_bins)
-    segment_size = int(cfg["data"]["segment_size"])
     segment_mode = cfg["data"].get("segment_mode", "fixed_window")
     max_new_tokens = int(cfg["inference"]["max_new_tokens"])
     top_k_logprobs = int(cfg["inference"]["top_k_logprobs"])
@@ -263,6 +265,7 @@ def train_ppo(
                     segment_size, obs_dim, device=device, extra_parts=extra,
                     segment_mode=segment_mode,
                     include_topk=(not hs_needed),
+                    pooling_mode=pooling_mode,
                 )
                 segment_obs[i][v] = obs.cpu()
 

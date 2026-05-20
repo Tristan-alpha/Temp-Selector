@@ -335,7 +335,7 @@ class VLLMFeatureExporter:
                 lp = torch.cat([c.to(cat_device) for c in lp_chunks], dim=0)
                 logprob_results.append(lp.float())               # [R, top_k+1]
             if return_hidden:
-                hidden_results.append(resp_hs.float())
+                hidden_results.append(resp_hs.float().to(cat_device))
 
         result: Dict[str, List[torch.Tensor]] = {}
         if return_logprobs:

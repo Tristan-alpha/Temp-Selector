@@ -339,8 +339,8 @@ def test_build_segment_obs_concat():
         segment_size=seg_size, obs_dim=obs_dim,
         pooling_mode="concat",
     )
-    # ceil(200 / 64) = 4 segments, each 64*64=4096 dims
-    assert obs.shape == (4, 4096), f"Expected (4, 4096), got {obs.shape}"
+    # 200 tokens: 3 full segments (64+64+64), last 8-tok dropped
+    assert obs.shape == (3, 4096), f"Expected (3, 4096), got {obs.shape}"
 
 
 def test_build_segment_obs_concat_vs_mean_shape():

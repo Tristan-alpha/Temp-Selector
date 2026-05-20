@@ -91,24 +91,24 @@ def segment_pooling(
     token.  An empty input returns a single zero-vector.
     """
     n_tokens = token_tensor.shape[0]
+    dev = token_tensor.device
     out: List[torch.Tensor] = []
     for s in spans:
         st = max(0, min(s.start, n_tokens))
         ed = max(st + 1, min(s.end, n_tokens))
         chunk = token_tensor[st:ed]
         if chunk.shape[0] == 0:
-            out.append(torch.zeros(obs_dim))
+            out.append(torch.zeros(obs_dim, device=dev))
             continue
         if mode == "concat":
+            if chunk.shape[0] < segment_size:
+                continue  # drop incomplete segment
             flat = chunk.reshape(-1)
-            target_len = segment_size * obs_dim
-            if flat.shape[0] < target_len:
-                flat = torch.cat([flat, torch.zeros(target_len - flat.shape[0])])
-            out.append(flat[:target_len])
+            out.append(flat)
         else:  # mean
             out.append(chunk.mean(dim=0))
     if not out:
-        return torch.zeros(1, obs_dim)
+        return torch.zeros(1, obs_dim, device=dev)
     return torch.stack(out)
 
 
