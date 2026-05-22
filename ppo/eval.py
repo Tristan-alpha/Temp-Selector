@@ -71,9 +71,9 @@ class OnlineTemperatureEvaluator:
         self.segment_size = int(config["data"]["segment_size"])
         self.segment_mode = config["data"].get("segment_mode", "fixed_window")
         self.max_new_tokens = int(config["inference"]["max_new_tokens"])
-        instance_dim = int(config["data"]["instance_dim"])
+        self.instance_dim = int(config["data"]["instance_dim"])
         self.pooling_mode = config["data"].get("segment_pooling", "mean")
-        self.obs_dim = instance_dim * self.segment_size if self.pooling_mode == "concat" else instance_dim
+        self.model_obs_dim = self.instance_dim * self.segment_size if self.pooling_mode == "concat" else self.instance_dim
         self.hidden_dim = int(config["ppo"]["model"]["hidden_dim"])
         self.temp_bins = [float(x) for x in config["data"]["temp_bins"]]
         self.n_actions = len(self.temp_bins)
@@ -95,7 +95,7 @@ class OnlineTemperatureEvaluator:
 
         ckpt = torch.load(ppo_ckpt, map_location="cpu", weights_only=False)
         policy_state = ckpt.get("policy_value", ckpt)
-        self.policy = PolicyValueNet(obs_dim=self.obs_dim, n_actions=self.n_actions, hidden=self.hidden_dim)
+        self.policy = PolicyValueNet(obs_dim=self.model_obs_dim, n_actions=self.n_actions, hidden=self.hidden_dim)
         self.policy.load_state_dict(policy_state, strict=False)
         self.policy.eval()
 
@@ -184,7 +184,7 @@ class OnlineTemperatureEvaluator:
                 if f["logprobs"] is not None:
                     obs = build_segment_obs_from_lp(
                         f["logprobs"], f["tokens"], f["text"],
-                        self.segment_size, self.obs_dim,
+                        self.segment_size, self.instance_dim,
                         segment_mode=self.segment_mode,
                         include_topk=True,
                         pooling_mode=self.pooling_mode,

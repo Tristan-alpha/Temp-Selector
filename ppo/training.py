@@ -70,7 +70,7 @@ def train_ppo(
     instance_dim = int(cfg["data"]["instance_dim"])
     segment_size = int(cfg["data"]["segment_size"])
     pooling_mode = cfg["data"].get("segment_pooling", "mean")
-    obs_dim = instance_dim * segment_size if pooling_mode == "concat" else instance_dim
+    model_obs_dim = instance_dim * segment_size if pooling_mode == "concat" else instance_dim
     hidden_dim = int(cfg["mil"]["model"]["hidden_dim"])
     temp_bins = [float(x) for x in cfg["data"]["temp_bins"]]
     n_actions = len(temp_bins)
@@ -124,7 +124,7 @@ def train_ppo(
     device = torch.device(f"cuda:{max(0, n_gpu - 1)}") if n_gpu > 0 else torch.device("cpu")
 
     # ---- PPO policy ----
-    policy = PolicyValueNet(obs_dim=obs_dim, n_actions=n_actions, hidden=policy_hidden_dim).to(device)
+    policy = PolicyValueNet(obs_dim=model_obs_dim, n_actions=n_actions, hidden=policy_hidden_dim).to(device)
 
     # Best-fixed temperature for pi head init
     best_fixed_temp_idx = n_actions // 2
@@ -151,7 +151,7 @@ def train_ppo(
         try:
             mil_ckpt_data = torch.load(mil_ckpt, map_location=device, weights_only=False)
             mil_model = MILModel(
-                input_dim=obs_dim, hidden_dim=hidden_dim,
+                input_dim=model_obs_dim, hidden_dim=hidden_dim,
                 aggregator=cfg["mil"]["model"].get("aggregator", "attention"),
                 use_position=cfg["mil"]["model"].get("use_position", True),
                 use_gru=cfg["mil"]["model"].get("use_gru", True),
@@ -219,7 +219,7 @@ def train_ppo(
                         # only keep the per-chain lists aligned so t=0 is the
                         # first decision.
                         temp = 0.7
-                        ep_obs[i][v].append(torch.zeros(obs_dim))
+                        ep_obs[i][v].append(torch.zeros(model_obs_dim))
                         ep_actions[i][v].append(torch.tensor(0))
                         ep_logprobs[i][v].append(torch.tensor(0.0))
                         ep_values[i][v].append(torch.tensor(0.0))
@@ -262,7 +262,7 @@ def train_ppo(
                 extra = [f["hidden_states"]] if f["hidden_states"] is not None else None
                 obs = build_segment_obs_from_lp(
                     f["logprobs"], f["tokens"], f["text"],
-                    segment_size, obs_dim, device=device, extra_parts=extra,
+                    segment_size, instance_dim, device=device, extra_parts=extra,
                     segment_mode=segment_mode,
                     include_topk=(not hs_needed),
                     pooling_mode=pooling_mode,
