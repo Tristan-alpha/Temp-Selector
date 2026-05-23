@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -82,6 +83,7 @@ class OnlineTemperatureEvaluator:
         self.system_prompt = config["inference"].get("system_prompt", "")
         self.use_math_chat = bool(config["inference"].get("use_math_chat_prompt", True))
         self.feature_mode = config["inference"].get("feature_mode", "topk_logprobs")
+        self.hs_needed = self.feature_mode == "hidden_states"
 
         gpu_mem = float(config.get("inference", {}).get("gpu_memory_utilization", 0.90))
         self.runner = VLLMFeatureExporter(
@@ -98,6 +100,8 @@ class OnlineTemperatureEvaluator:
         self.policy = PolicyValueNet(obs_dim=self.model_obs_dim, n_actions=self.n_actions, hidden=self.hidden_dim)
         self.policy.load_state_dict(policy_state, strict=False)
         self.policy.eval()
+
+        self._timing: Dict[str, float] = {}  # accumulated seconds per phase
 
     def _render_prompt(self, question: str) -> str:
         if not self.use_math_chat:
@@ -129,11 +133,20 @@ class OnlineTemperatureEvaluator:
 
         max_rounds = self.max_new_tokens // self.segment_size
 
+        t_total0 = time.perf_counter()
+        self._timing.setdefault("policy_decision", 0.0)
+        self._timing.setdefault("vllm_generate", 0.0)
+        self._timing.setdefault("feature_postproc", 0.0)
+        self._timing.setdefault("pp_text", 0.0)
+        self._timing.setdefault("pp_eos", 0.0)
+        self._timing.setdefault("pp_build_obs", 0.0)
+        self._timing.setdefault("pp_tolist", 0.0)
         for _seg_idx in range(max_rounds):
             round_prompts: List[str] = []
             round_temps: List[float] = []
             round_map: List[Tuple[int, int]] = []  # (prompt_idx, chain_idx)
 
+            t0 = time.perf_counter()
             for i in range(N):
                 for v in range(V):
                     if not active[i][v]:
@@ -162,35 +175,71 @@ class OnlineTemperatureEvaluator:
             if not round_map:
                 break
 
+            t1 = time.perf_counter()
             feats = self.runner.generate_with_features(
                 round_prompts, round_temps, self.segment_size,
                 top_k=self.top_k_logprobs,
                 return_logprobs=True,
+                return_hidden=self.hs_needed,
             )
+            t2 = time.perf_counter()
 
+            pp_text_r = pp_eos_r = pp_build_r = pp_tolist_r = 0.0
             for j, (i, v) in enumerate(round_map):
                 f = feats[j]
+
+                ta = time.perf_counter()
                 generated[i][v] += f["text"]
 
                 if v == 0:
                     n_segments[i] += 1
+                tb = time.perf_counter()
 
                 if (self.tokenizer.eos_token_id is not None and
                     self.tokenizer.eos_token_id in f["token_ids"]) or \
                    f["finish_reason"] == 'stop' or not f["token_ids"]:
                     active[i][v] = False
+                    pp_text_r += tb - ta
+                    pp_eos_r += time.perf_counter() - tb
                     continue
 
+                tc = time.perf_counter()
                 if f["logprobs"] is not None:
+                    extra = [f["hidden_states"]] if f["hidden_states"] is not None else None
                     obs = build_segment_obs_from_lp(
                         f["logprobs"], f["tokens"], f["text"],
                         self.segment_size, self.instance_dim,
                         segment_mode=self.segment_mode,
-                        include_topk=True,
+                        include_topk=(not self.hs_needed),
+                        extra_parts=extra,
                         pooling_mode=self.pooling_mode,
                     )
+                    td = time.perf_counter()
                     segment_obs[i][v] = obs.tolist()
+                    te = time.perf_counter()
+                    pp_text_r += tb - ta
+                    pp_eos_r += tc - tb
+                    pp_build_r += td - tc
+                    pp_tolist_r += te - td
 
+            t3 = time.perf_counter()
+            n_active = len(round_map)
+            self._timing["policy_decision"] += t1 - t0
+            self._timing["vllm_generate"] += t2 - t1
+            self._timing["feature_postproc"] += t3 - t2
+            self._timing["pp_text"] += pp_text_r
+            self._timing["pp_eos"] += pp_eos_r
+            self._timing["pp_build_obs"] += pp_build_r
+            self._timing["pp_tolist"] += pp_tolist_r
+            pp_other_r = (t3 - t2) - (pp_text_r + pp_eos_r + pp_build_r + pp_tolist_r)
+            print(f"  [timing] round={_seg_idx:3d}  active={n_active:4d}  "
+                  f"decision={t1 - t0:.3f}s  generate={t2 - t1:.2f}s  "
+                  f"postproc={t3 - t2:.1f}s "
+                  f"(text={pp_text_r:.1f}s eos={pp_eos_r:.1f}s "
+                  f"build_obs={pp_build_r:.1f}s tolist={pp_tolist_r:.1f}s "
+                  f"other={pp_other_r:.1f}s)  total={t3 - t0:.1f}s")
+
+        t_total1 = time.perf_counter()
         result = OnlineResult()
         for i in range(N):
             majority_correct = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
@@ -200,7 +249,22 @@ class OnlineTemperatureEvaluator:
             result.temperatures.extend(all_temps[i])
             result.segment_counts.append(n_segments[i])
 
+        t_total2 = time.perf_counter()
         result.accuracy = safe_div(result.n_correct, result.n_total)
+
+        d = self._timing
+        wall = t_total2 - t_total0
+        accounted = (d.get("policy_decision", 0) + d.get("vllm_generate", 0) +
+                     d.get("feature_postproc", 0) + (t_total2 - t_total1))
+        print(f"  [timing] strategy={strategy:12s}  "
+              f"decision={d.get('policy_decision', 0):.1f}s  "
+              f"generate={d.get('vllm_generate', 0):.1f}s  "
+              f"postproc={d.get('feature_postproc', 0):.1f}s  "
+              f"(text={d.get('pp_text', 0):.1f}s eos={d.get('pp_eos', 0):.1f}s "
+              f"build_obs={d.get('pp_build_obs', 0):.1f}s tolist={d.get('pp_tolist', 0):.1f}s)  "
+              f"scoring={t_total2 - t_total1:.1f}s  "
+              f"other={wall - accounted:.1f}s  "
+              f"wall={wall:.1f}s")
         return result
 
     def evaluate(
