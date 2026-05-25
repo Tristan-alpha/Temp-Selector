@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import torch
 
@@ -164,6 +164,115 @@ def build_segment_obs_from_lp(
     return segment_pooling(tok_vecs.to(device) if device is not None else tok_vecs,
                            spans, obs_dim, mode=pooling_mode,
                            segment_size=segment_size)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Batched GPU variant for online eval
+# ═══════════════════════════════════════════════════════════════
+
+def batch_build_segment_obs_from_lp(
+    lp_tensors: List[torch.Tensor],
+    tokens_list: List[List[str]],
+    texts: List[str],
+    segment_size: int,
+    obs_dim: int,
+    device: torch.device,
+    extra_tensors: Optional[List[torch.Tensor]] = None,
+    segment_mode: str = "fixed_window",
+    include_topk: bool = False,
+    pooling_mode: str = "mean",
+) -> List[torch.Tensor]:
+    """GPU-batched version of ``build_segment_obs_from_lp`` for eval.
+
+    Stacks per-chain logprob tensors, runs ``exp`` / ``cat`` / ``truncate`` on
+    ``device``, then pools into per-chain observation vectors.  Falls back to
+    per-chain CPU calls when ``device`` is CPU or only a single chain is given.
+
+    ``lp_tensors``: each ``[n_tok_i, top_k+1]`` — active chains only (EOS
+    chains already filtered by caller).
+
+    ``extra_tensors``: optional hidden states, one per chain (same length as
+    ``lp_tensors``), for ``feature_mode=hidden_states``.
+
+    Returns a list of ``[n_segments_i, obs_dim]`` tensors on CPU.
+    """
+    B = len(lp_tensors)
+    if B == 0:
+        return []
+    if device.type == "cpu" or B == 1:
+        return [
+            build_segment_obs_from_lp(
+                lp_tensors[i], tokens_list[i], texts[i],
+                segment_size, obs_dim, device=device,
+                extra_parts=[extra_tensors[i]] if extra_tensors and extra_tensors[i] is not None else None,
+                segment_mode=segment_mode, include_topk=include_topk,
+                pooling_mode=pooling_mode,
+            )
+            for i in range(B)
+        ]
+
+    # ---- Pad to uniform n_tok, stack on GPU ----
+    n_toks = [t.shape[0] for t in lp_tensors]
+    max_tok = max(n_toks)
+    need_pad = any(n != max_tok for n in n_toks)
+
+    if not need_pad:
+        stacked = torch.stack([t.to(device, non_blocking=True) for t in lp_tensors])
+    else:
+        padded = torch.zeros(B, max_tok, lp_tensors[0].shape[1], device=device)
+        for i, t in enumerate(lp_tensors):
+            padded[i, :n_toks[i]] = t.to(device)
+        stacked = padded
+
+    # ---- Token-level math on GPU ----
+    lp = stacked[:, :, 1:].float()                                  # [B, T, top_k]
+    sampled = stacked[:, :, 0:1].float()                            # [B, T, 1]
+    entropy = -(torch.exp(lp) * lp).sum(dim=2, keepdim=True)       # [B, T, 1]
+
+    if include_topk:
+        parts = [sampled, entropy, lp]                              # [B, T, 2+top_k]
+    else:
+        parts = [torch.cat([sampled, entropy], dim=2)]              # [B, T, 2]
+
+    if extra_tensors is not None:
+        if need_pad:
+            extra_padded = torch.zeros(B, max_tok, extra_tensors[0].shape[1], device=device)
+            for i, e in enumerate(extra_tensors):
+                extra_padded[i, :n_toks[i]] = e.to(device)
+            parts.append(extra_padded)
+        else:
+            parts.append(torch.stack([e.to(device, non_blocking=True) for e in extra_tensors]))
+
+    tok_vecs = torch.cat(parts, dim=2)                               # [B, T, D']
+    D = tok_vecs.shape[2]
+    if D < obs_dim:
+        tok_vecs = torch.cat(
+            [tok_vecs, torch.zeros(B, max_tok, obs_dim - D, device=device)], dim=2)
+    elif D > obs_dim:
+        tok_vecs = tok_vecs[:, :, :obs_dim]                          # [B, T, obs_dim]
+
+    # ---- Pooling ----
+    if segment_mode == "fixed_window" and pooling_mode == "mean":
+        # All active chains have the same span: [Segment(0, max_tok)].
+        # Mean-pool over the token dim on GPU.
+        obs_gpu = tok_vecs.mean(dim=1)                                # [B, obs_dim]
+        return [obs_gpu[i:i+1].cpu() for i in range(B)]              # each [1, obs_dim]
+
+    if segment_mode == "fixed_window" and pooling_mode == "concat":
+        obs_gpu = tok_vecs.reshape(B, -1)                             # [B, T*obs_dim]
+        return [obs_gpu[i:i+1].cpu() for i in range(B)]              # each [1, T*obs_dim]
+
+    # step / punctuation mode: pool per-chain on CPU (spans differ)
+    tok_cpu = tok_vecs.cpu()
+    results: List[torch.Tensor] = []
+    for i in range(B):
+        n = n_toks[i]
+        spans = build_segments(tokens=tokens_list[i], mode=segment_mode,
+                               segment_size=segment_size, response=texts[i])
+        obs = segment_pooling(tok_cpu[i, :n], spans, obs_dim,
+                              mode=pooling_mode, segment_size=segment_size)
+        results.append(obs)
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════

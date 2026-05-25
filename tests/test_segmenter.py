@@ -1,9 +1,10 @@
-"""Tests for segment_pooling and step_segment.  CPU-only."""
+"""Tests for segment_pooling, step_segment, and batch_build_segment_obs_from_lp.  CPU-only."""
 
 import torch
 
 from features.schema import Segment
 from features.segmenter import build_segments, segment_pooling
+from features.segmenter import batch_build_segment_obs_from_lp, build_segment_obs_from_lp
 
 OBS_DIM = 64
 
@@ -125,3 +126,88 @@ def test_step_segment_basic():
     assert len(spans) >= 2, f"Expected at least 2 segments, got {len(spans)}"
     assert spans[0].start == 0
     assert spans[-1].end == len(tokens)
+
+
+# ── batch_build_segment_obs_from_lp tests ──
+
+def _make_lp_tensor(n_tok, top_k=8):
+    """Synthetic logprob tensor: [n_tok, top_k+1], col 0 = sampled."""
+    lp = torch.randn(n_tok, top_k + 1, dtype=torch.float32) * 0.1
+    lp[:, 0] = -0.5  # sampled logprob
+    return lp
+
+
+def test_batch_build_obs_matches_per_chain_mean():
+    """CPU path: batch output matches per-chain for fixed_window+mean."""
+    seg_size = 4
+    obs_dim = 10
+    N = 3
+    lp_tensors = [_make_lp_tensor(seg_size, top_k=6) for _ in range(N)]
+    tokens_list = [["a"] * seg_size for _ in range(N)]
+    texts = ["a a a a"] * N
+    device = torch.device("cpu")
+
+    batch_out = batch_build_segment_obs_from_lp(
+        lp_tensors, tokens_list, texts,
+        seg_size, obs_dim, device,
+        include_topk=True, pooling_mode="mean",
+    )
+    per_chain = [
+        build_segment_obs_from_lp(
+            lp_tensors[i], tokens_list[i], texts[i],
+            seg_size, obs_dim,
+            include_topk=True, pooling_mode="mean",
+        )
+        for i in range(N)
+    ]
+    assert len(batch_out) == N
+    for bo, pc in zip(batch_out, per_chain):
+        assert torch.allclose(bo, pc, atol=1e-5), f"batch vs per-chain mismatch"
+
+
+def test_batch_build_obs_matches_per_chain_concat():
+    """CPU path: batch output matches per-chain for fixed_window+concat."""
+    seg_size = 3
+    obs_dim = 8
+    N = 2
+    lp_tensors = [_make_lp_tensor(seg_size, top_k=6) for _ in range(N)]
+    tokens_list = [["x"] * seg_size for _ in range(N)]
+    texts = ["x x x"] * N
+    device = torch.device("cpu")
+
+    batch_out = batch_build_segment_obs_from_lp(
+        lp_tensors, tokens_list, texts,
+        seg_size, obs_dim, device,
+        include_topk=False, pooling_mode="concat",
+    )
+    per_chain = [
+        build_segment_obs_from_lp(
+            lp_tensors[i], tokens_list[i], texts[i],
+            seg_size, obs_dim,
+            include_topk=False, pooling_mode="concat",
+        )
+        for i in range(N)
+    ]
+    assert len(batch_out) == N
+    for bo, pc in zip(batch_out, per_chain):
+        assert torch.allclose(bo, pc, atol=1e-5)
+
+
+def test_batch_build_obs_single_chain():
+    """Single chain falls through to per-chain path."""
+    device = torch.device("cpu")
+    lp = _make_lp_tensor(4, top_k=4)
+    out = batch_build_segment_obs_from_lp(
+        [lp], [["a"] * 4], ["a a a a"], 4, 8, device,
+        include_topk=True,
+    )
+    assert len(out) == 1
+    assert out[0].shape == (1, 8)
+
+
+def test_batch_build_obs_empty():
+    """Empty input returns empty list."""
+    out = batch_build_segment_obs_from_lp(
+        [], [], [], 4, 8, torch.device("cpu"),
+    )
+    assert out == []

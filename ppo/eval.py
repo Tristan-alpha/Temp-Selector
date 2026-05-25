@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import yaml
 
-from features.segmenter import build_segment_obs_from_lp
+from features.segmenter import build_segment_obs_from_lp, batch_build_segment_obs_from_lp
 from features.dataset_eval import load_temperature_labels
 from ppo.model import PolicyValueNet
 from inference.vllm_runner import VLLMFeatureExporter
@@ -94,6 +94,9 @@ class OnlineTemperatureEvaluator:
             reserve_training_gpu=True,
         )
         self.tokenizer = self.runner.tokenizer
+
+        n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        self.device = torch.device(f"cuda:{max(0, n_gpu - 1)}") if n_gpu > 0 else torch.device("cpu")
 
         ckpt = torch.load(ppo_ckpt, map_location="cpu", weights_only=False)
         policy_state = ckpt.get("policy_value", ckpt)
@@ -184,7 +187,16 @@ class OnlineTemperatureEvaluator:
             )
             t2 = time.perf_counter()
 
-            pp_text_r = pp_eos_r = pp_build_r = pp_tolist_r = 0.0
+            # First pass: text concat, EOS detection, collect logprobs from
+            # chains that will continue to the next round.
+            pp_text_r = pp_eos_r = 0.0
+            pp_build_r = pp_tolist_r = 0.0
+            batch_lp: List[torch.Tensor] = []
+            batch_tokens: List[List[str]] = []
+            batch_texts: List[str] = []
+            batch_extra: Optional[List[torch.Tensor]] = [] if self.hs_needed else None
+            batch_idx: List[Tuple[int, int]] = []  # (i, v) for segment_obs assignment
+
             for j, (i, v) in enumerate(round_map):
                 f = feats[j]
 
@@ -205,22 +217,35 @@ class OnlineTemperatureEvaluator:
 
                 tc = time.perf_counter()
                 if f["logprobs"] is not None:
-                    extra = [f["hidden_states"]] if f["hidden_states"] is not None else None
-                    obs = build_segment_obs_from_lp(
-                        f["logprobs"], f["tokens"], f["text"],
-                        self.segment_size, self.instance_dim,
-                        segment_mode=self.segment_mode,
-                        include_topk=(not self.hs_needed),
-                        extra_parts=extra,
-                        pooling_mode=self.pooling_mode,
-                    )
-                    td = time.perf_counter()
+                    batch_lp.append(f["logprobs"])
+                    batch_tokens.append(f["tokens"])
+                    batch_texts.append(f["text"])
+                    if self.hs_needed:
+                        batch_extra.append(f["hidden_states"] if f["hidden_states"] is not None else torch.zeros(f["logprobs"].shape[0], self.instance_dim))
+                    batch_idx.append((i, v))
+                pp_text_r += tb - ta
+                pp_eos_r += tc - tb
+
+            # Batch GPU call
+            if batch_lp:
+                tb0 = time.perf_counter()
+                obs_list = batch_build_segment_obs_from_lp(
+                    batch_lp, batch_tokens, batch_texts,
+                    self.segment_size, self.instance_dim, self.device,
+                    extra_tensors=batch_extra,
+                    segment_mode=self.segment_mode,
+                    include_topk=(not self.hs_needed),
+                    pooling_mode=self.pooling_mode,
+                )
+                tb1 = time.perf_counter()
+                pp_build_r = tb1 - tb0
+
+                # Distribute results
+                tt0 = time.perf_counter()
+                for (i, v), obs in zip(batch_idx, obs_list):
                     segment_obs[i][v] = obs.tolist()
-                    te = time.perf_counter()
-                    pp_text_r += tb - ta
-                    pp_eos_r += tc - tb
-                    pp_build_r += td - tc
-                    pp_tolist_r += te - td
+                tt1 = time.perf_counter()
+                pp_tolist_r = tt1 - tt0
 
             t3 = time.perf_counter()
             n_active = len(round_map)
