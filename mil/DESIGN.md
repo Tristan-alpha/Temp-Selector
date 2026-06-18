@@ -1,5 +1,13 @@
 # MIL Module Design
 
+## Causal Prefix Value Model
+
+The Full proposal replaces BiGRU instance pseudo-labeling with a mask-aware
+unidirectional GRU estimating `P(final answer correct | generated prefix)`.
+Training combines continuation binomial likelihood, terminal response BCE, and
+same-problem paired ranking. Packed batch inference and streaming `step` share
+the same parameters and positional encoding.
+
 ## Problem formulation
 
 Given a math reasoning chain split into segments, MIL answers two questions:

@@ -27,6 +27,18 @@ class PolicyValueNet(nn.Module):
         return self.pi(h), self.v(h).squeeze(-1)
 
 
+class PrefixPolicyValueNet(nn.Module):
+    """Policy and critic heads over a frozen prefix-value hidden state."""
+
+    def __init__(self, hidden_dim: int, n_actions: int):
+        super().__init__()
+        self.pi = nn.Linear(hidden_dim, n_actions)
+        self.v = nn.Linear(hidden_dim, 1)
+
+    def forward(self, prefix_hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.pi(prefix_hidden), self.v(prefix_hidden).squeeze(-1)
+
+
 def sample_action(logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     dist = torch.distributions.Categorical(logits=logits)
     a = dist.sample()
@@ -68,7 +80,7 @@ def load_mil_encoder_for_warmstart(mil_ckpt_path: str, device: torch.device) -> 
     """
     try:
         ckpt = torch.load(mil_ckpt_path, map_location=device, weights_only=False)
-    except FileNotFoundError:
+    except OSError:
         return None
     mil_state = ckpt.get("mil", {})
     encoder_mapping = {

@@ -147,7 +147,7 @@ def build_dataset(
             all_prompts.append(rp)
             all_params.append(SamplingParams(n=num_votes, temperature=temp,
                                               max_tokens=max_new_tokens,
-                                              top_p=1.0, top_k=0, seed=gen_seed))
+                                              top_p=1.0, top_k=-1, seed=gen_seed))
 
     logger.info("multi_temp start n_prompts=%d n_temps=%d total_requests=%d",
                  total_rows, n_temps, len(all_prompts))

@@ -46,6 +46,7 @@ def load_test_prompts(dataset_path: str) -> List[Dict[str, Any]]:
                 continue
             seen.add(prefix)
             prompts.append({
+                "problem_id": prefix,
                 "question": row.get("prompt", ""),
                 "answer": row.get("metadata", {}).get("gold_answer", ""),
             })
@@ -59,6 +60,11 @@ class OnlineResult:
     n_total: int = 0
     temperatures: List[float] = field(default_factory=list)
     segment_counts: List[int] = field(default_factory=list)
+    prompt_correct: List[int] = field(default_factory=list)
+    individual_correct: List[List[int]] = field(default_factory=list)
+    token_counts: List[List[int]] = field(default_factory=list)
+    vote_segment_counts: List[List[int]] = field(default_factory=list)
+    wall_seconds: float = 0.0
 
 
 class OnlineTemperatureEvaluator:
@@ -118,7 +124,9 @@ class OnlineTemperatureEvaluator:
         strategy: str,
         best_fixed_temp: float,
         rng: random.Random,
+        generation_seed: int,
     ) -> OnlineResult:
+        self._timing = {}
         V = self.num_votes
         N = len(prompts_data)
         rendered = [self._render_prompt(
@@ -131,8 +139,10 @@ class OnlineTemperatureEvaluator:
         segment_obs: List[List[Optional[List[float]]]] = [[None] * V for _ in range(N)]
         all_temps: List[List[float]] = [[] for _ in range(N)]
         n_segments: List[int] = [0] * N
+        n_segments_votes: List[List[int]] = [[0] * V for _ in range(N)]
+        n_tokens: List[List[int]] = [[0] * V for _ in range(N)]
 
-        from utils.answer_verifier import self_consistency_correct
+        from utils.answer_verifier import self_consistency_correct, verify_answer
 
         max_rounds = self.max_new_tokens // self.segment_size
 
@@ -184,6 +194,10 @@ class OnlineTemperatureEvaluator:
                 top_k=self.top_k_logprobs,
                 return_logprobs=True,
                 return_hidden=self.hs_needed,
+                seeds=[
+                    generation_seed + _seg_idx * N * V + i * V + v
+                    for i, v in round_map
+                ],
             )
             t2 = time.perf_counter()
 
@@ -202,6 +216,8 @@ class OnlineTemperatureEvaluator:
 
                 ta = time.perf_counter()
                 generated[i][v] += f["text"]
+                n_tokens[i][v] += len(f["token_ids"])
+                n_segments_votes[i][v] += 1
 
                 if v == 0:
                     n_segments[i] += 1
@@ -268,6 +284,12 @@ class OnlineTemperatureEvaluator:
         result = OnlineResult()
         for i in range(N):
             majority_correct = 1 if self_consistency_correct(generated[i], gold_answers[i]) else 0
+            result.prompt_correct.append(majority_correct)
+            result.individual_correct.append([
+                int(verify_answer(response, gold_answers[i])) for response in generated[i]
+            ])
+            result.token_counts.append(n_tokens[i])
+            result.vote_segment_counts.append(n_segments_votes[i])
             result.n_total += 1
             if majority_correct:
                 result.n_correct += 1
@@ -279,6 +301,7 @@ class OnlineTemperatureEvaluator:
 
         d = self._timing
         wall = t_total2 - t_total0
+        result.wall_seconds = wall
         accounted = (d.get("policy_decision", 0) + d.get("vllm_generate", 0) +
                      d.get("feature_postproc", 0) + (t_total2 - t_total1))
         print(f"  [timing] strategy={strategy:12s}  "
@@ -297,6 +320,7 @@ class OnlineTemperatureEvaluator:
         data_path: str,
         prompts_data: List[Dict[str, Any]],
         seed: int = 42,
+        ppo_only: bool = False,
     ) -> Dict[str, Any]:
         if not prompts_data:
             return {"error": "No prompts found."}
@@ -324,11 +348,13 @@ class OnlineTemperatureEvaluator:
             ("best-fixed", f"Best fixed temperature (T={best_fixed_temp:.1f})"),
             ("random", "Random temperature"),
         ]
+        if ppo_only:
+            strategies = strategies[:1]
 
         for strategy_key, strategy_label in strategies:
             strat_rng = random.Random(seed)
             result = self._evaluate_strategy_batch(
-                prompts_data, strategy_key, best_fixed_temp, strat_rng,
+                prompts_data, strategy_key, best_fixed_temp, strat_rng, seed,
             )
 
             import numpy as np
@@ -343,13 +369,39 @@ class OnlineTemperatureEvaluator:
                 "std_temperature": float(temp_arr.std()) if len(temp_arr) > 0 else 0.0,
                 "mean_segments": float(np.mean(result.segment_counts)) if result.segment_counts else 0.0,
                 "total_segments": sum(result.segment_counts),
+                "mean_segments_per_vote": safe_div(
+                    sum(sum(row) for row in result.vote_segment_counts),
+                    len(result.vote_segment_counts) * self.num_votes,
+                ),
+                "total_vote_segments": sum(sum(row) for row in result.vote_segment_counts),
+                "individual_accuracy": safe_div(
+                    sum(sum(row) for row in result.individual_correct),
+                    len(result.individual_correct) * self.num_votes,
+                ),
+                "total_tokens": sum(sum(row) for row in result.token_counts),
+                "mean_tokens_per_vote": safe_div(
+                    sum(sum(row) for row in result.token_counts),
+                    len(result.token_counts) * self.num_votes,
+                ),
+                "wall_seconds": result.wall_seconds,
+                "predictions": [
+                    {
+                        "problem_id": prompts_data[i].get("problem_id", str(i)),
+                        "majority_correct": result.prompt_correct[i],
+                        "individual_correct": result.individual_correct[i],
+                        "token_counts": result.token_counts[i],
+                        "segment_counts": result.vote_segment_counts[i],
+                    }
+                    for i in range(len(result.prompt_correct))
+                ],
             }
 
         ppo_acc = results["ppo"]["accuracy"]
-        best_acc = results["best-fixed"]["accuracy"]
-        rand_acc = results["random"]["accuracy"]
-        results["improvement_over_random"] = ppo_acc - rand_acc
-        results["improvement_over_best_fixed"] = ppo_acc - best_acc
+        if not ppo_only:
+            best_acc = results["best-fixed"]["accuracy"]
+            rand_acc = results["random"]["accuracy"]
+            results["improvement_over_random"] = ppo_acc - rand_acc
+            results["improvement_over_best_fixed"] = ppo_acc - best_acc
         results["_note"] = (
             "Online evaluation: the PPO policy truly controls generation temperature "
             "segment-by-segment via vLLM with APC."
@@ -370,6 +422,7 @@ def main() -> None:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--output", default=None, help="Optional path to save metrics JSON")
+    parser.add_argument("--ppo-only", action="store_true", help="Evaluate only the learned PPO policy")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -397,7 +450,10 @@ def main() -> None:
         parallel_size=args.parallel_size,
     )
     logger.info("Evaluator ready.  Running online evaluation ...")
-    results = evaluator.evaluate(data_path=test_data_path, prompts_data=prompts_data, seed=args.seed)
+    results = evaluator.evaluate(
+        data_path=test_data_path, prompts_data=prompts_data,
+        seed=args.seed, ppo_only=args.ppo_only,
+    )
 
     logger.info("online_results=%s", json.dumps(results, indent=2, default=str))
 
@@ -423,8 +479,9 @@ def main() -> None:
             print(f"    mean_temp={r['mean_temperature']:.2f} ± {r['std_temperature']:.2f}")
             print(f"    avg_segments={r['mean_segments']:.1f}  total_segments={r['total_segments']}")
 
-    print(f"\n  Improvement over random:     {results['improvement_over_random']:+.4f}")
-    print(f"  Improvement over best fixed:  {results['improvement_over_best_fixed']:+.4f}")
+    if "improvement_over_random" in results:
+        print(f"\n  Improvement over random:     {results['improvement_over_random']:+.4f}")
+        print(f"  Improvement over best fixed:  {results['improvement_over_best_fixed']:+.4f}")
     print("\n  " + results["_note"])
     print("=" * 70 + "\n")
 

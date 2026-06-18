@@ -52,12 +52,20 @@ class VLLMFeatureExporter:
     def __init__(self, model_name_or_path: str, max_new_tokens: int = 256,
                  parallel_size: int | None = None,
                  gpu_memory_utilization: float = 0.90,
-                 reserve_training_gpu: bool = False):
+                 reserve_training_gpu: bool = False,
+                 max_batch_size: int | None = None,
+                 enforce_eager: bool = False,
+                 enable_prefix_caching: bool | None = None):
         self.model_name_or_path = model_name_or_path
         self.max_new_tokens = max_new_tokens
         self.parallel_size = parallel_size if isinstance(parallel_size, int) else None
         self.gpu_memory_utilization = gpu_memory_utilization
         self.reserve_training_gpu = reserve_training_gpu
+        self.max_batch_size = (
+            max_batch_size if isinstance(max_batch_size, int) and max_batch_size > 0 else None
+        )
+        self.enforce_eager = enforce_eager
+        self.enable_prefix_caching = enable_prefix_caching
         self._llm = None
         self._tokenizer = None
         self._hs_tmpdir: Optional[str] = None  # for hidden state extraction
@@ -67,15 +75,42 @@ class VLLMFeatureExporter:
         if self._hs_tmpdir and os.path.isdir(self._hs_tmpdir):
             shutil.rmtree(self._hs_tmpdir, ignore_errors=True)
 
+    def reset_prefix_cache(self, reset_connector: bool = True) -> bool:
+        """Clear vLLM prefix-cache state between independent rollout batches."""
+        if self._llm is None:
+            return False
+        engine = getattr(self._llm, "llm_engine", None)
+        reset = getattr(engine, "reset_prefix_cache", None)
+        if not callable(reset):
+            return False
+        try:
+            return bool(reset(
+                reset_running_requests=False,
+                reset_connector=reset_connector,
+            ))
+        except TypeError:
+            return bool(reset())
+        except Exception:
+            logger.exception("failed to reset vLLM prefix cache")
+            return False
+
     def _resolve_parallel_size(self) -> int:
         n_gpus = torch.cuda.device_count()
         if n_gpus == 0:
             raise RuntimeError("No GPUs available for vLLM")
 
-        tp = self.parallel_size if self.parallel_size is not None else n_gpus
+        if self.parallel_size is not None:
+            tp = self.parallel_size
+        else:
+            tp = n_gpus
+            if self.reserve_training_gpu:
+                tp -= 1
 
-        if self.reserve_training_gpu:
-            tp -= 1
+        if self.reserve_training_gpu and self.parallel_size is not None and tp >= n_gpus:
+            raise RuntimeError(
+                f"parallel_size={tp} leaves no GPU for training reservation "
+                f"(total={n_gpus}, reserve_training_gpu=True)"
+            )
 
         if tp <= 0:
             raise RuntimeError(
@@ -99,6 +134,49 @@ class VLLMFeatureExporter:
         return_logprobs: bool = False,
         return_hidden: bool = False,
         device: torch.device | None = None,
+        seeds: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        if len(prompts) != len(temperatures):
+            raise ValueError("prompts and temperatures must match length")
+        if seeds is not None and len(seeds) != len(prompts):
+            raise ValueError("seeds must match prompts length")
+
+        max_batch = self.max_batch_size
+        if max_batch is not None and len(prompts) > max_batch:
+            logger.info(
+                "generate_with_features micro_batching total=%d max_batch_size=%d",
+                len(prompts), max_batch,
+            )
+            results: List[Dict[str, Any]] = []
+            for start in range(0, len(prompts), max_batch):
+                end = min(start + max_batch, len(prompts))
+                results.extend(self._generate_with_features_once(
+                    prompts[start:end],
+                    temperatures[start:end],
+                    segment_size,
+                    top_k=top_k,
+                    return_logprobs=return_logprobs,
+                    return_hidden=return_hidden,
+                    device=device,
+                    seeds=None if seeds is None else seeds[start:end],
+                ))
+            return results
+        return self._generate_with_features_once(
+            prompts, temperatures, segment_size,
+            top_k=top_k, return_logprobs=return_logprobs,
+            return_hidden=return_hidden, device=device, seeds=seeds,
+        )
+
+    def _generate_with_features_once(
+        self,
+        prompts: List[str],
+        temperatures: List[float],
+        segment_size: int,
+        top_k: int = 4096,
+        return_logprobs: bool = False,
+        return_hidden: bool = False,
+        device: torch.device | None = None,
+        seeds: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
         """Generate ``segment_size`` tokens per prompt and return per-token features.
 
@@ -114,9 +192,10 @@ class VLLMFeatureExporter:
         from vllm import SamplingParams
 
         # ── Pass 1: generate ──
-        params = [SamplingParams(temperature=t, max_tokens=segment_size,
-                                  top_p=1.0, top_k=0)
-                  for t in temperatures]
+        params = [SamplingParams(
+            temperature=t, max_tokens=segment_size, top_p=1.0, top_k=-1,
+            seed=None if seeds is None else seeds[i],
+        ) for i, t in enumerate(temperatures)]
         outputs = self._llm.generate(prompts, params, use_tqdm=False)
 
         # Collect per-sample metadata for Pass 2
@@ -178,6 +257,11 @@ class VLLMFeatureExporter:
     def _lazy_init(self) -> None:
         if self._llm is not None:
             return
+        # vLLM 0.18 requires this for apply_model callables. The callable used
+        # here is defined locally and only receives tensors prepared by this
+        # process.
+        os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         try:
             from vllm import LLM
         except ImportError as exc:
@@ -198,6 +282,7 @@ class VLLMFeatureExporter:
             tensor_parallel_size=tp_size,
             max_model_len=max_model_len,
             gpu_memory_utilization=self.gpu_memory_utilization,
+            enforce_eager=self.enforce_eager,
             speculative_config={
                 "method": "extract_hidden_states",
                 "num_speculative_tokens": 1,
@@ -215,6 +300,8 @@ class VLLMFeatureExporter:
                 },
             },
         )
+        if self.enable_prefix_caching is not None:
+            llm_kwargs["enable_prefix_caching"] = self.enable_prefix_caching
 
         self._llm = LLM(**llm_kwargs)
         self._tokenizer = self._llm.get_tokenizer()
@@ -266,6 +353,56 @@ class VLLMFeatureExporter:
         return_hidden: bool = False,
         device: torch.device | None = None,
     ) -> Dict[str, List[torch.Tensor]]:
+        if len(full_ids) != len(prompt_lens):
+            raise ValueError("full_ids and prompt_lens must match length")
+        if temperatures is not None and len(temperatures) != len(full_ids):
+            raise ValueError("temperatures must match full_ids length")
+
+        max_batch = self.max_batch_size
+        if max_batch is not None and len(full_ids) > max_batch:
+            logger.info(
+                "extract_from_ids micro_batching total=%d max_batch_size=%d",
+                len(full_ids), max_batch,
+            )
+            logprob_results: List[torch.Tensor] = []
+            hidden_results: List[torch.Tensor] = []
+            for start in range(0, len(full_ids), max_batch):
+                end = min(start + max_batch, len(full_ids))
+                extracted = self._extract_from_ids_once(
+                    full_ids[start:end],
+                    prompt_lens[start:end],
+                    None if temperatures is None else temperatures[start:end],
+                    top_k=top_k,
+                    return_logprobs=return_logprobs,
+                    return_hidden=return_hidden,
+                    device=device,
+                )
+                if return_logprobs:
+                    logprob_results.extend(extracted.get("logprobs", []))
+                if return_hidden:
+                    hidden_results.extend(extracted.get("hidden", []))
+            result: Dict[str, List[torch.Tensor]] = {}
+            if return_logprobs:
+                result["logprobs"] = logprob_results
+            if return_hidden:
+                result["hidden"] = hidden_results
+            return result
+        return self._extract_from_ids_once(
+            full_ids, prompt_lens, temperatures,
+            top_k=top_k, return_logprobs=return_logprobs,
+            return_hidden=return_hidden, device=device,
+        )
+
+    def _extract_from_ids_once(
+        self,
+        full_ids: List[List[int]],
+        prompt_lens: List[int],
+        temperatures: Optional[List[float]] = None,
+        top_k: int = 4096,
+        return_logprobs: bool = False,
+        return_hidden: bool = False,
+        device: torch.device | None = None,
+    ) -> Dict[str, List[torch.Tensor]]:
         """Return per-response logprob and/or hidden tensors from pre-tokenized IDs.
 
         Uses a single ``llm.generate()`` call to get hidden states, then
@@ -277,14 +414,15 @@ class VLLMFeatureExporter:
         from safetensors import safe_open
 
         if temperatures is not None:
-            params = [SamplingParams(max_tokens=1, top_p=1.0, top_k=0, temperature=t)
+            params = [SamplingParams(max_tokens=1, top_p=1.0, top_k=-1, temperature=t)
                       for t in temperatures]
         else:
-            params = [SamplingParams(max_tokens=1, top_p=1.0, top_k=0)] * len(full_ids)
+            params = [SamplingParams(max_tokens=1, top_p=1.0, top_k=-1)] * len(full_ids)
         outputs = self._llm.generate(full_ids, params, use_tqdm=False)
 
         logprob_results: List[torch.Tensor] = []
         hidden_results: List[torch.Tensor] = []
+        cat_device = device if device is not None else torch.device("cpu")
         for i, (out, p_len) in enumerate(zip(outputs, prompt_lens)):
             hs_path = out.kv_transfer_params.get("hidden_states_path")
             if hs_path is None:
@@ -331,7 +469,6 @@ class VLLMFeatureExporter:
                     )[0]
                     lp_chunks.append(raw)
 
-                cat_device = device if device is not None else torch.device("cpu")
                 lp = torch.cat([c.to(cat_device) for c in lp_chunks], dim=0)
                 logprob_results.append(lp.float())               # [R, top_k+1]
             if return_hidden:

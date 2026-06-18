@@ -1,5 +1,12 @@
 # PPO Module Design
 
+## Prefix-potential PPO
+
+The Full path keeps one frozen Prefix Value GRU state per vote. Policy and
+critic heads consume its 1024-dimensional hidden state. Non-terminal rewards
+use `lambda * (gamma * V_next - V_current)`; terminal transitions use
+`majority_reward - lambda * V_current`. EOS segments update value before close.
+
 ## Why online PPO
 
 Offline RL cannot learn causal policies — pre-collected data has no counterfactuals. Online PPO closes the loop:

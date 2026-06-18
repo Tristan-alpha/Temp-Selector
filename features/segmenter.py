@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
 import torch
 
 from features.schema import Segment, clamp_segment
+
+
+@dataclass
+class MaskedSegmentFeatures:
+    """Fixed-width concat features plus the per-token validity mask."""
+
+    features: torch.Tensor    # [K, segment_size * token_dim]
+    token_mask: torch.Tensor  # [K, segment_size]
+
+    def to(self, device: torch.device | str) -> "MaskedSegmentFeatures":
+        return MaskedSegmentFeatures(
+            features=self.features.to(device),
+            token_mask=self.token_mask.to(device),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -164,6 +179,106 @@ def build_segment_obs_from_lp(
     return segment_pooling(tok_vecs.to(device) if device is not None else tok_vecs,
                            spans, obs_dim, mode=pooling_mode,
                            segment_size=segment_size)
+
+
+def build_masked_concat_segment_obs_from_lp(
+    lp_tensor: torch.Tensor,
+    tokens: List[str],
+    text: str,
+    segment_size: int = 64,
+    token_dim: int = 64,
+    device: torch.device | None = None,
+    segment_mode: str = "fixed_window",
+) -> MaskedSegmentFeatures:
+    """Build mask-aware fixed-width concat features for the prefix value path.
+
+    Each response segment is represented by exactly ``segment_size`` token
+    slots.  Incomplete final segments are zero-padded and retained.  The
+    returned token mask is the source of truth for distinguishing real token
+    features from padding.
+    """
+    if segment_size <= 0 or token_dim <= 0:
+        raise ValueError("segment_size and token_dim must be positive")
+
+    target_device = device if device is not None else lp_tensor.device
+    n_tok = int(lp_tensor.shape[0])
+    if n_tok == 0:
+        return MaskedSegmentFeatures(
+            features=torch.zeros(1, segment_size * token_dim, device=target_device),
+            token_mask=torch.zeros(1, segment_size, device=target_device),
+        )
+
+    lp = lp_tensor[:, 1:].float()
+    sampled = lp_tensor[:, 0:1].float()
+    entropy = -(torch.exp(lp) * lp).sum(dim=1, keepdim=True)
+    tok_vecs = torch.cat([sampled, entropy, lp], dim=1)
+    if tok_vecs.shape[1] < token_dim:
+        tok_vecs = torch.cat(
+            [tok_vecs, tok_vecs.new_zeros(n_tok, token_dim - tok_vecs.shape[1])],
+            dim=1,
+        )
+    else:
+        tok_vecs = tok_vecs[:, :token_dim]
+    tok_vecs = tok_vecs.to(target_device)
+
+    spans = build_segments(
+        tokens=tokens,
+        mode=segment_mode,
+        segment_size=segment_size,
+        response=text,
+    )
+    if not spans:
+        spans = [Segment(segment_id=0, start=0, end=n_tok)]
+
+    feature_rows: List[torch.Tensor] = []
+    mask_rows: List[torch.Tensor] = []
+    for span in spans:
+        start = max(0, min(span.start, n_tok))
+        end = max(start, min(span.end, n_tok))
+        chunk = tok_vecs[start:end][:segment_size]
+        valid = int(chunk.shape[0])
+        padded = tok_vecs.new_zeros(segment_size, token_dim)
+        mask = tok_vecs.new_zeros(segment_size)
+        if valid:
+            padded[:valid] = chunk
+            mask[:valid] = 1.0
+        feature_rows.append(padded.reshape(-1))
+        mask_rows.append(mask)
+
+    return MaskedSegmentFeatures(
+        features=torch.stack(feature_rows),
+        token_mask=torch.stack(mask_rows),
+    )
+
+
+def batch_build_masked_concat_segment_obs_from_lp(
+    lp_tensors: List[torch.Tensor],
+    tokens_list: List[List[str]],
+    texts: List[str],
+    segment_size: int,
+    token_dim: int,
+    device: torch.device,
+    segment_mode: str = "fixed_window",
+) -> List[MaskedSegmentFeatures]:
+    """Batched dispatcher for the mask-aware concat representation.
+
+    The per-chain implementation is intentionally shared with offline feature
+    extraction so online and offline semantics cannot diverge.
+    """
+    if not (len(lp_tensors) == len(tokens_list) == len(texts)):
+        raise ValueError("lp_tensors, tokens_list, and texts must have equal length")
+    return [
+        build_masked_concat_segment_obs_from_lp(
+            lp_tensor=lp,
+            tokens=tokens,
+            text=text,
+            segment_size=segment_size,
+            token_dim=token_dim,
+            device=device,
+            segment_mode=segment_mode,
+        )
+        for lp, tokens, text in zip(lp_tensors, tokens_list, texts)
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════

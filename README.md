@@ -68,6 +68,22 @@ CONFIG=configs/training/arch_mlp_only.yaml GPU_DEVICES=0,1 bash scripts/run_pipe
 | `instance_contrastive.yaml` | contrastive instance loss (NDI-MIL) |
 | `ppo_control.yaml` | PPO terminal reward only (shaping_coef=0) |
 | `hidden_states.yaml` | Qwen3-8B hidden states as features (4096-dim) |
+| `legacy_concat_500.yaml` | Reproduce the previous 500-problem concat experiment |
+| `full_prefix_value_500.yaml` | Mask-aware causal prefix value + ranking + potential PPO |
+
+## Full prefix-value experiment
+
+The complete proposal keeps the original 500-problem, 60,000-trajectory split
+and compares the legacy concat pipeline against a mask-aware causal Prefix
+Value Model. Prefix labels use eight continuation temperatures, ranking pairs
+stay within the same problem, and PPO receives calibrated potential differences.
+
+```bash
+GPU_DEVICES=0,1 bash scripts/run_legacy_full_comparison.sh
+```
+
+The script validates the 400/50/50 problem split, evaluates seeds 42/43/44,
+and writes `results/legacy_vs_full.json` plus a Markdown comparison table.
 
 ## Running individual stages
 

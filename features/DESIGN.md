@@ -1,5 +1,12 @@
 # Features Module Design
 
+## Mask-aware concat path
+
+The Full proposal retains incomplete final segments. Each segment has 64 token
+slots and 64 probability features per token, producing `[K, 4096]` features and
+a `[K, 64]` token mask. Padding is zeroed explicitly. The legacy concat path is
+unchanged for reproducibility.
+
 ## Data pipeline overview (post-simplification)
 
 ```

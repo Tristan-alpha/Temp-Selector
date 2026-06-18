@@ -38,7 +38,8 @@ def compute_auc(labels: torch.Tensor, scores: torch.Tensor) -> float:
     fp = np.cumsum(1 - y)
     tpr = np.concatenate([[0.0], tp / n_pos, [1.0]])
     fpr = np.concatenate([[0.0], fp / n_neg, [1.0]])
-    return float(np.trapezoid(tpr, fpr))
+    trapezoid = getattr(np, "trapezoid", np.trapz)
+    return float(trapezoid(tpr, fpr))
 
 
 def compute_bag_metrics(labels: torch.Tensor, logits: torch.Tensor) -> Dict[str, float]:
