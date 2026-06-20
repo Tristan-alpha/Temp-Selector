@@ -232,8 +232,9 @@ class PrefixRolloutEngine:
             majority = int(self_consistency_correct(generated[i], gold[i]))
             majority_correct.append(majority)
             individual_correct.append([int(verify_answer(text, gold[i])) for text in generated[i]])
-            terminal = 1.0 if majority else -1.0
             for vote in range(votes):
+                vote_correct = int(individual_correct[i][vote])
+                terminal = 1.0 if vote_correct else -1.0
                 chain = transitions[i][vote]
                 if chain:
                     chain[-1].done = True
@@ -247,7 +248,7 @@ class PrefixRolloutEngine:
                     transition.reward = reward
                     transition.terminal_reward = float(terminal_component)
                     transition.shaping_reward = float(reward - terminal_component)
-                    transition.final_correct = majority
+                    transition.final_correct = vote_correct
 
         if not collect_transitions:
             transitions = []

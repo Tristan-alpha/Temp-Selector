@@ -78,6 +78,8 @@ ppo:
     ppo_epochs: 1
     mini_batch_size: 32
     val_size: 4
+    fixed_temp_bias: 1.0
+    nonfixed_temp_bias: 0.0
     gamma: 0.99
     gae_lambda: 0.95
     clip_eps: 0.2

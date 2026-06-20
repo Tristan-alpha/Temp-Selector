@@ -7,3 +7,5 @@ data/
 datasets/
 checkpoints/*.pt
 logs/
+results/
+tmux_logs/

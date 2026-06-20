@@ -1,6 +1,7 @@
-# Single-seed minimal evidence run for Prefix Value Model + Full PPO.
-# Keeps PPO training hyperparameters aligned with the runtime Full PPO config
-# while isolating all generated labels, caches, checkpoints, and results.
+# PPO restart config for the single-seed minimal evidence run.
+# Reuses the current 20260618 PVM checkpoint, labels, and caches.
+# Runtime settings match the successful Full PPO path, except GPU memory
+# utilization is modestly raised for currently idle A800 GPUs.
 seed: 42
 
 paths:
@@ -28,10 +29,9 @@ data:
 
 inference:
   model_name_or_path: /home/data/nas_hdd/jiaxuan/ckpt_ada2/Qwen3-8B
-  gpu_memory_utilization: 0.80
-  vllm_micro_batch_size: 128
-  vllm_enforce_eager: true
-  enable_prefix_caching: false
+  gpu_memory_utilization: 0.75
+  vllm_micro_batch_size: 64
+  vllm_enforce_eager: false
   reset_prefix_cache_before_validation: true
   max_new_tokens: 8192
   temperature_grid: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]

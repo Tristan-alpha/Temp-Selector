@@ -210,8 +210,13 @@ def train(config_path: str, parallel_size: int | None = None,
     temp_bins = [float(x) for x in cfg["data"]["temp_bins"]]
     train_prompts = load_prompts(cfg["paths"]["train_dataset"])
     val_prompts = load_prompts(cfg["paths"]["val_dataset"])
-    val_size = int(training_cfg.get("val_size", 16))
-    val_fixed = random.Random(seed).sample(val_prompts, min(val_size, len(val_prompts)))
+    val_size = int(training_cfg.get("val_size", 0) or 0)
+    if val_size > 0 and val_size < len(val_prompts):
+        val_fixed = random.Random(seed).sample(val_prompts, val_size)
+        val_selection = "sampled"
+    else:
+        val_fixed = list(val_prompts)
+        val_selection = "full"
 
     n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
     if n_gpu == 0:
@@ -228,11 +233,17 @@ def train(config_path: str, parallel_size: int | None = None,
         if accuracy:
             best_temp = max(accuracy, key=accuracy.get)
             best_idx = min(range(len(temp_bins)), key=lambda idx: abs(temp_bins[idx] - best_temp))
+    fixed_temp_bias = float(training_cfg.get("fixed_temp_bias", 1.0))
+    nonfixed_temp_bias = float(training_cfg.get("nonfixed_temp_bias", 0.0))
     with torch.no_grad():
-        policy.pi.bias.fill_(-5.0)
-        policy.pi.bias[best_idx] = 5.0
-    logger.info("train_prompts=%d val_prompts=%d best_fixed=%.1f",
-                len(train_prompts), len(val_fixed), temp_bins[best_idx])
+        policy.pi.bias.fill_(nonfixed_temp_bias)
+        policy.pi.bias[best_idx] = fixed_temp_bias
+    logger.info(
+        "train_prompts=%d val_prompts_total=%d val_prompts_used=%d "
+        "val_selection=%s best_fixed=%.1f fixed_temp_bias=%.3f nonfixed_temp_bias=%.3f",
+        len(train_prompts), len(val_prompts), len(val_fixed), val_selection,
+        temp_bins[best_idx], fixed_temp_bias, nonfixed_temp_bias,
+    )
 
     runner = VLLMFeatureExporter(
         model_name_or_path=cfg["inference"]["model_name_or_path"],
