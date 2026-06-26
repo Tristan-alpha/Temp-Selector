@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 
+_ROOT_CONFIGURED = False
+
 def setup_experiment_logger(
     component: str,
     run_name: Optional[str] = None,
@@ -18,22 +20,26 @@ def setup_experiment_logger(
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f"{final_run_name}.log")
 
+    global _ROOT_CONFIGURED
+    if not _ROOT_CONFIGURED:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        )
+        logging.captureWarnings(True)
+        _ROOT_CONFIGURED = True
+
     logger_name = f"tf_mil.{component}.{final_run_name}"
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
-    logger.propagate = False
+    # propagate=True (default): messages reach root → stderr.
+    # FileHandler keeps this stage's messages in its own log file.
 
     if not logger.handlers:
-        fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
         file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-        file_handler.setFormatter(fmt)
+        root_fmt = logging.getLogger().handlers[0].formatter
+        file_handler.setFormatter(root_fmt)
         logger.addHandler(file_handler)
-
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(fmt)
-        logger.addHandler(stream_handler)
-
-    logging.captureWarnings(True)
 
     logger.info("run_start component=%s run_name=%s", component, final_run_name)
     if config is not None:

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import yaml
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,8 +12,11 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from mil.model import MILModel, DynamicTempHead, GlobalTempHead, smoothness_loss
-from mil.utils import BagDataset, make_collate_fn, SegmentCacheDataset, make_cached_collate_fn, token_batches
+from mil.model import MILModel
+from mil.utils import (BagDataset, make_collate_fn, SegmentCacheDataset,
+                       make_cached_collate_fn, token_batches,
+                       _build_cache_path, _load_or_build_segment_cache,
+                       _fit_apply_scaler)
 from utils.exp_logger import log_exception, setup_experiment_logger
 
 
@@ -54,6 +58,7 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         parallel_size=parallel_size,
         gpu_memory_utilization=float(cfg["inference"].get("gpu_memory_utilization", 0.90)),
         reserve_training_gpu=True,
+        enable_prefix_caching=False,
     )
     logger.info("VLLMFeatureExporter ready for online feature extraction")
 
@@ -84,34 +89,26 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         extractor=runner,
         feature_mode=feature_mode,
         instance_dim=instance_dim,
-        segment_mode=cfg["data"].get("segment_mode", "step"),
+        segment_mode=cfg["data"].get("segment_mode", "fixed_window"),
         segment_size=int(cfg["data"].get("segment_size", 32)),
         pooling_mode=cfg["data"].get("segment_pooling", "mean"),
         temp_bins=temp_bins,
         train_device=device,
     )
 
-    # ---- Pre-compute segment features for training set ----
+    # ---- Pre-compute segment features for training set (cached) ----
     max_tokens_per_batch = int(cfg["mil"]["training"].get("max_tokens_per_batch", 131072))
-    segment_cache: List[Dict[str, Any]] = []
-    train_batches = token_batches(dataset.rows, max_tokens_per_batch)
-    logger.info("precomputing train features n_rows=%d n_batches=%d max_tokens_per_batch=%d",
-                 len(dataset), len(train_batches), max_tokens_per_batch)
-    for indices in tqdm(train_batches, desc="Precompute train features"):
-        batch_rows = [dataset[i] for i in indices]
-        batch = collate_fn(batch_rows)
-        x = batch["instances"].cpu()
-        y = batch["label"].cpu()
-        t = batch["temp_idx"].cpu()
-        mask = batch["mask"].cpu()
-        for i in range(x.shape[0]):
-            n_valid = int(mask[i].sum().item())
-            segment_cache.append({
-                "instances": x[i, :n_valid].clone(),
-                "label": float(y[i].item()),
-                "temp_idx": int(t[i].item()),
-            })
-    logger.info("precomputed train segment_cache_size=%d", len(segment_cache))
+    segment_mode = cfg["data"].get("segment_mode", "fixed_window")
+    pooling_mode = cfg["data"].get("segment_pooling", "mean")
+    segment_size_for_cache = int(cfg["data"].get("segment_size", 32))
+    train_cache_path = _build_cache_path(
+        "datasets/cache", "train", segment_mode, pooling_mode,
+        feature_mode, instance_dim, segment_size_for_cache,
+    )
+    segment_cache = _load_or_build_segment_cache(
+        dataset.rows, collate_fn, train_cache_path,
+        max_tokens_per_batch, logger,
+    )
 
     train_batch_size = int(cfg["mil"]["training"].get("batch_size", 32))
     cached_collate = make_cached_collate_fn(segment_cache, instance_dim, device)
@@ -134,38 +131,17 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         aggregator=cfg["mil"]["model"].get("aggregator", "attention"),
         use_position=cfg["mil"]["model"].get("use_position", True),
         use_gru=cfg["mil"]["model"].get("use_gru", True),
+        gated_attention=cfg["mil"]["model"].get("gated_attention", False),
+        num_heads=int(cfg["mil"]["model"].get("num_heads", 1)),
     ).to(device)
 
-    alpha = float(cfg["mil"]["training"]["alpha_temp"])
-    use_temp = (alpha > 0)
-    global_head = None
-    dynamic_head = None
-    if use_temp:
-        global_head = GlobalTempHead(hidden_dim=hidden_dim, n_bins=len(temp_bins)).to(device)
-        dynamic_head = DynamicTempHead(hidden_dim=hidden_dim, n_bins=len(temp_bins)).to(device)
-
-    params = list(mil.parameters())
-    if use_temp:
-        params += list(global_head.parameters()) + list(dynamic_head.parameters())
-    optimizer = optim.Adam(params, lr=float(cfg["mil"]["training"]["lr"]))
+    optimizer = optim.Adam(mil.parameters(), lr=float(cfg["mil"]["training"]["lr"]))
 
     n_pos = sum(1 for r in dataset.rows if float(r.get("individual_label", 0)) > 0.5)
     n_neg = len(dataset.rows) - n_pos
-    pos_weight = torch.tensor([(n_neg / max(1, n_pos)) ** 0.5], device=device)
-    logger.info("bce_pos_weight=%.4f (n_wrong=%d n_correct=%d)", pos_weight.item(), n_pos, n_neg)
-    bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    ce = nn.CrossEntropyLoss()
+    logger.info("class_balance n_wrong=%d n_correct=%d", n_pos, n_neg)
+    bce = nn.BCEWithLogitsLoss()
 
-    instance_loss_method = cfg["mil"]["training"].get("instance_loss", "topk")
-    valid_methods = {"topk", "pure", "soft_pseudo_label", "contrastive"}
-    if instance_loss_method not in valid_methods:
-        raise ValueError(f"Unknown instance_loss method: {instance_loss_method}. "
-                         f"Must be one of {valid_methods}")
-    logger.info("instance_loss_method=%s", instance_loss_method)
-
-    alpha = float(cfg["mil"]["training"]["alpha_temp"])
-    beta = float(cfg["mil"]["training"]["beta_inst_aux"])
-    gamma = float(cfg["mil"]["training"]["gamma_smooth"])
     max_epochs = int(cfg["mil"]["training"]["max_epochs"])
     early_stop_patience = int(cfg["mil"]["training"]["early_stop_patience"])
 
@@ -185,25 +161,23 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
                 row["_full_ids"] = pids + resp_ids
                 row["_prompt_len"] = len(pids)
 
-    # ---- Pre-compute segment features for validation set ----
-    val_segment_cache: List[Dict[str, Any]] = []
-    val_batches = token_batches(val_dataset.rows, max_tokens_per_batch)
-    logger.info("precomputing val features n_rows=%d n_batches=%d", len(val_dataset), len(val_batches))
-    for indices in tqdm(val_batches, desc="Precompute val features"):
-        batch_rows = [val_dataset[i] for i in indices]
-        batch = collate_fn(batch_rows)
-        x = batch["instances"].cpu()
-        y = batch["label"].cpu()
-        t = batch["temp_idx"].cpu()
-        mask = batch["mask"].cpu()
-        for i in range(x.shape[0]):
-            n_valid = int(mask[i].sum().item())
-            val_segment_cache.append({
-                "instances": x[i, :n_valid].clone(),
-                "label": float(y[i].item()),
-                "temp_idx": int(t[i].item()),
-            })
-    logger.info("precomputed val segment_cache_size=%d", len(val_segment_cache))
+    # ---- Pre-compute segment features for validation set (cached) ----
+    val_cache_path = _build_cache_path(
+        "datasets/cache", "val", segment_mode, pooling_mode,
+        feature_mode, instance_dim, segment_size_for_cache,
+    )
+    val_segment_cache = _load_or_build_segment_cache(
+        val_dataset.rows, collate_fn, val_cache_path,
+        max_tokens_per_batch, logger,
+    )
+
+    # ---- Optional: StandardScaler on input features ----
+    use_scaler = cfg["mil"]["training"].get("use_input_scaler", False)
+    if use_scaler:
+        segment_cache, val_segment_cache, scaler_params = _fit_apply_scaler(
+            segment_cache, val_segment_cache, logger, device=device)
+        logger.info("scaler_applied n_features=%d",
+                     len(scaler_params["mean"]))
 
     val_cached_collate = make_cached_collate_fn(val_segment_cache, instance_dim, device)
     val_loader = DataLoader(
@@ -212,179 +186,111 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
         collate_fn=val_cached_collate, num_workers=0,
     )
 
-    def _validate() -> float:
-        """Compute inst_logit_separation on the validation set.
-
-        Mean inst_logit on error bags minus mean on correct bags.
-        Higher = model discriminates error segments from correct segments better.
-        """
+    def _validate() -> Tuple[float, float, float]:
+        """Compute bag-level accuracy on validation set for early stopping.
+        Returns (overall_acc, pos_acc, neg_acc)."""
         mil.eval()
-        pos_means: List[float] = []
-        neg_means: List[float] = []
+        correct = 0
+        total = 0
+        pos_correct = 0; pos_total = 0
+        neg_correct = 0; neg_total = 0
         with torch.no_grad():
             for batch_v in val_loader:
                 x_v = batch_v["instances"]
-                mask_v = batch_v["mask"]
                 y_v = batch_v["label"]
-                inst = mil(x_v)["inst_logit"]
-                for i in range(y_v.size(0)):
-                    n_valid = int(mask_v[i].sum().item())
-                    if n_valid == 0:
-                        continue
-                    bag_mean = inst[i, :n_valid].mean().item()
-                    if y_v[i].item() > 0.5:  # label=1: positive bag (contains errors)
-                        pos_means.append(bag_mean)
-                    else:  # label=0: negative bag (no errors)
-                        neg_means.append(bag_mean)
+                out_v = mil(x_v)
+                pred = (torch.sigmoid(out_v["bag_logit"]) > 0.5).float()
+                correct += (pred == y_v).sum().item()
+                total += y_v.size(0)
+                pos_mask = (y_v > 0.5)
+                neg_mask = ~pos_mask
+                pos_correct += (pred[pos_mask] == y_v[pos_mask]).sum().item()
+                pos_total += pos_mask.sum().item()
+                neg_correct += (pred[neg_mask] == y_v[neg_mask]).sum().item()
+                neg_total += neg_mask.sum().item()
         mil.train()
-        if pos_means and neg_means:
-            import numpy as np
-            return float(np.mean(pos_means) - np.mean(neg_means))
-        return 0.0
-
-    best_separation = -float("inf")
+        return (correct / max(1, total),
+                pos_correct / max(1, pos_total),
+                neg_correct / max(1, neg_total))
     patience_counter = 0
+    best_val_acc = float("-inf")
     best_ckpt: Dict[str, Any] | None = None
+
+    # ---- Metrics JSONL ----
+    metrics_path = f"{log_dir}/{final_run_name}_mil_metrics.jsonl"
+    metrics_fh = open(metrics_path, "a", encoding="utf-8")
+    logger.info("metrics_jsonl=%s", metrics_path)
 
     for epoch in range(max_epochs):
         mil.train()
-        if use_temp:
-            global_head.train()
-            dynamic_head.train()
 
         sum_loss = 0.0
+        sum_grad_norm = 0.0
+        sum_attn_entropy = 0.0
+        train_correct = 0
+        train_total = 0
+        n_train_batches = 0
         pbar = tqdm(total=len(loader), desc=f"Epoch {epoch + 1}/{max_epochs}",
                      unit="batch", dynamic_ncols=True)
         for batch in loader:
             x = batch["instances"]
-            mask = batch["mask"]
             y = batch["label"]
-            t = batch["temp_idx"]
-            bags = x.shape[0]
 
             out = mil(x)
             bag_logit = out["bag_logit"]
-            inst_logit = out["inst_logit"]
-            bag_repr = out["bag_repr"]
-            inst_repr = out["encoder_out"]
 
-            loss_bag = bce(bag_logit, y)
-
-            # Instance-level auxiliary loss.  Method is configurable because
-            # the optimal strategy for assigning instance-level targets from
-            # bag-level labels is an open research question.  See mil/DESIGN.md.
-            inst_loss_total = 0.0
-            inst_count = 0
-            for i in range(y.size(0)):
-                n_valid = int(mask[i].sum().item())
-                if n_valid == 0:
-                    continue
-                scores = inst_logit[i, :n_valid]  # [n_valid]
-
-                if y[i].item() > 0.5:  # label=1: positive bag (contains errors)
-                    # ---- positive bag (wrong answer) ----
-                    if instance_loss_method == "topk":
-                        k = max(1, n_valid // 3)
-                        topk_logprobs, topk_idx = torch.topk(scores, k)
-                        loss_pos = bce(topk_logprobs, torch.ones(k, device=device))
-                        all_idx = set(range(n_valid))
-                        rest_idx = torch.tensor(sorted(all_idx - set(topk_idx.tolist())), device=device)
-                        if len(rest_idx) > 0:
-                            rest_logits = scores[rest_idx]
-                            loss_rest = bce(rest_logits, torch.zeros(len(rest_idx), device=device))
-                            inst_loss_total += loss_pos.sum() + loss_rest.sum()
-                            inst_count += k + len(rest_idx)
-                        else:
-                            inst_loss_total += loss_pos.sum()
-                            inst_count += k
-
-                    elif instance_loss_method == "pure":
-                        k = 1
-                        topk_logprobs, topk_idx = torch.topk(scores, k)
-                        loss_pos = bce(topk_logprobs, torch.ones(k, device=device))
-                        all_idx = set(range(n_valid))
-                        rest_idx = torch.tensor(sorted(all_idx - set(topk_idx.tolist())), device=device)
-                        if len(rest_idx) > 0:
-                            rest_logits = scores[rest_idx]
-                            loss_rest = bce(rest_logits, torch.zeros(len(rest_idx), device=device))
-                            inst_loss_total += loss_pos.sum() + loss_rest.sum()
-                            inst_count += k + len(rest_idx)
-                        else:
-                            inst_loss_total += loss_pos.sum()
-                            inst_count += k
-
-                    elif instance_loss_method == "soft_pseudo_label":
-                        probs = torch.sigmoid(scores).detach()
-                        if probs.max() < 0.5:
-                            probs[probs.argmax()] = 0.5
-                        loss = bce(scores, probs)
-                        inst_loss_total += loss.sum()
-                        inst_count += n_valid
-
-                    elif instance_loss_method == "contrastive":
-                        # Relative: encourage one score to stand out above others.
-                        # Absolute: push the max score into the positive range
-                        # (otherwise all scores drift negative while negative-bag
-                        # scores are pushed to 0 → negative separation).
-                        loss_val = (torch.logsumexp(scores, dim=0) - scores.max()
-                                    + nn.functional.softplus(-scores.max()))
-                        inst_loss_total += loss_val
-                        inst_count += 1
-
-                else:  # label=0: negative bag (no errors)
-                    # ---- negative bag (correct answer) ----
-                    if instance_loss_method == "contrastive":
-                        loss_neg = scores.pow(2).mean()
-                        inst_loss_total += loss_neg * n_valid
-                    else:
-                        loss_neg = bce(scores, torch.zeros(n_valid, device=device))
-                        inst_loss_total += loss_neg.sum()
-                    inst_count += n_valid
-
-            loss_inst = inst_loss_total / max(1, inst_count)
-
-            loss_temp = torch.tensor(0.0, device=device)
-            loss_smo = torch.tensor(0.0, device=device)
-            if use_temp:
-                temp_logits_global = global_head(bag_repr)
-                loss_temp_global = ce(temp_logits_global, t)
-                temp_logits_dyn = dynamic_head(inst_repr)
-                temp_logits_dyn_avg = temp_logits_dyn.mean(dim=1)
-                loss_temp_dyn = ce(temp_logits_dyn_avg, t)
-                loss_temp = alpha * (loss_temp_global + loss_temp_dyn) * 0.5
-                loss_smo = gamma * smoothness_loss(temp_logits_dyn)
-
-            loss = loss_bag + loss_temp + beta * loss_inst + loss_smo
+            loss = bce(bag_logit, y)
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(mil.parameters(), max_norm=1.0)
             optimizer.step()
 
             _batch_loss = float(loss.item())
-            _batch_bag = float(loss_bag.item())
-            _batch_inst = float(loss_inst.item())
             sum_loss += _batch_loss
+            sum_grad_norm += float(grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm))
+            if "attn_w" in out:
+                attn = out["attn_w"]
+                attn_ent = -(attn * (attn + 1e-12).log()).sum(dim=-1).mean().item()
+                sum_attn_entropy += attn_ent
 
-            del x, mask, y, t, out, loss, loss_bag, loss_inst, batch
+            with torch.no_grad():
+                pred_train = (torch.sigmoid(bag_logit) > 0.5).float()
+                train_correct += (pred_train == y).sum().item()
+                train_total += y.size(0)
+            n_train_batches += 1
+
+            del x, y, out, loss, batch
 
             pbar.update(1)
-            pbar.set_postfix(loss=f"{_batch_loss:.4f}",
-                             bag=f"{_batch_bag:.4f}",
-                             inst=f"{_batch_inst:.4f}",
-                             bags=bags)
+            pbar.set_postfix(loss=f"{_batch_loss:.4f}")
 
         pbar.close()
         avg = sum_loss / max(1, len(loader))
+        train_acc_val = train_correct / max(1, train_total)
+        avg_grad_norm = sum_grad_norm / max(1, n_train_batches)
+        avg_attn_entropy = sum_attn_entropy / max(1, n_train_batches)
 
         # ---- validation + early stopping ----
-        separation = _validate()
-        logger.info("epoch=%d done avg_loss=%.6f separation=%.4f best=%.4f patience=%d/%d",
-                     epoch + 1, avg, separation, best_separation,
+        val_acc, val_acc_pos, val_acc_neg = _validate()
+        logger.info("epoch=%d done avg_loss=%.6f val_acc=%.4f best=%.4f patience=%d/%d",
+                     epoch + 1, avg, val_acc, best_val_acc,
                      patience_counter, early_stop_patience)
 
-        if separation > best_separation:
-            best_separation = separation
+        metrics_fh.write(json.dumps({
+            "epoch": epoch + 1,
+            "loss": avg,
+            "train_acc": round(train_acc_val, 4),
+            "val_acc": round(val_acc, 4),
+            "val_acc_pos": round(val_acc_pos, 4),
+            "val_acc_neg": round(val_acc_neg, 4),
+            "grad_norm": round(avg_grad_norm, 4),
+            "attn_entropy": round(avg_attn_entropy, 4),
+        }) + "\n")
+        metrics_fh.flush()
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             patience_counter = 0
             # clone to CPU — state_dict() returns references to live parameters,
             # which are mutated in-place by optimizer.step().
@@ -392,29 +298,25 @@ def train(config_path: str, data_path: str, run_name: str | None = None, log_dir
                 "mil": {k: v.detach().cpu().clone() for k, v in mil.state_dict().items()},
                 "config": cfg,
             }
-            if use_temp:
-                ckpt["global_head"] = {k: v.detach().cpu().clone() for k, v in global_head.state_dict().items()}
-                ckpt["dynamic_head"] = {k: v.detach().cpu().clone() for k, v in dynamic_head.state_dict().items()}
             best_ckpt = ckpt
-            logger.info("new_best separation=%.4f", best_separation)
+            logger.info("new_best separation=%.4f", best_val_acc)
         else:
             patience_counter += 1
             if patience_counter >= early_stop_patience:
-                logger.info("early_stop separation=%.4f best=%.4f", separation, best_separation)
+                logger.info("early_stop val_acc=%.4f best=%.4f", val_acc, best_val_acc)
                 break
+
+    metrics_fh.close()
 
     if best_ckpt is None:
         best_ckpt = {
             "mil": {k: v.detach().cpu().clone() for k, v in mil.state_dict().items()},
             "config": cfg,
         }
-        if use_temp:
-            best_ckpt["global_head"] = {k: v.detach().cpu().clone() for k, v in global_head.state_dict().items()}
-            best_ckpt["dynamic_head"] = {k: v.detach().cpu().clone() for k, v in dynamic_head.state_dict().items()}
     ckpt_path = cfg["paths"]["mil_ckpt"]
     torch.save(best_ckpt, ckpt_path)
-    logger.info("saved_checkpoint=%s best_separation=%.4f run_name=%s log_path=%s",
-                 ckpt_path, best_separation, final_run_name, log_path)
+    logger.info("saved_checkpoint=%s best_val_acc=%.4f run_name=%s log_path=%s",
+                 ckpt_path, best_val_acc, final_run_name, log_path)
 
 
 def main() -> None:

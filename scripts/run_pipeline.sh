@@ -120,7 +120,7 @@ fi
 
 if stage_enabled "split"; then
     run_stage "split_jsonl" \
-        python scripts/split_jsonl.py --config "$CONFIG" \
+        python scripts/split_jsonl.py --config "$DATASET_CONFIG" \
             --val-ratio "$VAL_RATIO" --test-ratio "$TEST_RATIO" --group-by sample_prefix --seed 42
 else
     echo "[skip] split_jsonl"

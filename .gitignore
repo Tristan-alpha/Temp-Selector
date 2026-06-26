@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 *.safetensors
 .pytest_cache/
+.cache_eval200/
+pytest-of-*/
 .venv/
 data/
 datasets/
@@ -9,3 +11,5 @@ checkpoints/*.pt
 logs/
 results/
 tmux_logs/
+latent_opportunity_from_confident_decoding_*/outputs/
+latent_opportunity_from_confident_decoding_*/latent_opportunity/runs/

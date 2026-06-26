@@ -116,15 +116,20 @@ def segment_pooling(
             out.append(torch.zeros(obs_dim, device=dev))
             continue
         if mode == "concat":
-            if chunk.shape[0] < segment_size:
-                continue  # drop incomplete segment
-            flat = chunk.reshape(-1)
+            flat = torch.zeros(segment_size * obs_dim, device=dev)
+            n_take = min(chunk.shape[0], segment_size)
+            flat[:n_take * obs_dim] = chunk[:n_take].reshape(-1)
             out.append(flat)
         else:  # mean
             out.append(chunk.mean(dim=0))
     if not out:
-        return torch.zeros(1, obs_dim, device=dev)
-    return torch.stack(out)
+        out_dim = obs_dim * segment_size if mode == "concat" else obs_dim
+        return torch.zeros(1, out_dim, device=dev)
+    result = torch.stack(out)
+    assert result.dim() == 2, f"segment_pooling: expected 2D [K, D], got {result.shape}"
+    assert result.shape[-1] == (obs_dim * segment_size if mode == "concat" else obs_dim), \
+        f"segment_pooling: expected last dim {obs_dim * segment_size if mode == 'concat' else obs_dim}, got {result.shape[-1]}"
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -152,12 +157,23 @@ def build_segment_obs_from_lp(
     vector (2 + top_k dims).  When False, only logprob + entropy form the base
     (2 dims), with ``extra_parts`` appended before padding.
     """
+    if pooling_mode == "concat" and segment_mode in ("step", "punctuation"):
+        raise ValueError(
+            f"pooling_mode='concat' is incompatible with segment_mode='{segment_mode}'. "
+            f"Use segment_mode='fixed_window' with concat pooling."
+        )
+
     n_tok = lp_tensor.shape[0]
     if n_tok == 0:
         return torch.zeros(1, obs_dim, device=device)
 
     lp = lp_tensor[:, 1:].float()
     sampled = lp_tensor[:, 0:1].float()                        # [n_tok, 1]
+    # Top-k pseudo-entropy: computed over top-k logprobs only, not the full
+    # vocabulary (~128K).  Summing over a subset under-estimates true entropy,
+    # but full-distribution logprobs are prohibitively expensive (memory).
+    # The downstream model receives the full top-k distribution (4096 dims)
+    # which provides richer uncertainty signal than a single entropy scalar.
     entropy = -(torch.exp(lp) * lp).sum(dim=1, keepdim=True)  # [n_tok, 1]
 
     if include_topk:
@@ -176,9 +192,12 @@ def build_segment_obs_from_lp(
 
     spans = build_segments(tokens=tokens, mode=segment_mode,
                            segment_size=segment_size, response=text)
-    return segment_pooling(tok_vecs.to(device) if device is not None else tok_vecs,
+    result = segment_pooling(tok_vecs.to(device) if device is not None else tok_vecs,
                            spans, obs_dim, mode=pooling_mode,
                            segment_size=segment_size)
+    assert result.dim() == 2, \
+        f"build_segment_obs_from_lp: expected 2D [K, obs_dim], got {result.shape}"
+    return result
 
 
 def build_masked_concat_segment_obs_from_lp(
@@ -342,6 +361,7 @@ def batch_build_segment_obs_from_lp(
     # ---- Token-level math on GPU ----
     lp = stacked[:, :, 1:].float()                                  # [B, T, top_k]
     sampled = stacked[:, :, 0:1].float()                            # [B, T, 1]
+    # Top-k pseudo-entropy (same caveat as per-chain version above).
     entropy = -(torch.exp(lp) * lp).sum(dim=2, keepdim=True)       # [B, T, 1]
 
     if include_topk:
@@ -374,8 +394,16 @@ def batch_build_segment_obs_from_lp(
         return [obs_gpu[i:i+1].cpu() for i in range(B)]              # each [1, obs_dim]
 
     if segment_mode == "fixed_window" and pooling_mode == "concat":
-        obs_gpu = tok_vecs.reshape(B, -1)                             # [B, T*obs_dim]
-        return [obs_gpu[i:i+1].cpu() for i in range(B)]              # each [1, T*obs_dim]
+        # Pad or truncate to segment_size tokens so output dim always
+        # matches segment_pooling concat: segment_size * obs_dim.
+        T = tok_vecs.shape[1]
+        if T < segment_size:
+            pad = torch.zeros(B, segment_size - T, obs_dim, device=tok_vecs.device)
+            tok_vecs = torch.cat([tok_vecs, pad], dim=1)
+        elif T > segment_size:
+            tok_vecs = tok_vecs[:, :segment_size, :]
+        obs_gpu = tok_vecs.reshape(B, segment_size * obs_dim)        # [B, segment_size * obs_dim]
+        return [obs_gpu[i:i+1].cpu() for i in range(B)]              # each [1, segment_size * obs_dim]
 
     # step / punctuation mode: pool per-chain on CPU (spans differ)
     tok_cpu = tok_vecs.cpu()
@@ -387,6 +415,10 @@ def batch_build_segment_obs_from_lp(
         obs = segment_pooling(tok_cpu[i, :n], spans, obs_dim,
                               mode=pooling_mode, segment_size=segment_size)
         results.append(obs)
+    # Shape contract: each element is [n_segments_i, obs_dim] (2D)
+    for i, r in enumerate(results):
+        assert r.dim() == 2, \
+            f"batch_build_segment_obs_from_lp: chain {i} expected 2D, got {r.shape}"
     return results
 
 
@@ -416,7 +448,7 @@ def _punctuation_segment(tokens: Iterable[str], max_window: int = 64) -> List[Se
     sid = 0
     punct = {".", "!", "?", ";", "\n"}
     for i, t in enumerate(token_list):
-        is_break = t.strip() in punct or (i - start + 1) >= max(1, max_window)
+        is_break = t.strip() in punct or "\n" in t or (i - start + 1) >= max(1, max_window)
         if is_break:
             s, e = clamp_segment(start, i + 1, len(token_list))
             if e > s:

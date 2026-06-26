@@ -32,7 +32,7 @@ tf-mil/
 │   ├── vectorizer.py           # token_to_vec, token_to_obs, compute_entropy
 │   └── dataset_eval.py         # 数据集统计分析
 ├── mil/
-│   ├── model.py                # MILModel + temp heads
+│   ├── model.py                # MILModel (bag_bce-only, attention aggregation)
 │   ├── utils.py                # BagDataset, TokenBatchSampler, make_collate_fn
 │   ├── training.py             # MIL 训练
 │   └── eval.py                 # MIL 评估
@@ -46,7 +46,8 @@ tf-mil/
 │   └── exp_logger.py           # 日志
 ├── scripts/
 │   ├── run_pipeline.sh         # 全流程编排
-│   └── build_dataset.py        # Stage 1 数据构建
+│   ├── build_dataset.py        # Stage 1 数据构建
+│   └── plot_training.py        # 训练指标可视化
 └── tests/                      # CPU-only 测试
 ```
 
@@ -173,7 +174,7 @@ for each batch:
 | mode | 在线提取 | instance_dim |
 |------|---------|-------------|
 | `topk_logprobs` | logprob + entropy + top-4096 logprobs | 4098 |
-| `hidden_states` | hidden states (Qwen3-8B last layer) | 4096 |
+| `hidden_states` | hidden states (Qwen3-8B last layer) | 4098 |
 
 ### 模型架构
 
@@ -186,18 +187,15 @@ SinusoidalPositionalEncoding (可选)
     ↓
 BiGRU (可选, bidirectional)
     ↓
-AttentionAggregator
-    ├── bag_repr → bag_head → bag_logit
-    └── inst_logit (per-segment error score)
+AttentionAggregator → bag_logit + attn_w
+    └── bag_head
 ```
 
 ### 损失函数
 
 ```
-Total = bag_bce + β×instance_bce + α×temp_ce + γ×smoothness
+Total = bag_bce  (Ilse et al. 2018 — bag-level supervision only)
 ```
-
-Instance loss 四种方法：`pure` (k=1, 默认), `topk`, `soft_pseudo_label`, `contrastive`
 
 ### 训练超参数 (base.yaml)
 
@@ -209,14 +207,10 @@ mil:
     use_position: true
     use_gru: true
   training:
-    instance_loss: pure
     max_tokens_per_batch: 131072
     lr: 2.0e-4
     max_epochs: 50
     early_stop_patience: 5
-    alpha_temp: 0.0
-    beta_inst_aux: 0.2
-    gamma_smooth: 0.05
 ```
 
 ---
@@ -239,7 +233,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m ppo.training --config configs/training/base.y
      Round 1: prompt+seg₀ → policy(obs₁)→temperature → generate 512 tokens
      ...直到 EOS 或 max_tokens
   3. 终局: majority voting → terminal reward (±1)
-  4. 中间步: MIL shaping reward = shaping_coef × (1-sigmoid(inst_logit))
+  4. 全步: terminal reward 按 MIL attention 权重分配到所有决策步
   5. GAE + PPO clip update
 ```
 
@@ -267,7 +261,6 @@ ppo:
     mini_batch_size: 32
     lr: 1.0e-5
     clip_eps: 0.2
-    shaping_coef: 0.15
 ```
 
 ---
@@ -355,7 +348,6 @@ ppo:
     mini_batch_size: 32
     lr: 1.0e-5
     clip_eps: 0.2
-    shaping_coef: 0.15
 ```
 
 ---

@@ -73,4 +73,3 @@ ppo:
     value_coef: 0.5
     entropy_coef: 0.005
     lr: 1.0e-5
-    shaping_coef: 0.15

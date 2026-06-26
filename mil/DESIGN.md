@@ -10,10 +10,10 @@ the same parameters and positional encoding.
 
 ## Problem formulation
 
-Given a math reasoning chain split into segments, MIL answers two questions:
+Given a math reasoning chain split into segments, MIL answers:
 
-1. **Bag-level**: Is this whole answer wrong? (`bag_logit`)
-2. **Instance-level**: Which specific segments are likely wrong? (`inst_logit`)
+- **Bag-level**: Is this whole answer wrong? (`bag_logit`)
+- **Attention**: Which segments contribute most to the prediction? (`attn_w`)
 
 MIL reads `individual_label` (per-response correctness):
 
@@ -23,6 +23,10 @@ MIL reads `individual_label` (per-response correctness):
 | 1 | answer wrong, ≥1 segment wrong | positive bag (contains errors) |
 
 Every `> 0.5` branch carries an inline comment (`# label=1: positive bag (contains errors)`) to make the convention explicit.
+
+## Design philosophy: bag_bce only (Ilse et al. 2018)
+
+Following Ilse et al. (2018) "Attention-based Deep Multiple Instance Learning", MIL is trained with **bag-level BCE only** — no instance loss, no auxiliary heads, no smoothness regularization. Attention weights are learned purely through backpropagation from the bag classification objective. The paper shows that this is sufficient: the model naturally learns to attend to discriminative instances.
 
 ## Segment feature pre-computation
 
@@ -56,47 +60,40 @@ instances [B, K, 4098]
      ↓
 InstanceEncoder           Linear(4098→1024)→ReLU→Linear(1024→1024)→ReLU
      ↓  [B, K, 1024]
-SinusoidalPositionalEncoding   (optional) learnable PE buffers
+SinusoidalPositionalEncoding   (optional)
      ↓  [B, K, 1024]
 BiGRU                     bidirectional GRU(1024→1024) + Linear(2048→1024)
      ↓  [B, K, 1024]
 AttentionAggregator       Linear(1024→1)→softmax → weighted sum
      │
-     ├── bag_repr [B, 1024]  →  bag_head  → bag_logit [B]
-     └── inst_logit [B, K]   ←  inst_head per-segment  (error score)
+     ├── bag_repr [B, 1024]  →  bag_head  →  bag_logit [B]
+     └── attn_w   [B, K]       (attention weights, interpretable)
 ```
 
-~500K params with pos + GRU.
+~450K params with pos + GRU (removed inst_head).
 
 ## Loss function
 
 ```
-Total = bag_bce + β×instance_bce + α×temp_ce + γ×smoothness
+Total = bag_bce
 ```
 
-### Bag BCE
+`BCEWithLogitsLoss` with `pos_weight = sqrt(n_correct / n_wrong)`. No auxiliary losses.
 
-`BCEWithLogitsLoss` with `pos_weight = sqrt(n_correct / n_wrong)`.
+## Evaluation
 
-### Instance auxiliary loss (β=0.2)
+Bag-level: AUC, accuracy, precision, recall, F1, calibration (ECE, Brier).
+Attention interpretability: entropy, top3_mass, effective_n.
 
-| Method | Pos bag strategy |
-|---|---|
-| `pure` (default) | k=1: highest-scoring instance → target=1 |
-| `topk` | k=n_valid//3: top third → target=1 |
-| `soft_pseudo_label` | sigmoid(inst_logit).detach() with anti-degeneration clamp |
-| `contrastive` | logsumexp(scores) - max(scores) |
+## PPO credit assignment
 
-All methods: negative bag → all instances target=0.
+During PPO training, MIL attention weights are used for credit assignment:
 
-### Temperature auxiliary loss (α, typically 0.0)
+```
+batch construction (post-rollout):
+  full_bag = torch.stack(all_round_segments)  # [K, obs_dim] — full response bag
+  mil_model(full_bag) → attn_w  # [K] — attention weights
+  reward[t] = terminal_reward × attn_w[t] / attn_w.sum()  # L1-normalized attention weights
+```
 
-GlobalTempHead + DynamicTempHead predict temperature bin.
-
-### Smoothness regularization (γ=0.05)
-
-`mean((logit_{t+1} - logit_t)²)` — penalize jagged temperature predictions.
-
-## DynamicTempHead and the Bug 1 lesson
-
-Must receive `out["encoder_out"]` (post-encoder, post-position, post-GRU), NOT `mil.encoder(x)` (raw). These representations are fundamentally different — using raw encoder output would make the dynamic head's evaluation meaningless.
+The attention mechanism distributes the terminal reward (±1) across steps proportional to their importance. This replaces the previous `inst_logit`-based shaping which had no reliable ground truth for evaluation.

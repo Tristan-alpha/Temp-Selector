@@ -12,11 +12,11 @@ logging:
   level: INFO
 
 data:
-  instance_dim: 4098
+  instance_dim: 64
   temp_bins: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
   segment_mode: fixed_window
-  segment_size: 512
-  segment_pooling: mean
+  segment_size: 64
+  segment_pooling: concat
 
 inference:
   model_name_or_path: /home/xuezhe/models/Qwen3-8B
@@ -41,36 +41,19 @@ inference:
   top_k_logprobs: 4096
   feature_mode: topk_logprobs
 
-mil:
-  model:
-    hidden_dim: 1024
-    aggregator: attention
-    use_position: true
-    use_gru: true
-  training:
-    instance_loss: pure     # topk | pure | soft_pseudo_label | contrastive
-    max_tokens_per_batch: 131072
-    lr: 2.0e-4
-    max_epochs: 50
-    early_stop_patience: 5
-    alpha_temp: 0.0
-    beta_inst_aux: 0.2
-    gamma_smooth: 0.05
-
 ppo:
   model:
     hidden_dim: 1024
   training:
     max_iterations: 200
     early_stop_patience: 10
-    online_rollout_size: 128
+    online_rollout_size: 64
     ppo_epochs: 8
     mini_batch_size: 32
-    val_ratio: 0.2
+    val_size: 16
     gamma: 0.99
     gae_lambda: 0.95
     clip_eps: 0.2
     value_coef: 0.5
     entropy_coef: 0.005
     lr: 1.0e-5
-    shaping_coef: 0.0

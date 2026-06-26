@@ -47,11 +47,15 @@ def _load_value_model(cfg: Dict[str, Any], device: torch.device
     checkpoint = torch.load(
         cfg["paths"]["prefix_value_ckpt"], map_location=device, weights_only=False,
     )
+    model_cfg = cfg["prefix_value"]["model"]
     model = PrefixValueModel(
         token_dim=int(cfg["data"]["instance_dim"]),
         segment_size=int(cfg["data"]["segment_size"]),
-        hidden_dim=int(cfg["prefix_value"]["model"]["hidden_dim"]),
-        max_segments=int(cfg["prefix_value"]["model"].get("max_segments", 8192)),
+        hidden_dim=int(model_cfg["hidden_dim"]),
+        max_segments=int(model_cfg.get("max_segments", 8192)),
+        n_temps=int(model_cfg.get("n_temps", 0)),
+        prompt_dim=int(model_cfg.get("prompt_dim", 0) or 0),
+        prompt_integration=str(model_cfg.get("prompt_integration", "none")),
     ).to(device)
     model.load_state_dict(checkpoint["prefix_value"])
     model.eval()

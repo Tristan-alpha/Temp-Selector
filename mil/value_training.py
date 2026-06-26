@@ -20,6 +20,7 @@ from mil.prefix_data import (
     IndexDataset,
     build_ranking_pairs,
     continuation_collate,
+    oracle_temperature_stats,
     precompute_feature_cache,
     ranking_collate,
     terminal_collate,
@@ -28,6 +29,7 @@ from mil.prefix_value import (
     PrefixValueModel,
     binomial_nll,
     calibrated_probability,
+    masked_binomial_nll,
     paired_ranking_loss,
 )
 from utils.exp_logger import log_exception, setup_experiment_logger
@@ -41,6 +43,26 @@ def _to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str
 def _repeat(loader: DataLoader):
     while True:
         yield from loader
+
+
+def _loader_kwargs(training_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    num_workers = int(training_cfg.get("num_workers", 0))
+    kwargs: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": bool(training_cfg.get("pin_memory", num_workers > 0 and torch.cuda.is_available())),
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = bool(training_cfg.get("persistent_workers", True))
+        kwargs["prefetch_factor"] = int(training_cfg.get("prefetch_factor", 2))
+    return kwargs
+
+
+def _prompt_dim(cfg: Dict[str, Any]) -> int:
+    return int(cfg.get("prefix_value", {}).get("model", {}).get("prompt_dim", 0) or 0)
+
+
+def _prompt_integration(cfg: Dict[str, Any]) -> str:
+    return str(cfg.get("prefix_value", {}).get("model", {}).get("prompt_integration", "none"))
 
 
 def _ece(probabilities: torch.Tensor, targets: torch.Tensor, n_bins: int = 10) -> float:
@@ -127,13 +149,22 @@ def _load_or_build_cache(path: str, rows: List[Dict[str, Any]], extractor,
                          cfg: Dict[str, Any], device: torch.device,
                          description: str) -> List[Dict[str, Any]]:
     cache_path = Path(path)
+    prompt_dim = _prompt_dim(cfg)
     if cache_path.exists():
         cache = torch.load(cache_path, map_location="cpu", weights_only=False)
         expected_dim = int(cfg["data"]["segment_size"]) * int(cfg["data"]["instance_dim"])
         row_ids = [str(row.get("sample_id", "")) for row in rows]
         cache_ids = [str(entry.get("sample_id", "")) for entry in cache]
+        prompt_ok = (
+            prompt_dim <= 0 or
+            (not cache or (
+                "prompt_hidden" in cache[0] and
+                int(cache[0]["prompt_hidden"].shape[-1]) == prompt_dim
+            ))
+        )
         if (len(cache) == len(rows) and cache_ids == row_ids and
-                (not cache or int(cache[0]["features"].shape[1]) == expected_dim)):
+                (not cache or int(cache[0]["features"].shape[1]) == expected_dim) and
+                prompt_ok):
             return cache
     cache = precompute_feature_cache(
         rows=rows,
@@ -146,14 +177,85 @@ def _load_or_build_cache(path: str, rows: List[Dict[str, Any]], extractor,
         )),
         device=device,
         description=description,
+        prompt_dim=prompt_dim,
     )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(cache, cache_path)
     return cache
 
 
+def _forward_model(model: PrefixValueModel, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return model(
+        batch["features"],
+        batch["token_mask"],
+        batch["segment_mask"],
+        prompt_hidden=batch.get("prompt_hidden"),
+    )
+
+
 def _forward_terminal(model: PrefixValueModel, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-    return model(batch["features"], batch["token_mask"], batch["segment_mask"])["terminal_logits"]
+    return _forward_model(model, batch)["terminal_logits"]
+
+
+def _q_metrics(q_logits: torch.Tensor, q_n_correct: torch.Tensor,
+               q_n_total: torch.Tensor, q_mask: torch.Tensor,
+               temp_bins: List[float] | None,
+               records: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+    valid = q_mask > 0
+    if not torch.any(valid):
+        return {}
+    q_probs = torch.sigmoid(q_logits)
+    q_target = (q_n_correct + 0.5) / (q_n_total + 1.0)
+    q_observed = q_n_correct / q_n_total.clamp_min(1.0)
+    q_loss = masked_binomial_nll(q_logits, q_n_correct, q_n_total, q_mask)
+    result: Dict[str, Any] = {
+        "q_brier": float(torch.mean((q_probs[valid] - q_target[valid]) ** 2).item()),
+        "q_ece": _ece(q_probs[valid], q_observed[valid]),
+        "q_binomial_nll": float(q_loss.item()),
+        "q_valid_labels": int(valid.sum().item()),
+    }
+    if temp_bins is None or q_logits.shape[1] != len(temp_bins):
+        return result
+
+    regrets: List[float] = []
+    top1_matches: List[float] = []
+    top3_coverages: List[float] = []
+    selected_temps: Dict[str, int] = defaultdict(int)
+    for row_idx in range(q_logits.shape[0]):
+        valid_idx = torch.nonzero(q_mask[row_idx] > 0, as_tuple=False).flatten()
+        if valid_idx.numel() == 0:
+            continue
+        row_probs = q_probs[row_idx, valid_idx]
+        row_observed = q_observed[row_idx, valid_idx]
+        local_selected = int(torch.argmax(row_probs).item())
+        selected_idx = int(valid_idx[local_selected].item())
+        selected_rate = float(q_observed[row_idx, selected_idx].item())
+        oracle_rate = float(row_observed.max().item())
+        oracle_indices = valid_idx[row_observed == row_observed.max()]
+        regrets.append(oracle_rate - selected_rate)
+        top1_matches.append(float(selected_idx in {int(i.item()) for i in oracle_indices}))
+        k = min(3, int(valid_idx.numel()))
+        topk_local = torch.topk(row_probs, k=k).indices
+        topk_indices = {int(valid_idx[int(i.item())].item()) for i in topk_local}
+        top3_coverages.append(float(any(int(i.item()) in topk_indices for i in oracle_indices)))
+        selected_temps[str(float(temp_bins[selected_idx]))] += 1
+
+    if regrets:
+        result.update({
+            "q_oracle_regret": float(sum(regrets) / len(regrets)),
+            "q_top1_oracle_match": float(sum(top1_matches) / len(top1_matches)),
+            "q_top3_oracle_coverage": float(sum(top3_coverages) / len(top3_coverages)),
+            "q_selected_temperature_distribution": dict(sorted(selected_temps.items())),
+        })
+    if records is not None and len(records) == q_logits.shape[0]:
+        oracle_summary = [
+            oracle_temperature_stats(record)
+            for record in records
+        ]
+        result["q_record_oracle_available"] = sum(
+            1 for item in oracle_summary if item["oracle_temperature"] is not None
+        )
+    return result
 
 
 @torch.no_grad()
@@ -162,19 +264,31 @@ def evaluate_value_model(model: PrefixValueModel,
                          ranking_loader: DataLoader | None,
                          device: torch.device,
                          calibration_temperature: float = 1.0,
-                         records: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+                         records: List[Dict[str, Any]] | None = None,
+                         temp_bins: List[float] | None = None) -> Dict[str, Any]:
     model.eval()
     logits_all: List[torch.Tensor] = []
     targets_all: List[torch.Tensor] = []
     correct_all: List[torch.Tensor] = []
     total_all: List[torch.Tensor] = []
+    q_logits_all: List[torch.Tensor] = []
+    q_correct_all: List[torch.Tensor] = []
+    q_total_all: List[torch.Tensor] = []
+    q_mask_all: List[torch.Tensor] = []
     for batch in continuation_loader:
         batch = _to_device(batch, device)
-        logits = _forward_terminal(model, batch)
+        output = _forward_model(model, batch)
+        logits = output["terminal_logits"]
         logits_all.append(logits.cpu())
         targets_all.append(batch["target"].cpu())
         correct_all.append(batch["n_correct"].cpu())
         total_all.append(batch["n_total"].cpu())
+        q_logits = output.get("terminal_q_logits")
+        if q_logits is not None and "q_n_correct" in batch:
+            q_logits_all.append(q_logits.cpu())
+            q_correct_all.append(batch["q_n_correct"].cpu())
+            q_total_all.append(batch["q_n_total"].cpu())
+            q_mask_all.append(batch["q_mask"].cpu())
     if not logits_all:
         return {"brier": 1.0, "ece": 1.0, "binomial_nll": float("inf"), "pair_accuracy": 0.0}
     logits = torch.cat(logits_all)
@@ -201,7 +315,7 @@ def evaluate_value_model(model: PrefixValueModel,
             target_b = b["target"]
             pair_correct += int(((logits_a > logits_b) == (target_a > target_b)).sum().item())
             pair_total += int(logits_a.numel())
-    return {
+    result = {
         "brier": float(torch.mean((probs - targets) ** 2).item()),
         "ece": _ece(probs, targets),
         "binomial_nll": float(per_record_nll.mean().item()),
@@ -218,6 +332,16 @@ def evaluate_value_model(model: PrefixValueModel,
         },
         **_record_level_metrics(records, probs, targets, per_record_nll, observed_rate),
     }
+    if q_logits_all:
+        result.update(_q_metrics(
+            torch.cat(q_logits_all),
+            torch.cat(q_correct_all),
+            torch.cat(q_total_all),
+            torch.cat(q_mask_all),
+            temp_bins=temp_bins,
+            records=records,
+        ))
+    return result
 
 
 def _record_level_metrics(records: List[Dict[str, Any]] | None,
@@ -317,6 +441,7 @@ def train(config_path: str, parallel_size: int | None = None,
         parallel_size=parallel_size,
         gpu_memory_utilization=float(cfg["inference"].get("gpu_memory_utilization", 0.90)),
         reserve_training_gpu=True,
+        enable_prefix_caching=cfg["inference"].get("enable_prefix_caching", False),
     )
     train_cache = _load_or_build_cache(
         cfg["paths"]["train_feature_cache"], train_rows, extractor, cfg, device,
@@ -335,29 +460,36 @@ def train(config_path: str, parallel_size: int | None = None,
 
     training_cfg = cfg["prefix_value"]["training"]
     batch_size = int(training_cfg.get("batch_size", 32))
+    temp_bins = [float(x) for x in cfg["data"].get("temp_bins", [])]
+    n_temps = int(cfg["prefix_value"]["model"].get("n_temps", 0))
+    q_temp_bins = temp_bins if n_temps > 0 else None
     generator = torch.Generator().manual_seed(seed)
+    loader_kwargs = _loader_kwargs(training_cfg)
+    logger.info("dataloader_kwargs=%s", json.dumps(loader_kwargs, sort_keys=True))
     train_terminal_loader = DataLoader(
         IndexDataset(len(train_cache)), batch_size=batch_size, shuffle=True,
-        generator=generator, num_workers=0,
+        generator=generator, **loader_kwargs,
         collate_fn=partial(terminal_collate, train_cache),
     )
     train_cont_loader = DataLoader(
         IndexDataset(len(train_records)), batch_size=batch_size, shuffle=True,
-        generator=generator, num_workers=0,
-        collate_fn=partial(continuation_collate, train_by_id, train_records),
+        generator=generator, **loader_kwargs,
+        collate_fn=partial(continuation_collate, train_by_id, train_records, temp_bins=q_temp_bins),
     )
     train_rank_loader = DataLoader(
         IndexDataset(len(train_pairs)), batch_size=batch_size, shuffle=True,
-        generator=generator, num_workers=0,
-        collate_fn=partial(ranking_collate, train_by_id, train_records, train_pairs),
+        generator=generator, **loader_kwargs,
+        collate_fn=partial(ranking_collate, train_by_id, train_records, train_pairs, temp_bins=q_temp_bins),
     ) if train_pairs else None
     val_cont_loader = DataLoader(
         IndexDataset(len(val_records)), batch_size=batch_size, shuffle=False,
-        num_workers=0, collate_fn=partial(continuation_collate, val_by_id, val_records),
+        **loader_kwargs,
+        collate_fn=partial(continuation_collate, val_by_id, val_records, temp_bins=q_temp_bins),
     )
     val_rank_loader = DataLoader(
         IndexDataset(len(val_pairs)), batch_size=batch_size, shuffle=False,
-        num_workers=0, collate_fn=partial(ranking_collate, val_by_id, val_records, val_pairs),
+        **loader_kwargs,
+        collate_fn=partial(ranking_collate, val_by_id, val_records, val_pairs, temp_bins=q_temp_bins),
     ) if val_pairs else None
 
     model = PrefixValueModel(
@@ -365,9 +497,13 @@ def train(config_path: str, parallel_size: int | None = None,
         segment_size=int(cfg["data"]["segment_size"]),
         hidden_dim=int(cfg["prefix_value"]["model"]["hidden_dim"]),
         max_segments=int(cfg["prefix_value"]["model"].get("max_segments", 8192)),
+        n_temps=n_temps,
+        prompt_dim=_prompt_dim(cfg),
+        prompt_integration=_prompt_integration(cfg),
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(training_cfg.get("lr", 2e-4)))
     rank_weight = float(training_cfg.get("ranking_weight", 0.5))
+    q_weight = float(training_cfg.get("q_weight", 0.0))
     max_epochs = int(training_cfg.get("max_epochs", 50))
     patience_limit = int(training_cfg.get("early_stop_patience", 5))
 
@@ -378,13 +514,15 @@ def train(config_path: str, parallel_size: int | None = None,
         model.train()
         cont_iter = _repeat(train_cont_loader)
         rank_iter = _repeat(train_rank_loader) if train_rank_loader is not None else None
-        sums = {"total": 0.0, "terminal": 0.0, "continuation": 0.0, "ranking": 0.0}
+        sums = {"total": 0.0, "terminal": 0.0, "continuation": 0.0, "ranking": 0.0, "q": 0.0}
         steps = 0
         for terminal_batch in train_terminal_loader:
             terminal_batch = _to_device(terminal_batch, device)
             continuation_batch = _to_device(next(cont_iter), device)
-            terminal_logits = _forward_terminal(model, terminal_batch)
-            continuation_logits = _forward_terminal(model, continuation_batch)
+            terminal_output = _forward_model(model, terminal_batch)
+            continuation_output = _forward_model(model, continuation_batch)
+            terminal_logits = terminal_output["terminal_logits"]
+            continuation_logits = continuation_output["terminal_logits"]
             loss_terminal = F.binary_cross_entropy_with_logits(
                 terminal_logits, terminal_batch["target"],
             )
@@ -392,6 +530,17 @@ def train(config_path: str, parallel_size: int | None = None,
                 continuation_logits,
                 continuation_batch["n_correct"], continuation_batch["n_total"],
             )
+            loss_q = terminal_logits.new_zeros(())
+            if q_weight > 0.0:
+                q_logits = continuation_output.get("terminal_q_logits")
+                if q_logits is None:
+                    raise RuntimeError("prefix_value.training.q_weight > 0 requires prefix_value.model.n_temps > 0")
+                loss_q = masked_binomial_nll(
+                    q_logits,
+                    continuation_batch["q_n_correct"],
+                    continuation_batch["q_n_total"],
+                    continuation_batch["q_mask"],
+                )
             loss_ranking = terminal_logits.new_zeros(())
             if rank_iter is not None:
                 pair_batch = next(rank_iter)
@@ -401,7 +550,7 @@ def train(config_path: str, parallel_size: int | None = None,
                     _forward_terminal(model, a), _forward_terminal(model, b),
                     a["target"], b["target"],
                 )
-            loss = loss_continuation + loss_terminal + rank_weight * loss_ranking
+            loss = loss_continuation + loss_terminal + q_weight * loss_q + rank_weight * loss_ranking
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -410,14 +559,18 @@ def train(config_path: str, parallel_size: int | None = None,
             sums["terminal"] += float(loss_terminal.item())
             sums["continuation"] += float(loss_continuation.item())
             sums["ranking"] += float(loss_ranking.item())
+            sums["q"] += float(loss_q.item())
             steps += 1
 
-        metrics = evaluate_value_model(model, val_cont_loader, val_rank_loader, device)
+        metrics = evaluate_value_model(
+            model, val_cont_loader, val_rank_loader, device, temp_bins=q_temp_bins,
+        )
         logger.info(
-            "epoch=%d loss=%.6f terminal=%.6f continuation=%.6f ranking=%.6f val=%s",
+            "epoch=%d loss=%.6f terminal=%.6f continuation=%.6f q=%.6f ranking=%.6f val=%s",
             epoch + 1, sums["total"] / max(1, steps),
             sums["terminal"] / max(1, steps), sums["continuation"] / max(1, steps),
-            sums["ranking"] / max(1, steps), json.dumps(metrics, sort_keys=True),
+            sums["q"] / max(1, steps), sums["ranking"] / max(1, steps),
+            json.dumps(metrics, sort_keys=True),
         )
         if metrics["binomial_nll"] < best_nll:
             best_nll = metrics["binomial_nll"]
@@ -434,7 +587,7 @@ def train(config_path: str, parallel_size: int | None = None,
     calibration_temperature = fit_temperature(model, val_cont_loader, device)
     calibrated_metrics = evaluate_value_model(
         model, val_cont_loader, val_rank_loader, device, calibration_temperature,
-        records=val_records,
+        records=val_records, temp_bins=q_temp_bins,
     )
     checkpoint = {
         "prefix_value": best_state,

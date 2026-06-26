@@ -28,7 +28,7 @@ Stage 2 consumption:     make_collate_fn → online extraction via
                          segment_pooling → [K, instance_dim] instance matrix
 ```
 
-**Key design**: Features are NOT stored in JSONL. Logprob + entropy + top-k logprobs are extracted online during MIL/PPO training via `extract_from_ids` and `generate_with_features`.
+**Key design**: Features are NOT stored in JSONL. Logprob + entropy + top-k logprobs are extracted online during MIL/PPO training.  `generate_with_features` uses vLLM's `include_output_tokens` for **single-pass** extraction (hidden states + logprobs in one `llm.generate()` call).  `extract_from_ids` remains available for MIL pre-computation where pre-tokenized sequences are batch-fed.
 
 ## Segmentation modes
 
@@ -58,7 +58,10 @@ segment_feat[j] = mean(token_vec[j][start:end])  → [instance_dim]
 segment_feat = concat(token_vec[j][:segment_size]) → [segment_size × instance_dim]
 ```
 
-No information loss. Only works with `fixed_window`. Used in `pool_concat.yaml`.
+Short tail segments (< `segment_size` tokens) are zero-padded to preserve all tokens.
+Segments exceeding `segment_size` are truncated to the first N tokens.
+No information loss for segments that match the window size. Only works with
+`fixed_window`. Used in `pool_concat.yaml`.
 
 ## build_segment_obs_from_lp
 

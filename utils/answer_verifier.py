@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import re
+
 import signal
 from collections import Counter
 from contextlib import contextmanager
 from typing import Any, List, Optional
 
+import sympy
 from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
 
 
@@ -114,34 +115,31 @@ def _extract_last_dollar(text: str) -> Optional[str]:
     return None
 
 
-def _extract_last_number(text: str) -> Optional[str]:
-    """Extract the last numeric value from free text.
-
-    Matches integers, decimals, and negative numbers.
-    Returns the matched string or None.
-    """
-    matches = re.findall(r"-?\d+\.?\d*", text)
-    if matches:
-        return matches[-1]
-    return None
-
 
 def _normalize_parsed(parsed: Any) -> str:
-    """Convert a math_verify parse result into a canonical string."""
+    """Convert a math_verify parse result into a canonical string.
+
+    Uses the sympy object (parsed[0]) rather than the LaTeX string (parsed[-1])
+    because sympy auto-simplifies during construction: Rational(2,4) → Half,
+    so str(Half) = "1/2" regardless of input form.  Float decimals are converted
+    to Rational via nsimplify for consistent canonicalization with fractions.
+    """
     if parsed is None or parsed == []:
         return ""
     if isinstance(parsed, list) and len(parsed) > 0:
-        return str(parsed[-1])
+        expr = parsed[0]
+        if isinstance(expr, sympy.Float):
+            expr = sympy.nsimplify(expr, rational=True)
+        return str(expr)
     return str(parsed)
 
 
 def extract_answer(text: str) -> str | None:
     """Extract a normalized math expression from LLM-generated text.
 
-    Three-tier fallback, returning the first non-empty result:
+    Two-tier fallback, returning the first non-empty result:
     1. Last ``\\boxed{...}`` — the final boxed answer (handles nested braces).
     2. Last ``$...$`` or ``$$...$$`` — the final LaTeX math expression.
-    3. Last number (integer or decimal) — fallback for plain-text answers.
 
     Every extracted answer is normalized through ``math_verify.parse()``.
     Returns None if all extraction fails.
@@ -159,14 +157,6 @@ def extract_answer(text: str) -> str | None:
         dollar = _extract_last_dollar(text)
         if dollar is not None:
             parsed = _parse("$" + dollar + "$", strip=True)
-            result = _normalize_parsed(parsed)
-            if result:
-                return result
-
-        # Tier 3: last number
-        number = _extract_last_number(text)
-        if number is not None:
-            parsed = _parse(number, strip=True)
             result = _normalize_parsed(parsed)
             if result:
                 return result

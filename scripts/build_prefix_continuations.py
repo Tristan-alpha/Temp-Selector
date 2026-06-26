@@ -25,6 +25,11 @@ DEFAULT_TEMPERATURES = [0.1, 0.3, 0.5, 0.7, 0.9, 1.1, 1.3, 1.5]
 DEFAULT_SEEDS_PER_TEMPERATURE = 4
 
 
+def temperature_key(temperature: float) -> str:
+    """Stable JSON key for a decoding temperature."""
+    return str(float(temperature))
+
+
 def continuation_generation_seed(base_seed: int, record_idx: int, temp_idx: int,
                                  seed_index: int, n_temperatures: int,
                                  seeds_per_temperature: int) -> int:
@@ -55,6 +60,56 @@ def continuation_request_plan(n_records: int, temperatures: List[float],
                     "generation_seed": generation_seed,
                 })
     return plan
+
+
+def continuation_temperature_summary(
+    continuations: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize continuation correctness by temperature.
+
+    Ties for the oracle temperature are resolved toward the lower temperature.
+    """
+    grouped: Dict[float, Dict[str, int]] = {}
+    for item in continuations:
+        temp = float(item["temperature"])
+        entry = grouped.setdefault(temp, {"n_correct": 0, "n_total": 0})
+        entry["n_total"] += 1
+        entry["n_correct"] += int(bool(item.get("correct", False)))
+
+    per_temperature_stats: Dict[str, Dict[str, float | int]] = {}
+    rates: List[float] = []
+    for temp in sorted(grouped):
+        n_total = int(grouped[temp]["n_total"])
+        n_correct = int(grouped[temp]["n_correct"])
+        success_rate = n_correct / n_total if n_total else 0.0
+        rates.append(success_rate)
+        per_temperature_stats[temperature_key(temp)] = {
+            "n_correct": n_correct,
+            "n_total": n_total,
+            "success_rate": success_rate,
+        }
+
+    if rates:
+        best_rate = max(rates)
+        oracle_temperature = min(
+            temp for temp in grouped
+            if per_temperature_stats[temperature_key(temp)]["success_rate"] == best_rate
+        )
+        mean_rate = sum(rates) / len(rates)
+        variance = sum((rate - mean_rate) ** 2 for rate in rates) / len(rates)
+    else:
+        oracle_temperature = None
+        best_rate = None
+        mean_rate = 0.0
+        variance = 0.0
+
+    return {
+        "per_temperature_stats": per_temperature_stats,
+        "oracle_temperature": oracle_temperature,
+        "oracle_success_rate": best_rate,
+        "mean_success_rate": mean_rate,
+        "temperature_success_variance": variance,
+    }
 
 
 def _render_prompt(tokenizer, row: Dict[str, Any], system_prompt: str,
@@ -185,10 +240,12 @@ def generate_labels(config_path: str, input_path: str, output_path: str,
 
     output_rows: List[Dict[str, Any]] = []
     for spec, continuations in zip(prepared, continuation_results):
+        temperature_summary = continuation_temperature_summary(continuations)
         output_rows.append({
             **spec,
             "n_correct": sum(1 for item in continuations if item["correct"]),
             "n_total": len(continuations),
+            **temperature_summary,
             "continuations": continuations,
             "generation": {
                 "seed": seed,

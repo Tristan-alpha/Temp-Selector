@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
@@ -12,6 +13,8 @@ import yaml
 from utils.math import safe_div
 from utils.exp_logger import setup_experiment_logger
 from utils.jsonl import strip_vote_suffix
+
+logger = logging.getLogger(__name__)
 
 
 def evaluate_dataset(data_path: str) -> Dict[str, Any]:
@@ -22,8 +25,9 @@ def evaluate_dataset(data_path: str) -> Dict[str, Any]:
     temp_correct: Dict[float, int] = defaultdict(int)
     temp_individual_correct: Dict[float, int] = defaultdict(int)
 
-    # For majority voting: group by (base_id, temperature) → list of individual_correct
-    vote_groups: Dict[Tuple[str, float], List[int]] = defaultdict(list)
+    # For majority voting: group by (base_id, temperature) →
+    # (voting_label, [individual_correct, ...])
+    vote_groups: Dict[Tuple[str, float], Tuple[int, List[int]]] = {}
     has_voting = False
 
     with open(data_path, "r", encoding="utf-8") as f:
@@ -40,14 +44,16 @@ def evaluate_dataset(data_path: str) -> Dict[str, Any]:
             if voting_correct_bool:
                 temp_correct[temp] = temp_correct.get(temp, 0) + 1
 
-            individual_label = row.get("individual_label")
-            if individual_label is not None:
-                has_voting = True
-                indiv_correct = 1 - int(individual_label)  # flip: 1=correct
-                individual_correct += indiv_correct
-                temp_individual_correct[temp] = temp_individual_correct.get(temp, 0) + indiv_correct
-                base_id = strip_vote_suffix(row.get("sample_id", ""))
-                vote_groups[(base_id, temp)].append(indiv_correct)
+            individual_label = row["individual_label"]
+            has_voting = True
+            indiv_correct = 1 - int(individual_label)  # flip: 1=correct
+            individual_correct += indiv_correct
+            temp_individual_correct[temp] = temp_individual_correct.get(temp, 0) + indiv_correct
+            base_id = strip_vote_suffix(row.get("sample_id", ""))
+            key = (base_id, temp)
+            if key not in vote_groups:
+                vote_groups[key] = (voting_label, [])
+            vote_groups[key][1].append(indiv_correct)
 
     per_temp_acc = {}
     for t, cnt in sorted(temp_counts.items()):
@@ -71,14 +77,18 @@ def evaluate_dataset(data_path: str) -> Dict[str, Any]:
     if has_voting and vote_groups:
         group_labels = []
         group_indiv_accs = []
-        for (_base_id, _temp), votes in sorted(vote_groups.items()):
-            n_correct = sum(votes)
-            majority = 1 if n_correct >= (len(votes) + 1) // 2 else 0
-            group_labels.append(majority)
-            group_indiv_accs.append(n_correct / len(votes))
+        group_vote_counts = []
+        for (_base_id, _temp), (v_label, votes) in sorted(vote_groups.items()):
+            group_labels.append(1 - v_label)  # flip: 0=error,1=correct → 1=correct
+            group_indiv_accs.append(sum(votes) / len(votes))
+            group_vote_counts.append(len(votes))
 
         import numpy as np
-        num_votes_per_group = len(next(iter(vote_groups.values())))
+        # Use mode of vote counts — most groups should have the same count
+        num_votes_per_group = int(np.argmax(np.bincount(group_vote_counts))) if group_vote_counts else 0
+        if len(set(group_vote_counts)) > 1:
+            logger.warning("inconsistent vote counts across groups: %s",
+                           sorted(set(group_vote_counts)))
         result["majority_voting"] = {
             "num_votes": num_votes_per_group,
             "n_groups": len(vote_groups),

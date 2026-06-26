@@ -34,13 +34,25 @@
 
 ### Requirement: PPO validation uses fixed held-out set
 
-`train_ppo` SHALL load a fixed validation prompt set from `paths.val_dataset` at training start. After each PPO iteration, it SHALL run a val rollout on this fixed set to compute `val_value` for early stopping. It SHALL NOT use an 80/20 split of training data for validation.
+`train_ppo` SHALL load a fixed validation prompt set from `paths.val_dataset` at training start. After each PPO iteration, it SHALL run a val rollout on this fixed set to compute `val_acc` for early stopping. It SHALL NOT use an 80/20 split of training data for validation. The validation rollout SHALL use the same `generate_with_features` parameters as the training rollout (`return_logprobs=True, return_hidden=hs_needed`). The validation rollout SHALL construct segment observations via `build_segment_obs_from_lp` after each round, and SHALL select temperatures via the policy's argmax (not hardcoded T=0.7 after the first segment). It SHALL call `_decide_temperature` and `_process_generated_features` shared with the training rollout.
 
 #### Scenario: Fixed val set stable across iterations
 
 - **WHEN** PPO training runs for multiple iterations
-- **THEN** the same set of validation prompts SHALL be used for `val_value` computation
-- **AND** `val_value` SHALL only vary due to policy changes, not dataset sampling noise
+- **THEN** the same set of validation prompts SHALL be used for `val_acc` computation
+- **AND** `val_acc` SHALL only vary due to policy changes, not dataset sampling noise
+
+#### Scenario: Validation rollout uses policy for temperature after first round
+
+- **WHEN** the validation rollout runs round 2+ for an active chain
+- **THEN** it SHALL call `_decide_temperature(deterministic=True)` with the segment observation from the previous round
+- **AND** the policy's argmax SHALL determine the temperature (not a hardcoded T=0.7)
+
+#### Scenario: Validation rollout builds segment observations
+
+- **WHEN** a chain in the validation rollout has not terminated after generation
+- **THEN** it SHALL call `_process_generated_features` to build the next round's segment observation via `build_segment_obs_from_lp`
+- **AND** it SHALL store the resulting observation for the next round's temperature decision
 
 ### Requirement: Shared feature construction helper
 
@@ -88,6 +100,35 @@
 - **WHEN** `data.segment_pooling` is `"concat"` in config
 - **THEN** `train_ppo` SHALL set `obs_dim = instance_dim * segment_size`
 - **AND** `build_segment_obs_from_lp` SHALL be called with `pooling_mode="concat"`
+
+### Requirement: PPO intermediate reward is attention-based credit assignment
+
+`ppo/training.py` SHALL NOT use `mil_model` output `inst_logit` for intermediate-step shaping rewards. Instead, it SHALL call `mil_model` once per chain on the accumulated full bag of segment observations during PPO batch construction. For **incorrect** chains (`terminal_reward < 0`), it SHALL distribute the terminal reward across all decision steps proportional to L1-normalized MIL attention weights. For **correct** chains (`terminal_reward > 0`), it SHALL distribute the terminal reward uniformly across all steps. When MIL attention weights are unavailable (`mil_model is None`), both SHALL use uniform distribution. The `shaping_coef` hyperparameter SHALL NOT exist. The `mil_model` SHALL be called with `torch.no_grad()`.
+
+#### Scenario: MIL is only called during batch construction
+
+- **WHEN** PPO batch construction runs after a rollout
+- **THEN** `mil_model` SHALL be called within the batch construction loop (not the rollout loop)
+- **AND** each chain's `mil_model` call SHALL receive all accumulated segment observations as a single bag
+- **AND** the call SHALL be wrapped in `torch.no_grad()`
+
+#### Scenario: Incorrect chain uses attention weights
+
+- **WHEN** `terminal_reward = -1.0` and MIL `attn_weights = [0.5, 0.3, 0.2]` for a chain with 3 steps
+- **THEN** rewards SHALL be `[-0.5, -0.3, -0.2]`
+- **AND** the sum SHALL equal `-1.0`
+
+#### Scenario: Correct chain uses uniform weights
+
+- **WHEN** `terminal_reward = +1.0` and a chain has 4 steps
+- **THEN** each step SHALL receive `+1.0 / 4 = 0.25`
+- **AND** the sum SHALL equal `+1.0`
+
+#### Scenario: MIL unavailable, both uniform
+
+- **WHEN** `mil_model is None` and a chain has 4 steps with `terminal_reward = -1.0`
+- **THEN** each step SHALL receive `-1.0 / 4 = -0.25`
+- **AND** the sum SHALL equal `-1.0`
 
 ## REMOVED Requirements
 

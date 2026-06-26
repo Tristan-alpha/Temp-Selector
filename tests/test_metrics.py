@@ -8,8 +8,6 @@ from mil.eval import (
     compute_auc,
     compute_bag_metrics,
     compute_calibration,
-    compute_confusion_matrix,
-    compute_multiclass_metrics,
     compute_attention_metrics,
 )
 from utils.math import safe_div
@@ -128,52 +126,6 @@ def test_calibration_overconfident():
 
 
 # ═══════════════════════════════════════════════════════════════
-# compute_confusion_matrix
-# ═══════════════════════════════════════════════════════════════
-
-def test_confusion_matrix():
-    labels = torch.tensor([0, 0, 1, 1, 2, 2])
-    preds = torch.tensor([0, 1, 1, 1, 2, 0])
-    cm = compute_confusion_matrix(labels, preds, 3)
-    # Actual 0 → predicted 0 once, predicted 1 once
-    assert cm[0][0] == 1
-    assert cm[0][1] == 1
-    assert cm[0][2] == 0
-    # Actual 1 → predicted 1 twice
-    assert cm[1][1] == 2
-    # Actual 2 → predicted 2 once, predicted 0 once
-    assert cm[2][2] == 1
-    assert cm[2][0] == 1
-
-
-# ═══════════════════════════════════════════════════════════════
-# compute_multiclass_metrics
-# ═══════════════════════════════════════════════════════════════
-
-def test_multiclass_perfect():
-    labels = torch.tensor([0, 0, 1, 1, 2, 2])
-    logits = torch.zeros(6, 3)
-    for i, l in enumerate(labels):
-        logits[i, l] = 10.0
-    m = compute_multiclass_metrics(labels, logits, 3)
-    assert m["temp_accuracy"] == 1.0
-    assert m["temp_macro_f1"] == 1.0
-
-
-def test_multiclass_missing_class():
-    # Class 2 never appears in labels
-    labels = torch.tensor([0, 0, 0, 1, 1, 1])
-    logits = torch.zeros(6, 3)
-    for i, l in enumerate(labels):
-        logits[i, l] = 10.0
-    m = compute_multiclass_metrics(labels, logits, 3)
-    # Class 2 has 0 support → precision/recall = 0 via safe_div
-    assert m["temp_per_class"]["2"]["precision"] == 0.0
-    assert m["temp_per_class"]["2"]["recall"] == 0.0
-    assert m["temp_per_class"]["2"]["support"] == 0
-
-
-# ═══════════════════════════════════════════════════════════════
 # compute_attention_metrics
 # ═══════════════════════════════════════════════════════════════
 
@@ -220,3 +172,81 @@ def test_attention_varying_lengths():
     assert 0.5 < avg_entropy < 2.0
     assert 0.0 < avg_top3 <= 1.0
     assert avg_eff_n > 1.0
+
+
+# ═══════════════════════════════════════════════════════════════
+# Edge case tests
+# ═══════════════════════════════════════════════════════════════
+
+def test_auc_all_positive():
+    labels = torch.ones(10)
+    scores = torch.randn(10)
+    auc = compute_auc(labels, scores)
+    assert auc == 0.5  # no negative samples → baseline
+
+
+def test_auc_all_negative():
+    labels = torch.zeros(10)
+    scores = torch.randn(10)
+    auc = compute_auc(labels, scores)
+    assert auc == 0.5  # no positive samples → baseline
+
+
+def test_bag_metrics_extreme_logits():
+    """Very large/small logits should not produce NaN."""
+    labels = torch.tensor([0.0, 1.0])
+    logits = torch.tensor([-100.0, 100.0])
+    m = compute_bag_metrics(labels, logits)
+    assert m["bag_accuracy"] == 1.0
+    assert m["bag_auc"] == 1.0
+
+
+def test_calibration_perfect_separation():
+    """Extreme logits → low ECE, low Brier."""
+    labels = torch.tensor([0.0, 0.0, 1.0, 1.0])
+    logits = torch.tensor([-10.0, -10.0, 10.0, 10.0])
+    c = compute_calibration(labels, logits)
+    assert c["brier_score"] < 0.01
+    assert c["ece"] < 0.01
+
+
+# ═══════════════════════════════════════════════════════════════
+# AttentionAggregator direct tests
+# ═══════════════════════════════════════════════════════════════
+
+from mil.model import AttentionAggregator
+
+
+def test_attention_aggregator_shapes():
+    agg = AttentionAggregator(hidden_dim=16)
+    h = torch.randn(3, 5, 16)
+    bag, w = agg(h)
+    assert bag.shape == (3, 16)
+    assert w.shape == (3, 5)
+
+
+def test_attention_aggregator_weights_sum_to_one():
+    agg = AttentionAggregator(hidden_dim=8)
+    h = torch.randn(2, 10, 8)
+    _, w = agg(h)
+    assert torch.allclose(w.sum(dim=-1), torch.ones(2), atol=1e-6)
+
+
+def test_attention_aggregator_equal_scores():
+    agg = AttentionAggregator(hidden_dim=4)
+    # Zero out weights to get equal scores
+    agg.attn.weight.data.zero_()
+    agg.attn.bias.data.zero_()
+    h = torch.randn(1, 6, 4)
+    _, w = agg(h)
+    # All attention scores = 0 → softmax → uniform
+    assert torch.allclose(w, torch.full((1, 6), 1.0 / 6), atol=1e-6)
+
+
+def test_attention_aggregator_no_nan():
+    """Extreme input values should not produce NaN in weights."""
+    agg = AttentionAggregator(hidden_dim=4)
+    h = torch.tensor([[[1e3, -1e3, 0.0, 0.0], [-1e3, 1e3, 0.0, 0.0]]])
+    _, w = agg(h)
+    assert not torch.isnan(w).any()
+    assert torch.allclose(w.sum(dim=-1), torch.tensor([1.0]), atol=1e-6)

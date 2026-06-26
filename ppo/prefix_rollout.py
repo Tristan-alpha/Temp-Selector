@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -11,7 +12,11 @@ import torch
 from features.segmenter import batch_build_masked_concat_segment_obs_from_lp
 from mil.prefix_value import PrefixRecurrentState, PrefixValueModel, calibrated_probability, potential_reward
 from ppo.model import PrefixPolicyValueNet, sample_action
-from utils.answer_verifier import self_consistency_correct, verify_answer
+from utils.answer_verifier import extract_answer, verify_answer, verify_answer_by_value
+from utils.calibration import answer_entropy
+
+
+NO_ANSWER = "<NO_ANSWER>"
 
 
 @dataclass
@@ -36,6 +41,11 @@ class PrefixRolloutResult:
     majority_correct: List[int]
     individual_correct: List[List[int]]
     generated: List[List[str]]
+    extracted_answers: List[List[str]]
+    majority_answers: List[str]
+    majority_counts: List[int]
+    sc_confidences: List[float]
+    answer_entropies: List[float]
     temperatures: List[List[float]]
     segment_counts: List[List[int]]
     token_counts: List[List[int]]
@@ -77,7 +87,8 @@ class PrefixRolloutEngine:
                 stochastic: bool, rng: random.Random,
                 collect_transitions: bool = True,
                 generation_seed: int | None = None,
-                fixed_temperature: float | None = None) -> PrefixRolloutResult:
+                fixed_temperature: float | None = None,
+                random_temperature: bool = False) -> PrefixRolloutResult:
         n_prompts = len(prompts_data)
         votes = self.num_votes
         rendered = [self._render(str(p.get("question", p.get("prompt", "")))) for p in prompts_data]
@@ -93,6 +104,7 @@ class PrefixRolloutEngine:
         transitions: List[List[List[PrefixTransition]]] = [
             [[] for _ in range(votes)] for _ in range(n_prompts)
         ]
+        use_prompt_hidden = int(getattr(self.value_model, "prompt_dim", 0)) > 0
 
         max_rounds = max(1, (self.max_new_tokens + self.segment_size - 1) // self.segment_size)
         for segment_idx in range(max_rounds):
@@ -107,6 +119,9 @@ class PrefixRolloutEngine:
                     round_prompts.append(rendered[i] + generated[i][vote])
                     if fixed_temperature is not None:
                         temperature = float(fixed_temperature)
+                        decision = None
+                    elif random_temperature:
+                        temperature = float(rng.choice(self.temp_bins))
                         decision = None
                     elif hidden_obs[i][vote] is None:
                         temperature = 0.7
@@ -140,6 +155,7 @@ class PrefixRolloutEngine:
                 round_prompts, round_temps, self.segment_size,
                 top_k=self.top_k_logprobs,
                 return_logprobs=True, return_hidden=False,
+                return_prompt_hidden=use_prompt_hidden,
                 device=self.device,
                 seeds=[
                     (generation_seed + segment_idx * n_prompts * votes + i * votes + vote)
@@ -152,6 +168,7 @@ class PrefixRolloutEngine:
             lp_tensors: List[torch.Tensor] = []
             token_lists: List[List[str]] = []
             texts: List[str] = []
+            prompt_hiddens: List[torch.Tensor] = []
             done_flags: List[bool] = []
             for pos, ((i, vote), item) in enumerate(zip(round_map, features)):
                 generated[i][vote] += item["text"]
@@ -169,6 +186,11 @@ class PrefixRolloutEngine:
                     lp_tensors.append(item["logprobs"])
                     token_lists.append(item["tokens"])
                     texts.append(item["text"])
+                    if use_prompt_hidden:
+                        prompt_hidden = item.get("prompt_hidden")
+                        if prompt_hidden is None:
+                            raise RuntimeError("prompt-aware PVM rollout requires prompt_hidden")
+                        prompt_hiddens.append(prompt_hidden)
 
             masked_list = batch_build_masked_concat_segment_obs_from_lp(
                 lp_tensors, token_lists, texts,
@@ -176,6 +198,9 @@ class PrefixRolloutEngine:
                 device=self.device, segment_mode="fixed_window",
             ) if lp_tensors else []
             position_to_masked = dict(zip(valid_positions, masked_list))
+            position_to_prompt_hidden = (
+                dict(zip(valid_positions, prompt_hiddens)) if use_prompt_hidden else {}
+            )
 
             # Active chains in the same generation round share a prefix position.
             step_positions = [pos for pos in valid_positions]
@@ -191,9 +216,14 @@ class PrefixRolloutEngine:
                     i, vote = round_map[pos]
                     state = states[i][vote]
                     if state is None:
-                        hidden_parts.append(torch.zeros(
-                            1, 1, self.value_model.hidden_dim, device=self.device,
-                        ))
+                        if use_prompt_hidden:
+                            hidden_parts.append(self.value_model.initial_hidden(
+                                position_to_prompt_hidden[pos].unsqueeze(0).to(self.device)
+                            ))
+                        else:
+                            hidden_parts.append(torch.zeros(
+                                1, 1, self.value_model.hidden_dim, device=self.device,
+                            ))
                     else:
                         hidden_parts.append(state.hidden.to(self.device))
                 hidden = torch.cat(hidden_parts, dim=1)
@@ -228,10 +258,31 @@ class PrefixRolloutEngine:
 
         majority_correct: List[int] = []
         individual_correct: List[List[int]] = []
+        extracted_answers: List[List[str]] = []
+        majority_answers: List[str] = []
+        majority_counts: List[int] = []
+        sc_confidences: List[float] = []
+        answer_entropies: List[float] = []
         for i in range(n_prompts):
-            majority = int(self_consistency_correct(generated[i], gold[i]))
+            answers = [
+                answer if (answer := extract_answer(text)) is not None else NO_ANSWER
+                for text in generated[i]
+            ]
+            counts = Counter(answers)
+            majority_answer, majority_count = (
+                counts.most_common(1)[0] if counts else (NO_ANSWER, 0)
+            )
+            majority = int(
+                majority_answer != NO_ANSWER and
+                verify_answer_by_value(majority_answer, gold[i])
+            )
             majority_correct.append(majority)
             individual_correct.append([int(verify_answer(text, gold[i])) for text in generated[i]])
+            extracted_answers.append(answers)
+            majority_answers.append(str(majority_answer))
+            majority_counts.append(int(majority_count))
+            sc_confidences.append(float(majority_count / max(1, len(generated[i]))))
+            answer_entropies.append(answer_entropy(answers))
             for vote in range(votes):
                 vote_correct = int(individual_correct[i][vote])
                 terminal = 1.0 if vote_correct else -1.0
@@ -256,6 +307,11 @@ class PrefixRolloutEngine:
             majority_correct=majority_correct,
             individual_correct=individual_correct,
             generated=generated,
+            extracted_answers=extracted_answers,
+            majority_answers=majority_answers,
+            majority_counts=majority_counts,
+            sc_confidences=sc_confidences,
+            answer_entropies=answer_entropies,
             temperatures=temperatures,
             segment_counts=segment_counts,
             token_counts=token_counts,

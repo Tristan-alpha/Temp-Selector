@@ -1,0 +1,31 @@
+experiment:
+  repo_root: /home/data/nas_hdd/dazhou/Confident-Decoding
+  name: latent_opportunity_reuse_trace
+
+inputs:
+  traces: pvm_value/runs/value_lens_pilot_20260625_121044/layer_traces.jsonl
+  targets: pvm_value/runs/value_lens_pilot_20260625_121044/value_targets.jsonl
+
+model:
+  name_or_path: /home/data/nas_hdd/jiaxuan/ckpt_ada2/Qwen3-8B
+
+pvm_teacher:
+  tf_mil_root: /home/data/nas_hdd/dazhou/tf-mil
+  checkpoint: pvm_value_head.pt
+  top_k: 64
+  batch_size: 32
+  parallel_size: 1
+  gpu_memory_utilization: 0.70
+  enable_prefix_caching: false
+
+analysis:
+  prefix_score_source: teacher
+  delta_thresholds: [0.0, 0.01, 0.03, 0.05, 0.10]
+  default_delta: 0.0
+  temperatures: [0.0, 0.2, 0.4, 0.7, 1.0]
+  num_bootstrap: 1000
+  seed: 42
+  score_tolerance: 0.000001
+
+outputs:
+  run_dir: ""

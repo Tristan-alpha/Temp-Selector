@@ -3,7 +3,7 @@
 from utils.answer_verifier import (
     _extract_brace_content,
     _extract_last_dollar,
-    _extract_last_number,
+    _normalize_parsed,
     extract_answer,
     extract_final_answer,
     verify_answer,
@@ -75,58 +75,35 @@ def test_dollar_no_match():
     assert _extract_last_dollar("no math here") is None
 
 
-# ═══════════════════════  unit: _extract_last_number  ═══════════════════════
-
-def test_number_integer():
-    assert _extract_last_number("the answer is 42") == "42"
-
-
-def test_number_negative():
-    assert _extract_last_number("result is -3.5 today") == "-3.5"
-
-
-def test_number_decimal():
-    assert _extract_last_number("total: .5 and 3.14") == "3.14"
-
-
-def test_number_multiple():
-    """Last number wins."""
-    assert _extract_last_number("x=7, y=42") == "42"
-
-
-def test_number_no_match():
-    assert _extract_last_number("no numbers here") is None
-
-
 # ═══════════════════════  unit: extract_answer tiers  ═══════════════════════
 
 def test_extract_tier1_boxed_nested_frac():
     """Tier 1: last \\boxed{} with nested braces."""
     ans = extract_answer(r"\boxed{7} then \boxed{\frac{1}{2}}")
-    assert ans == r"\frac{1}{2}"
+    assert ans == "1/2"
 
 
 def test_extract_tier1_boxed_simple():
     ans = extract_answer(r"the answer is \boxed{x+2}")
-    assert ans == "x+2"
+    assert ans == "x + 2"
 
 
 def test_extract_tier2_dollar():
     """Tier 2: fallback to $...$ when no \\boxed{}."""
     ans = extract_answer("solve $x+2$ please")
-    assert ans == "x+2"
+    assert ans == "x + 2"
 
 
 def test_extract_tier2_dollar_display():
     """Tier 2: $$...$$ display math."""
     ans = extract_answer(r"therefore $$\frac{1}{2}$$ is the answer")
-    assert ans == r"\frac{1}{2}"
+    assert ans == "1/2"
 
 
 def test_extract_tier3_number():
-    """Tier 3: fallback to last number when no LaTeX at all."""
+    """Plain text without boxed or dollar returns None (no number fallback)."""
     ans = extract_answer("the answer is 42")
-    assert ans == "42"
+    assert ans is None
 
 
 def test_extract_boxed_over_dollar():
@@ -138,7 +115,7 @@ def test_extract_boxed_over_dollar():
 def test_extract_dollar_over_number():
     """$...$ has priority over bare number."""
     ans = extract_answer("the number 7 but $x+2$ gives answer")
-    assert ans == "x+2"
+    assert ans == "x + 2"
 
 
 def test_extract_empty_text():
@@ -191,10 +168,10 @@ def test_sc_mode_differs_from_gold():
 
 
 def test_sc_plain_text_numbers():
-    """Tier 3 extraction: plain numbers."""
+    """Plain-text numbers without boxed/dollar → no extraction → False."""
     assert self_consistency_correct(
         ["The answer is 7", "I got 7", "7", "Maybe 5"], "7"
-    ) is True
+    ) is False
 
 
 def test_sc_mixed_boxed_and_plain():
@@ -216,6 +193,29 @@ def test_sc_all_empty_extraction():
     assert self_consistency_correct(
         ["gibberish", "nonsense", "blah"], "3"
     ) is False
+
+
+def test_sc_equivalent_fractions_bucket_together():
+    """\\boxed{1/2} and \\boxed{2/4} count in same bucket via sympy normalization."""
+    assert self_consistency_correct(
+        [r"\boxed{\frac{1}{2}}", r"\boxed{2/4}", r"\boxed{0.5}", r"\boxed{\frac{1}{2}}"], "1/2"
+    ) is True
+
+
+def test_sc_decimal_normalized_to_rational():
+    """\\boxed{0.50} normalizes to 1/2 via nsimplify, buckets with fraction."""
+    assert self_consistency_correct(
+        [r"\boxed{0.50}", r"\boxed{1/2}", r"\boxed{1/2}"], "1/2"
+    ) is True
+
+
+def test_sc_mixed_equivalent_forms():
+    """Mixed equivalent answers (fraction, decimal, percent-ish) bucket together."""
+    assert self_consistency_correct(
+        [r"\boxed{1/2}", r"\boxed{2/4}", r"\boxed{0.5}", r"\boxed{\frac{1}{2}}",
+         r"\boxed{1/2}", r"\boxed{2/4}", r"\boxed{0.5}", r"\boxed{\frac{1}{2}}"],
+        r"\frac{1}{2}",
+    ) is True
 
 
 # ═══════════════════════  unit: verify_answer  ═══════════════════════
@@ -255,3 +255,74 @@ def test_extract_final_answer_last_wins():
 
 def test_extract_final_answer_no_boxed():
     assert extract_final_answer("no answer here") is None
+
+
+# ═══════════════════════  unit: _normalize_parsed  ═══════════════════════
+
+def test_normalize_parsed_float_to_rational():
+    """sympy.Float(0.3333333333) → nsimplify(rational=True) → "1/3"."""
+    import sympy
+    f = sympy.Float(0.3333333333)
+    parsed = [f, ""]
+    result = _normalize_parsed(parsed)
+    assert result == "1/3", f"Expected '1/3', got {result!r}"
+
+
+def test_normalize_parsed_float_one_half():
+    """sympy.Float(0.5) → "1/2"."""
+    import sympy
+    f = sympy.Float(0.5)
+    parsed = [f, ""]
+    result = _normalize_parsed(parsed)
+    assert result == "1/2", f"Expected '1/2', got {result!r}"
+
+
+def test_normalize_parsed_rational_unchanged():
+    """sympy Rational is returned as-is by str()."""
+    import sympy
+    r = sympy.Rational(2, 4)  # auto-simplifies to 1/2
+    parsed = [r, ""]
+    result = _normalize_parsed(parsed)
+    assert result == "1/2"
+
+
+def test_normalize_parsed_none_or_empty():
+    """None or empty parsed → empty string."""
+    assert _normalize_parsed(None) == ""
+    assert _normalize_parsed([]) == ""
+
+
+# ═══════════════════════  self_consistency: decimal-only  ══════════════
+
+def test_sc_all_decimals_canonicalize():
+    """All responses are decimal \\boxed{...} — canonicalize then majority vote."""
+    # 0.50 → 1/2, 0.5 → 1/2; all three bucket to "1/2" → match gold
+    assert self_consistency_correct(
+        [r"\boxed{0.50}", r"\boxed{0.5}", r"\boxed{0.50}"], "1/2"
+    ) is True
+
+
+def test_sc_all_decimals_wrong():
+    """All decimal responses, but the majority is wrong."""
+    assert self_consistency_correct(
+        [r"\boxed{0.333}", r"\boxed{0.333}", r"\boxed{0.5}"], "1/2"
+    ) is False
+
+
+def test_sc_decimal_majority():
+    """Majority is decimal form — must canonicalize to match fractions."""
+    # Four responses: 3 × 0.5 (→ "1/2"), 1 × 1/3 (→ "1/3")
+    # Mode is "1/2" which matches gold
+    assert self_consistency_correct(
+        [r"\boxed{0.5}", r"\boxed{0.5}", r"\boxed{0.5}", r"\boxed{\frac{1}{3}}"],
+        r"\frac{1}{2}",
+    ) is True
+
+
+def test_sc_repeating_decimal():
+    """Repeating decimal 0.(3) → should normalize to 1/3 if sympy handles it."""
+    # math_verify.parse("0.3333333333") may parse as Float.
+    # After nsimplify(rational=True), it should become 1/3.
+    assert self_consistency_correct(
+        [r"\boxed{0.3333333333}", r"\boxed{1/3}", r"\boxed{1/3}"], "1/3"
+    ) is True

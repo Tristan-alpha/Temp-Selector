@@ -21,6 +21,12 @@ STATUS_GRACE_SECONDS=${STATUS_GRACE_SECONDS:-120}
 mkdir -p "$LOG_ROOT" "$RESULT_ROOT"
 MASTER_LOG="${LOG_ROOT}/${RUN_NAME}.watch_then_eval.log"
 EVAL_LOG="${LOG_ROOT}/${RUN_NAME}.prefix_eval.log"
+EXTRA_EVAL_ARGS_STRING=${EXTRA_EVAL_ARGS:-}
+EXTRA_EVAL_ARGS_ARRAY=()
+if [[ -n "$EXTRA_EVAL_ARGS_STRING" ]]; then
+    # shellcheck disable=SC2206
+    EXTRA_EVAL_ARGS_ARRAY=($EXTRA_EVAL_ARGS_STRING)
+fi
 
 log() {
     echo "[$(date --iso-8601=seconds)] $*" | tee -a "$MASTER_LOG"
@@ -96,6 +102,7 @@ export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 log "eval_start config=${CONFIG} seed=${SEED} gpu_devices=${GPU_DEVICES} parallel_size=${PARALLEL_SIZE}"
 log "eval_output=${OUTPUT}"
 log "eval_log=${EVAL_LOG}"
+log "extra_eval_args=${EXTRA_EVAL_ARGS_STRING:-none}"
 
 set +e
 CUDA_VISIBLE_DEVICES="$GPU_DEVICES" python -m ppo.prefix_eval \
@@ -105,6 +112,7 @@ CUDA_VISIBLE_DEVICES="$GPU_DEVICES" python -m ppo.prefix_eval \
     --output "$OUTPUT" \
     --run-name "$RUN_NAME" \
     --log-dir "$LOG_ROOT" \
+    "${EXTRA_EVAL_ARGS_ARRAY[@]}" \
     > "$EVAL_LOG" 2>&1
 STATUS=$?
 set -e

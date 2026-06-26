@@ -6,7 +6,8 @@
       "Bash(openspec status *)",
       "Bash(openspec instructions *)",
       "WebFetch(domain:arxiv.org)",
-      "Skill(opsx:archive)"
+      "Skill(opsx:archive)",
+      "Bash(openspec list *)"
     ]
   }
 }

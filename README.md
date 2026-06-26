@@ -1,133 +1,104 @@
-# tf-mil — Temperature Framework with Multiple Instance Learning
+# prefix-value-pipeline branch
 
-Dynamic temperature selection for LLM math reasoning.  MIL learns to localise errors in reasoning chains; PPO learns to pick the right temperature per step to maximise majority-vote correctness.
+This branch extends the main `tf-mil` pipeline with a Prefix Value Model (PVM)
+for causal, prefix-level temperature control. It is meant to document the delta
+from the main branch, not to repeat the baseline project overview.
 
-Detailed methodology: **[PIPELINE.md](PIPELINE.md)**.
+For the original project structure and baseline dynamic-temperature workflow,
+see the main branch documentation and `PIPELINE.md`.
 
-## Directory structure
+## What changed from `main`
 
-```
-tf-mil/
-├── configs/
-│   ├── dataset/                # Dataset generation configs (paths, inference, split)
-│   └── training/               # MIL + PPO training configs (data, mil, ppo, inference)
-├── data/                       # Raw prompt JSONL
-├── datasets/                   # Processed datasets
-├── checkpoints/                # Model weights
-├── features/                   # Segmentation + feature construction
-│   ├── schema.py               # Segment dataclass
-│   ├── segmenter.py            # Segmentation strategies, segment_pooling, build_segment_obs_from_lp
-│   ├── vectorizer.py           # token_to_vec, token_to_obs, mean_pool_obs, compute_entropy
-│   └── dataset_eval.py         # per-temperature accuracy, majority-voting analysis
-├── inference/
-│   └── vllm_runner.py          # VLLMFeatureExporter: generation + online feature extraction
-├── mil/                        # Stage 2 — MIL error localization
-│   ├── model.py                # MILModel + auxiliary temperature heads
-│   ├── utils.py                # BagDataset, TokenBatchSampler, make_collate_fn
-│   ├── training.py             # train() + training loop
-│   └── eval.py                 # evaluate_mil() + all MIL metric functions
-├── ppo/                        # Stage 3 — online PPO training
-│   ├── model.py                # PolicyValueNet, GAE, MIL warm-start
-│   ├── training.py             # train_ppo() + online feature extraction
-│   └── eval.py                 # OnlineTemperatureEvaluator
-├── utils/                      # Shared infrastructure
-│   ├── math.py                 # safe_div
-│   ├── answer_verifier.py      # math-verify wrapper
-│   ├── jsonl.py                # JSONL helpers (load/write/split/sample)
-│   └── exp_logger.py           # file + stream logging
-├── scripts/
-│   ├── run_pipeline.sh         # Orchestrator (STAGES env var)
-│   └── build_dataset.py        # Stage 1 entry: vLLM generation + majority voting
-├── tests/                      # CPU-only tests
-└── logs/                       # run logs
-```
+The main branch trains MIL to localize error-prone reasoning segments, then uses
+PPO to choose generation temperatures online. This branch keeps that baseline
+available, but adds a prefix-value path:
 
-## Quick start
+1. Build prefix examples from partial reasoning chains.
+2. Label each prefix with continuation outcomes across candidate temperatures.
+3. Train a causal Prefix Value Model over segment-level hidden states.
+4. Use the PVM state and calibrated value differences to guide PPO temperature
+   choices during online rollout.
+
+The key difference is the training target. The main branch learns from completed
+responses and segment-level error localization. This branch additionally learns
+the expected downstream value of a partial prefix, so temperature selection can
+condition on the current reasoning state before the answer is finished.
+
+## Prefix Value Model
+
+The PVM is implemented as a mask-aware causal recurrent model. It consumes
+prefix segment features and predicts whether continuing from the current prefix
+is likely to lead to a correct majority-vote answer.
+
+Important entry points:
+
+| Area | Files |
+|---|---|
+| Prefix dataset construction | `mil/prefix_data.py` |
+| PVM architecture | `mil/prefix_value.py` |
+| PVM training and calibration | `mil/value_training.py` |
+| PVM evaluation | `mil/value_eval.py` |
+| Prefix PPO training | `ppo/prefix_training.py` |
+| Prefix online rollout | `ppo/prefix_rollout.py` |
+| Prefix PPO evaluation | `ppo/prefix_eval.py` |
+
+## Experiment configs
+
+The branch includes configs for both the full prefix-value path and smaller
+single-seed evidence runs.
+
+| Config | Purpose |
+|---|---|
+| `configs/training/full_prefix_value_500.yaml` | Full 500-problem PVM + PPO experiment |
+| `configs/training/full_prefix_value_500_ppo_smoke_mb128.yaml` | PPO smoke variant for the full config |
+| `configs/training/min_pvm_ppo_500_seed42.yaml` | Minimal single-seed PVM + PPO evidence path |
+| `configs/training/min_pvm_q_500_seed42.yaml` | Prefix-Q selector extension |
+
+Local timestamped configs may exist for follow-up runs. They are experiment
+snapshots, not the canonical branch interface.
+
+## Typical commands
+
+Train the Prefix Value Model:
 
 ```bash
-# 1. Generate dataset (raw vLLM, no speculative decode)
-CUDA_VISIBLE_DEVICES=0,1 python scripts/build_dataset.py --config configs/dataset/full.yaml
-
-# 2. Training + evaluation pipeline
-GPU_DEVICES=0,1 bash scripts/run_pipeline.sh
-
-# Run a specific ablation config
-CONFIG=configs/training/arch_mlp_only.yaml GPU_DEVICES=0,1 bash scripts/run_pipeline.sh
+CUDA_VISIBLE_DEVICES=0 python -m mil.value_training \
+  --config configs/training/full_prefix_value_500.yaml
 ```
 
-## Config variants
+Run prefix PPO:
 
-| Config | What it tests |
-|---|---|
-| `base.yaml` | fixed_window 512, mean pooling, GRU + pos encoding, pure MIL (k=1) |
-| `step_control.yaml` | step segmentation (double-newline boundaries) vs fixed_window |
-| `pool_concat.yaml` | concatenation pooling (2048-dim, no information loss) |
-| `arch_mlp_only.yaml` | pure MLP — no position encoding, no GRU |
-| `temp_heads.yaml` | temperature classification heads enabled (alpha = 0.1) |
-| `instance_soft_pseudo_label.yaml` | soft pseudo-label instance loss (SeLa-MIL) |
-| `instance_contrastive.yaml` | contrastive instance loss (NDI-MIL) |
-| `ppo_control.yaml` | PPO terminal reward only (shaping_coef=0) |
-| `hidden_states.yaml` | Qwen3-8B hidden states as features (4096-dim) |
-| `legacy_concat_500.yaml` | Reproduce the previous 500-problem concat experiment |
-| `full_prefix_value_500.yaml` | Mask-aware causal prefix value + ranking + potential PPO |
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m ppo.prefix_training \
+  --config configs/training/full_prefix_value_500.yaml
+```
 
-## Full prefix-value experiment
+Evaluate prefix PPO online:
 
-The complete proposal keeps the original 500-problem, 60,000-trajectory split
-and compares the legacy concat pipeline against a mask-aware causal Prefix
-Value Model. Prefix labels use eight continuation temperatures, ranking pairs
-stay within the same problem, and PPO receives calibrated potential differences.
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m ppo.prefix_eval \
+  --config configs/training/full_prefix_value_500.yaml
+```
+
+Run the legacy-vs-prefix comparison helper when the required artifacts are
+already prepared:
 
 ```bash
 GPU_DEVICES=0,1 bash scripts/run_legacy_full_comparison.sh
 ```
 
-The script validates the 400/50/50 problem split, evaluates seeds 42/43/44,
-and writes `results/legacy_vs_full.json` plus a Markdown comparison table.
+## How to compare with `main`
 
-## Running individual stages
+Use the main branch as the baseline for the MIL warm-start and online PPO
+workflow. Use this branch when evaluating whether prefix-derived values improve
+temperature decisions.
 
-```bash
-# Stage 1 — build dataset
-CUDA_VISIBLE_DEVICES=0,1 python scripts/build_dataset.py --config configs/dataset/full.yaml
+For fair comparisons:
 
-# Stage 2 — train MIL
-CUDA_VISIBLE_DEVICES=0 python -m mil.training --config configs/training/base.yaml
-
-# Stage 2 — evaluate MIL
-python -m mil.eval --config configs/training/base.yaml
-
-# Stage 3 — online PPO
-CUDA_VISIBLE_DEVICES=0,1 python -m ppo.training --config configs/training/base.yaml
-
-# Stage 3 — online evaluation (PPO vs best-fixed vs random)
-CUDA_VISIBLE_DEVICES=0,1 python -m ppo.eval --config configs/training/base.yaml
-```
-
-## Pipeline stages
-
-```
-build → mil → eval → ppo → eval_ol
-          ↑
-    MIL assessment before PPO
-```
-
-- **Stage 1** — Raw vLLM generates all responses at 15 temperatures (APC shares prompt KV-cache). Outputs `individual_label` (per-response correctness, for MIL) and `voting_label` (majority-vote result, for PPO bias). Both use 0=correct, 1=error.
-- **Stage 2** — MIL learns to localise errors via always-on online feature extraction. `inst_head` output becomes PPO shaping reward; encoder weights warm-start PPO backbone.
-- **Stage 3** — Policy controls vLLM generation temperature segment-by-segment. Majority-vote terminal reward + MIL shaping reward. PPO clip update.
-
-## Key design decisions
-
-1. **Split labels** — `individual_label` for MIL (per-response error signal), `voting_label` for PPO bias (majority-vote result). Code uses inline comments instead of "flipped" warnings.
-2. **Online feature extraction** — Logprobs and hidden states extracted during training via `extract_from_ids`, never stored in JSONL.
-3. **Always-on speculative decode** — `_lazy_init` always configures extract_hidden_states for vLLM.
-4. **Online PPO** — Offline data cannot learn causal action→reward; the policy must truly control generation.
-5. **Majority voting end-to-end** — Stage 1 labels, PPO terminal reward, and online evaluation all use the same criterion.
-
-## Tests
-
-```bash
-python -m pytest tests/ -v
-```
-
-CPU-only, 133 tests.
+- Keep the same prompt split and vote count.
+- Compare against fixed-temperature and legacy PPO baselines under the same
+  code revision when possible.
+- Report prompt-level majority accuracy separately from per-vote individual
+  accuracy.
+- Treat single-seed runs as implementation evidence; use the 42/43/44 seed
+  flow before making stability claims.

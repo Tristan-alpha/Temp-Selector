@@ -40,13 +40,21 @@ reward = +1.0 if majority_vote_correct else -1.0
 
 Self-consistency majority voting over `num_votes` completions.
 
-### Shaping reward (intermediate steps)
+### Attention-weighted reward (all steps)
 
 ```
-reward = shaping_coef × (1 − sigmoid(inst_logit))
+# Incorrect chains: attention-weighted (MIL localizes errors)
+weights = attn_w / attn_w.sum()              # L1-normalize MIL attention
+reward[t] = terminal_reward × weights[t]
+
+# Correct chains + no-MIL fallback: uniform
+reward[t] = terminal_reward / n_steps
 ```
 
-`inst_logit` from pre-trained MIL model. Default `shaping_coef = 0.15`.
+Reward is asymmetric: MIL attention weights only apply to incorrect chains
+where they provide meaningful error-localization signal.  Correct chains use
+uniform distribution — no segment is "more correct" than another.  One MIL call
+per incorrect chain on the full accumulated bag during batch construction.
 
 ## PPO architecture
 

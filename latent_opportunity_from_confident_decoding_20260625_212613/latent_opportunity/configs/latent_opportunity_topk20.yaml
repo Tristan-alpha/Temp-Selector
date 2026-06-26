@@ -1,0 +1,45 @@
+experiment:
+  repo_root: /home/data/nas_hdd/dazhou/Confident-Decoding
+  name: latent_opportunity_topk20_followup
+
+# This config preserves the full top_k=20 path. First collect a matching
+# trace/target pair with the existing pvm_value scripts, then point inputs below
+# at that run and execute latent_opportunity/scripts/run_reuse_trace.sh.
+collection:
+  source_jsonl: /home/data/nas_hdd/dazhou/tf-mil/datasets/all_5_sub_200.jsonl
+  model_name_or_path: /home/data/nas_hdd/jiaxuan/ckpt_ada2/Qwen3-8B
+  pvm_checkpoint: pvm_value_head.pt
+  last_k: 8
+  top_k: 20
+  teacher_top_k: 64
+  suggested_command: |
+    TOP_K=20 LAST_K=8 RUN_DIR=/home/data/nas_hdd/dazhou/Confident-Decoding/pvm_value/runs/value_lens_topk20_$(date +%Y%m%d_%H%M%S) \
+      bash /home/data/nas_hdd/dazhou/Confident-Decoding/pvm_value/scripts/run_value_lens_pilot.sh
+
+inputs:
+  traces: pvm_value/runs/value_lens_topk20_PLACEHOLDER/layer_traces.jsonl
+  targets: pvm_value/runs/value_lens_topk20_PLACEHOLDER/value_targets.jsonl
+
+model:
+  name_or_path: /home/data/nas_hdd/jiaxuan/ckpt_ada2/Qwen3-8B
+
+pvm_teacher:
+  tf_mil_root: /home/data/nas_hdd/dazhou/tf-mil
+  checkpoint: pvm_value_head.pt
+  top_k: 64
+  batch_size: 32
+  parallel_size: 1
+  gpu_memory_utilization: 0.70
+  enable_prefix_caching: false
+
+analysis:
+  prefix_score_source: teacher
+  delta_thresholds: [0.0, 0.01, 0.03, 0.05, 0.10]
+  default_delta: 0.0
+  temperatures: [0.0, 0.2, 0.4, 0.7, 1.0]
+  num_bootstrap: 1000
+  seed: 42
+  score_tolerance: 0.000001
+
+outputs:
+  run_dir: ""

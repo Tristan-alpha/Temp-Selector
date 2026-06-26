@@ -11,7 +11,8 @@ class _ChunkingExporter(VLLMFeatureExporter):
 
     def _generate_with_features_once(
         self, prompts, temperatures, segment_size, top_k=4096,
-        return_logprobs=False, return_hidden=False, device=None, seeds=None,
+        return_logprobs=False, return_hidden=False, return_prompt_hidden=False,
+        device=None, seeds=None,
     ):
         self.calls.append((list(prompts), list(temperatures), None if seeds is None else list(seeds)))
         return [

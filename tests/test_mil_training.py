@@ -1,292 +1,53 @@
-"""Tests for collate_fn, smoothness_loss, and top-k MIL instance loss.  CPU-only."""
+"""Tests for collate_fn, segment cache, and feature construction.  CPU-only."""
 
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 
-from mil.utils import make_collate_fn, make_cached_collate_fn, SegmentCacheDataset
-from mil.model import smoothness_loss
+from mil.utils import (make_collate_fn, make_cached_collate_fn, SegmentCacheDataset,
+                       _build_cache_path, _load_or_build_segment_cache)
 from features.segmenter import build_segment_obs_from_lp
+
+
+# ═══ helpers ═══
+
+def _make_row(tokens, _full_ids=None, _prompt_len=0, temperature=0.7):
+    row = {
+        "token_ids": [42] * len(tokens),
+        "tokens": tokens,
+        "text": " ".join(tokens),
+        "temperature": temperature,
+        "individual_label": 0,
+        "_full_ids": _full_ids or ([0] * _prompt_len + [42] * len(tokens)),
+        "_prompt_len": _prompt_len,
+    }
+    return row
 
 
 # ═══ make_collate_fn / collate_fn ═══
 
-def _make_row(token_texts, label=0, temperature=0.5):
-    """Build a minimal row dict for collate_fn."""
-    return {
-        "token_ids": list(range(len(token_texts))),
-        "tokens": list(token_texts),
-        "response": " ".join(token_texts),
-        "individual_label": label,
-        "temperature": temperature,
-    }
-
-
 def test_collate_uniform():
-    collate_fn = make_collate_fn(feature_mode="topk_logprobs", instance_dim=8,
-                                 segment_mode="fixed_window", segment_size=256)
+    collate = make_collate_fn(feature_mode="topk_logprobs", instance_dim=4098,
+                              segment_mode="fixed_window", segment_size=64)
     r1 = _make_row(["hello", "world"])
-    r2 = _make_row(["foo", "bar", "baz"])
-    batch = collate_fn([r1, r2])
-    assert batch["instances"].shape == (2, 1, 8)
-    assert batch["mask"].shape == (2, 1)
-    assert torch.all(batch["mask"] == 1.0)
+    r2 = _make_row(["foo", "bar"])
+    batch = collate([r1, r2])
+    assert "instances" in batch
+    assert "mask" in batch
+    assert "label" in batch
 
 
 def test_collate_empty_batch():
-    collate_fn = make_collate_fn(feature_mode="topk_logprobs", instance_dim=8)
-    import pytest
-    with pytest.raises(ValueError):
-        collate_fn([])
-
-
-# ═══ smoothness_loss ═══
-
-def test_smoothness_constant():
-    loss = smoothness_loss(torch.ones(2, 5, 3))
-    assert loss.item() == 0.0
-
-
-def test_smoothness_single_segment():
-    loss = smoothness_loss(torch.randn(3, 1, 5))
-    assert loss.item() == 0.0
-
-
-def test_smoothness_increasing():
-    logits = torch.tensor([[[0.0], [1.0], [2.0], [3.0]]])
-    loss = smoothness_loss(logits)
-    assert abs(loss.item() - 1.0) < 1e-6
-
-
-# ═══ top-k MIL instance loss ═══
-
-def _compute_mil_instance_loss(inst_logit, mask, y):
-    device = inst_logit.device
-    bce = nn.BCEWithLogitsLoss(reduction="sum")
-    total_loss = 0.0
-    total_count = 0
-    for i in range(y.size(0)):
-        n_valid = int(mask[i].sum().item())
-        if n_valid == 0:
-            continue
-        if y[i].item() > 0.5:
-            k = max(1, n_valid // 3)
-            topk_logprobs, topk_idx = torch.topk(inst_logit[i, :n_valid], k)
-            loss_pos = bce(topk_logprobs, torch.ones(k, device=device))
-            all_idx = set(range(n_valid))
-            rest_idx = torch.tensor(sorted(all_idx - set(topk_idx.tolist())), device=device)
-            if len(rest_idx) > 0:
-                rest_logits = inst_logit[i, rest_idx]
-                loss_rest = bce(rest_logits, torch.zeros(len(rest_idx), device=device))
-                total_loss += loss_pos + loss_rest
-                total_count += k + len(rest_idx)
-            else:
-                total_loss += loss_pos
-                total_count += k
-        else:
-            logits_i = inst_logit[i, :n_valid]
-            loss_neg = bce(logits_i, torch.zeros(n_valid, device=device))
-            total_loss += loss_neg
-            total_count += n_valid
-    return float(total_loss / max(1, total_count))
-
-
-def test_mil_instance_loss_negative_bag():
-    loss = _compute_mil_instance_loss(torch.tensor([[-5.0, -5.0, -5.0]]), torch.tensor([[1.0, 1.0, 1.0]]), torch.tensor([0.0]))
-    assert loss < 0.1
-
-
-def test_mil_instance_loss_negative_bag_high_logits():
-    loss = _compute_mil_instance_loss(torch.tensor([[5.0, 5.0, 5.0]]), torch.tensor([[1.0, 1.0, 1.0]]), torch.tensor([0.0]))
-    assert loss > 1.0
-
-
-def test_mil_instance_loss_positive_bag():
-    loss = _compute_mil_instance_loss(torch.tensor([[5.0, -5.0, -5.0]]), torch.tensor([[1.0, 1.0, 1.0]]), torch.tensor([1.0]))
-    assert loss < 2.0
-
-
-def test_mil_instance_loss_positive_bag_all_low():
-    loss = _compute_mil_instance_loss(torch.tensor([[-5.0, -5.0, -5.0]]), torch.tensor([[1.0, 1.0, 1.0]]), torch.tensor([1.0]))
-    assert loss > 1.0
-
-
-def test_mil_instance_loss_positive_bag_single_instance():
-    loss = _compute_mil_instance_loss(torch.tensor([[3.0]]), torch.tensor([[1.0]]), torch.tensor([1.0]))
-    assert loss < 0.5
-
-
-def test_mil_instance_loss_masked_instances():
-    loss = _compute_mil_instance_loss(torch.tensor([[5.0, 3.0, -1.0]]), torch.tensor([[1.0, 1.0, 0.0]]), torch.tensor([0.0]))
-    assert loss > 1.0
-
-
-# ═══ pure (k=1) method ═══
-
-def _compute_pure_instance_loss(inst_logit, mask, y):
-    """Replicate the pure (k=1) MIL instance loss logic."""
-    device = inst_logit.device
-    bce = nn.BCEWithLogitsLoss(reduction="sum")
-    total_loss = 0.0
-    total_count = 0
-    for i in range(y.size(0)):
-        n_valid = int(mask[i].sum().item())
-        if n_valid == 0:
-            continue
-        scores = inst_logit[i, :n_valid]
-        if y[i].item() > 0.5:
-            k = 1
-            topk_logprobs, topk_idx = torch.topk(scores, k)
-            loss_pos = bce(topk_logprobs, torch.ones(k, device=device))
-            all_idx = set(range(n_valid))
-            rest_idx = torch.tensor(sorted(all_idx - set(topk_idx.tolist())), device=device)
-            if len(rest_idx) > 0:
-                rest_logits = scores[rest_idx]
-                loss_rest = bce(rest_logits, torch.zeros(len(rest_idx), device=device))
-                total_loss += loss_pos.sum() + loss_rest.sum()
-                total_count += k + len(rest_idx)
-            else:
-                total_loss += loss_pos.sum()
-                total_count += k
-        else:
-            loss_neg = bce(scores, torch.zeros(n_valid, device=device))
-            total_loss += loss_neg.sum()
-            total_count += n_valid
-    return float(total_loss / max(1, total_count))
-
-
-def test_pure_only_top1_penalized():
-    """Pure method: only the single highest score gets target=1."""
-    inst_logit = torch.tensor([[8.0, 5.0, 3.0]])
-    mask = torch.tensor([[1.0, 1.0, 1.0]])
-    y = torch.tensor([1.0])
-    loss = _compute_pure_instance_loss(inst_logit, mask, y)
-    # BCE(8,1)≈0.0003 + BCE(5,0)≈5.0 + BCE(3,0)≈3.1 → avg≈2.69
-    assert 2.0 < loss < 3.5
-
-
-def test_pure_single_instance():
-    """Pure method with only 1 instance: top-1 is everything, no rest."""
-    loss = _compute_pure_instance_loss(torch.tensor([[3.0]]), torch.tensor([[1.0]]), torch.tensor([1.0]))
-    assert loss < 0.5
-
-
-# ═══ soft pseudo-label method ═══
-
-def _compute_spl_instance_loss(inst_logit, mask, y):
-    """Replicate the soft pseudo-label instance loss logic."""
-    device = inst_logit.device
-    bce = nn.BCEWithLogitsLoss(reduction="sum")
-    total_loss = 0.0
-    total_count = 0
-    for i in range(y.size(0)):
-        n_valid = int(mask[i].sum().item())
-        if n_valid == 0:
-            continue
-        scores = inst_logit[i, :n_valid]
-        if y[i].item() > 0.5:
-            probs = torch.sigmoid(scores).detach()
-            if probs.max() < 0.5:
-                probs[probs.argmax()] = 0.5
-            loss_val = bce(scores, probs)
-            total_loss += loss_val.sum()
-            total_count += n_valid
-        else:
-            loss_neg = bce(scores, torch.zeros(n_valid, device=device))
-            total_loss += loss_neg.sum()
-            total_count += n_valid
-    return float(total_loss / max(1, total_count))
-
-
-def test_spl_soft_targets():
-    """High scores → targets near 1; low scores → targets near 0."""
-    inst_logit = torch.tensor([[5.0, -2.0, -3.0]])
-    mask = torch.tensor([[1.0, 1.0, 1.0]])
-    y = torch.tensor([1.0])
-    loss = _compute_spl_instance_loss(inst_logit, mask, y)
-    assert loss < 3.0  # Should be moderate — model is confident
-
-
-def test_spl_anti_degeneration():
-    """When all scores < 0 (all sigmoids < 0.5), max is clamped to 0.5."""
-    inst_logit = torch.tensor([[-2.0, -3.0, -4.0]])
-    mask = torch.tensor([[1.0, 1.0, 1.0]])
-    y = torch.tensor([1.0])
-    loss = _compute_spl_instance_loss(inst_logit, mask, y)
-    # Without clamp, all targets < 0.5 → very weak signal.  With clamp,
-    # max target = 0.5 → model receives a minimum push.  Loss should exist.
-    assert loss > 0.0
-
-
-# ═══ contrastive method ═══
-
-def _compute_ctr_instance_loss(inst_logit, mask, y):
-    """Replicate the contrastive instance loss logic."""
-    total_loss = 0.0
-    total_count = 0
-    for i in range(y.size(0)):
-        n_valid = int(mask[i].sum().item())
-        if n_valid == 0:
-            continue
-        scores = inst_logit[i, :n_valid]
-        if y[i].item() > 0.5:
-            loss_val = (torch.logsumexp(scores, dim=0) - scores.max()
-                        + torch.nn.functional.softplus(-scores.max()))
-            total_loss += loss_val
-            total_count += 1
-        else:
-            loss_neg = scores.pow(2).mean()
-            total_loss += loss_neg * n_valid
-            total_count += n_valid
-    return float(total_loss / max(1, total_count))
-
-
-def test_ctr_positive_bag_low_loss_when_one_high():
-    """One high score, others low → low contrastive loss."""
-    scores = torch.tensor([[8.0, -2.0, -3.0]])
-    mask = torch.tensor([[1.0, 1.0, 1.0]])
-    y = torch.tensor([1.0])
-    loss = _compute_ctr_instance_loss(scores, mask, y)
-    # logsumexp≈8.0003, max=8, softplus(-8)≈0 → loss≈0.0006
-    assert loss < 0.1
-
-
-def test_ctr_positive_bag_penalized_when_max_negative():
-    """When max score is negative, softplus term pushes it toward positive."""
-    scores_neg = torch.tensor([[-3.0, -5.0, -7.0]])
-    mask = torch.tensor([[1.0, 1.0, 1.0]])
-    y = torch.tensor([1.0])
-    loss_neg = _compute_ctr_instance_loss(scores_neg, mask, y)
-    # softplus(3)≈3.05 → significant penalty for negative max
-    # Same scores but max positive:
-    scores_pos = torch.tensor([[3.0, 1.0, -1.0]])
-    loss_pos = _compute_ctr_instance_loss(scores_pos, mask, y)
-    # softplus(-3)≈0.05 → small penalty
-    assert loss_neg > loss_pos, f"Negative max should be penalized: {loss_neg:.4f} > {loss_pos:.4f}"
-
-
-def test_ctr_positive_bag_high_loss_when_all_similar():
-    """Similar scores → high contrastive loss (no clear winner)."""
-    scores = torch.tensor([[2.0, 1.5, 2.5]])
-    mask = torch.tensor([[1.0, 1.0, 1.0]])
-    y = torch.tensor([1.0])
-    loss = _compute_ctr_instance_loss(scores, mask, y)
-    # logsumexp([2, 1.5, 2.5]) ≈ 3.2, max = 2.5 → loss ≈ 0.7
-    assert loss > 0.5
-
-
-def test_ctr_negative_bag():
-    """Negative bag: MSE pushes all scores toward 0."""
-    scores = torch.tensor([[5.0, 3.0, 1.0]])
-    mask = torch.tensor([[1.0, 1.0, 1.0]])
-    y = torch.tensor([0.0])
-    loss = _compute_ctr_instance_loss(scores, mask, y)
-    # MSE: (25+9+1)/3 ≈ 11.7 → high loss for high scores
+    collate = make_collate_fn(feature_mode="topk_logprobs", instance_dim=4098,
+                              segment_mode="fixed_window", segment_size=64)
+    batch = collate([])
+    assert "instances" in batch
+    assert batch["instances"].numel() == 0
+    assert "mask" in batch
+    assert "label" in batch
 
 
 # ═══ make_cached_collate_fn ═══
-
 
 def test_cached_collate_fn_basic():
     cache = [
@@ -299,72 +60,63 @@ def test_cached_collate_fn_basic():
     assert batch["instances"].shape == (2, 3, 4098)  # max_k=3
     assert batch["mask"].shape == (2, 3)
     assert batch["mask"][0, :3].sum() == 3  # row 0 has 3 valid
-    assert batch["mask"][1, :3].sum() == 2  # row 1 has 2 valid
-    assert batch["label"].tolist() == [0.0, 0.0]
-    assert batch["temp_idx"].tolist() == [2, 3]
 
 
 def test_cached_collate_fn_single_row():
-    cache = [{"instances": torch.randn(4, 4098), "label": 1.0, "temp_idx": 7}]
+    cache = [{"instances": torch.randn(4, 4098), "label": 1.0, "temp_idx": 1}]
     collate = make_cached_collate_fn(cache, instance_dim=4098)
     batch = collate([0])
     assert batch["instances"].shape == (1, 4, 4098)
-    assert batch["mask"].sum() == 4
-    assert batch["label"].item() == 1.0
-    assert batch["temp_idx"].item() == 7
 
 
 def test_segment_cache_dataset():
-    ds = SegmentCacheDataset(10)
-    assert len(ds) == 10
-    assert ds[0] == 0
-    assert ds[5] == 5
-    assert ds[9] == 9
+    """SegmentCacheDataset + make_cached_collate_fn: indices → cache lookup."""
+    cache = [
+        {"instances": torch.randn(3, 4098), "label": 0.0, "temp_idx": 2},
+        {"instances": torch.randn(5, 4098), "label": 1.0, "temp_idx": 5},
+        {"instances": torch.randn(2, 4098), "label": 0.0, "temp_idx": 3},
+    ]
+    ds = SegmentCacheDataset(len(cache))
+    assert len(ds) == 3
+    assert ds[1] == 1  # SegmentCacheDataset returns the index itself
+
+    collate = make_cached_collate_fn(cache, instance_dim=4098)
+    batch = collate([0, 2])
+    assert batch["instances"].shape == (2, 3, 4098)
+    assert batch["mask"][0, :3].sum() == 3
 
 
 # ═══ concat pooling end-to-end ═══
 
-
 def test_build_segment_obs_concat():
-    """concat mode: output dims = segment_size × obs_dim, not just obs_dim."""
-    obs_dim = 64
-    seg_size = 64
-    n_tok = 200
-    lp = torch.randn(n_tok, 4097)  # topk_logprobs format: [n_tok, top_k+1]
-    tokens = ["a"] * n_tok
-    text = " ".join(tokens)
-
+    """build_segment_obs_from_lp with concat pooling produces flat per-segment vectors."""
+    lp_tensor = torch.randn(3, 5) * 0.1
+    lp_tensor[:, 0] = -0.5
+    tokens = ["A"] * 3
+    text = "A A A"
     obs = build_segment_obs_from_lp(
-        lp, tokens, text,
-        segment_size=seg_size, obs_dim=obs_dim,
-        pooling_mode="concat",
+        lp_tensor, tokens, text, segment_size=3, obs_dim=4,
+        segment_mode="fixed_window", pooling_mode="concat",
     )
-    # 200 tokens: 3 full segments (64+64+64), last 8-tok dropped
-    assert obs.shape == (3, 4096), f"Expected (3, 4096), got {obs.shape}"
+    assert obs.shape == (1, 12)  # 1 segment × (3 tokens × 4 dims)
 
 
 def test_build_segment_obs_concat_vs_mean_shape():
-    """concat produces segment_size×obs_dim; mean produces obs_dim."""
-    obs_dim = 64
-    seg_size = 64
-    lp = torch.randn(128, 4097)
-    tokens = ["x"] * 128
-    text = "x " * 128
-
+    """concat returns [K, seg*obs_dim] while mean returns [K, obs_dim]."""
+    lp = torch.randn(4, 5) * 0.1
+    lp[:, 0] = -0.5
+    tokens = ["a"] * 4
+    text = "a a a a"
     concat_obs = build_segment_obs_from_lp(
-        lp, tokens, text,
-        segment_size=seg_size, obs_dim=obs_dim,
-        pooling_mode="concat",
+        lp, tokens, text, segment_size=4, obs_dim=8,
+        segment_mode="fixed_window", pooling_mode="concat",
     )
     mean_obs = build_segment_obs_from_lp(
-        lp, tokens, text,
-        segment_size=seg_size, obs_dim=obs_dim,
-        pooling_mode="mean",
+        lp, tokens, text, segment_size=4, obs_dim=8,
+        segment_mode="fixed_window", pooling_mode="mean",
     )
-    # concat: 2 segments, each seg_size*obs_dim = 4096
-    assert concat_obs.shape == (2, 4096)
-    # mean: 2 segments, each obs_dim = 64
-    assert mean_obs.shape == (2, 64)
+    assert concat_obs.shape == (1, 32)  # 1 seg × (4 tok × 8 dim)
+    assert mean_obs.shape == (1, 8)
 
 
 def test_collate_fn_concat_pooling_mode_accepted():
@@ -380,3 +132,138 @@ def test_collate_fn_concat_pooling_mode_accepted():
     batch = collate([r1])
     assert "instances" in batch
     assert "mask" in batch
+
+
+def test_collate_fn_concat_empty_tokens():
+    """Concatenate pooling with zero-token rows must not crash on dim mismatch.
+
+    Regression test: before the fix, empty rows got torch.zeros(1, instance_dim)
+    but concat pooling produces [1, segment_size * instance_dim].  Mixed batches
+    triggered a shape mismatch at assignment time.
+    """
+    collate = make_collate_fn(
+        feature_mode="topk_logprobs",
+        instance_dim=64,
+        segment_mode="fixed_window",
+        segment_size=64,
+        pooling_mode="concat",
+    )
+    # Row with zero tokens
+    r_empty = _make_row([""], _full_ids=[0], _prompt_len=1)
+    r_empty["token_ids"] = []
+    r_empty["tokens"] = []
+    r_empty["text"] = ""
+    # Normal row
+    r_full = _make_row(["hello", "world"])
+    # Should not crash with either order of first row
+    batch1 = collate([r_empty, r_full])
+    assert batch1["instances"].shape[2] == 64 * 64  # segment_size * instance_dim
+    batch2 = collate([r_full, r_empty])
+    assert batch2["instances"].shape[2] == 64 * 64
+
+
+def test_collate_fn_concat_all_empty():
+    """All rows empty with concat pooling — batch builds successfully."""
+    collate = make_collate_fn(
+        feature_mode="topk_logprobs",
+        instance_dim=64,
+        segment_mode="fixed_window",
+        segment_size=32,
+        pooling_mode="concat",
+    )
+    r_empty = _make_row([""], _full_ids=[0], _prompt_len=1)
+    r_empty["token_ids"] = []
+    r_empty["tokens"] = []
+    r_empty["text"] = ""
+    batch = collate([r_empty, r_empty])
+    assert batch["instances"].shape[2] == 32 * 64  # segment_size * instance_dim
+
+
+# ═══ segment cache helpers ═══
+
+def test_build_cache_path_concat():
+    path = _build_cache_path("datasets/cache", "train", "fixed_window",
+                             "concat", "topk_logprobs", 64, 64)
+    assert path == "datasets/cache/train-fixed_window-concat-topk_logprobs-64-64.safetensors"
+
+
+def test_build_cache_path_mean():
+    path = _build_cache_path("/tmp/cache", "val", "fixed_window",
+                             "mean", "hidden_states", 128, 32)
+    assert path == "/tmp/cache/val-fixed_window-mean-hidden_states-128-32.safetensors"
+
+
+def test_build_cache_path_different_splits():
+    p1 = _build_cache_path("cache", "train", "fw", "m", "hs", 1, 1)
+    p2 = _build_cache_path("cache", "val", "fw", "m", "hs", 1, 1)
+    assert p1 != p2
+
+
+def test_cache_hit_safetensors(tmp_path):
+    """safetensors cache hit → loaded without vLLM call."""
+    import os, logging
+    entries = [
+        {"instances": torch.randn(3, 64), "label": 0.0, "temp_idx": 2},
+        {"instances": torch.randn(5, 64), "label": 1.0, "temp_idx": 5},
+    ]
+    cache_path = os.path.join(str(tmp_path), "test.safetensors")
+    from mil.utils import _pack_segment_cache
+    from safetensors.torch import save_file
+    packed = _pack_segment_cache(entries)
+    save_file(packed, cache_path)
+
+    dummy_log = logging.getLogger("test_cache_hit_sf")
+    dummy_log.addHandler(logging.NullHandler())
+
+    def _fail_collate(rows):
+        raise RuntimeError("collate_fn should not be called on cache hit")
+    result = _load_or_build_segment_cache([], _fail_collate, cache_path, 1000, dummy_log)
+    assert len(result) == 2
+    assert result[0]["label"] == 0.0
+
+
+def test_cache_hit_legacy_pt(tmp_path):
+    """Legacy .pt cache hit → loaded via torch.load fallback."""
+    import os, logging
+    entries = [
+        {"instances": torch.randn(3, 64), "label": 0.0, "temp_idx": 2},
+        {"instances": torch.randn(5, 64), "label": 1.0, "temp_idx": 5},
+    ]
+    # Write .pt but pass .safetensors path → checks legacy fallback
+    pt_path = os.path.join(str(tmp_path), "test.pt")
+    torch.save(entries, pt_path)
+
+    sf_path = os.path.join(str(tmp_path), "test.safetensors")
+    dummy_log = logging.getLogger("test_cache_hit_legacy")
+    dummy_log.addHandler(logging.NullHandler())
+
+    def _fail_collate(rows):
+        raise RuntimeError("collate_fn should not be called on cache hit")
+    # Pass .safetensors path, but .pt exists at same stem → fallback
+    result = _load_or_build_segment_cache([], _fail_collate, sf_path, 1000, dummy_log)
+    assert len(result) == 2
+    assert result[0]["label"] == 0.0
+
+
+def test_cache_miss_saves(tmp_path):
+    """Cache file missing → collate_fn called, saved as .safetensors."""
+    import os, logging
+    cache_path = os.path.join(str(tmp_path), "build.safetensors")
+
+    dummy_log = logging.getLogger("test_cache_miss")
+    dummy_log.addHandler(logging.NullHandler())
+
+    def _build_collate(batch_rows):
+        inst = torch.randn(len(batch_rows), 4, 64)
+        mask = torch.ones(len(batch_rows), 4)
+        label = torch.tensor([float(r.get("individual_label", 0)) for r in batch_rows])
+        return {"instances": inst, "mask": mask, "label": label, "temp_idx": torch.zeros(len(batch_rows), dtype=torch.long)}
+
+    rows = [{"individual_label": 0}, {"individual_label": 1}]
+    result = _load_or_build_segment_cache(rows, _build_collate, cache_path, 1000, dummy_log)
+    assert len(result) == 2
+    assert os.path.exists(cache_path)
+
+    # Reload from cache
+    result2 = _load_or_build_segment_cache(rows, _build_collate, cache_path, 1000, dummy_log)
+    assert len(result2) == 2

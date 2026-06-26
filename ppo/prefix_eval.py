@@ -52,6 +52,11 @@ def _summarize_rollout(method: str, seed: int, rollout,
             "problem_id": prompt["problem_id"],
             "majority_correct": rollout.majority_correct[idx],
             "individual_correct": rollout.individual_correct[idx],
+            "extracted_answers": rollout.extracted_answers[idx],
+            "majority_answer": rollout.majority_answers[idx],
+            "majority_count": rollout.majority_counts[idx],
+            "sc_confidence": rollout.sc_confidences[idx],
+            "answer_entropy": rollout.answer_entropies[idx],
             "temperatures": rollout.temperatures[idx],
             "segment_counts": rollout.segment_counts[idx],
             "token_counts": rollout.token_counts[idx],
@@ -83,7 +88,8 @@ def _compact_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
     return compact
 
 
-def evaluate(config_path: str, seed: int, parallel_size: int | None = None) -> Dict[str, Any]:
+def evaluate(config_path: str, seed: int, parallel_size: int | None = None,
+             include_random: bool = False) -> Dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     prompts = load_prompts(cfg["paths"]["test_dataset"])
@@ -167,6 +173,20 @@ def evaluate(config_path: str, seed: int, parallel_size: int | None = None) -> D
             fixed_metrics["mean_segments_per_vote"]
         ),
     }
+    if include_random:
+        if hasattr(runner, "reset_prefix_cache"):
+            runner.reset_prefix_cache(reset_connector=True)
+        random_started = time.perf_counter()
+        random_rollout = engine.rollout(
+            prompts, policy, stochastic=False, rng=random.Random(seed),
+            collect_transitions=False, generation_seed=seed,
+            random_temperature=True,
+        )
+        random_elapsed = time.perf_counter() - random_started
+        result["random_temperature_per_segment"] = _summarize_rollout(
+            "random_temperature_per_segment", seed, random_rollout,
+            prompts, n_votes, random_elapsed,
+        )
     result["single_seed_evidence"] = True
     return result
 
@@ -179,12 +199,13 @@ def main() -> None:
     parser.add_argument("--output", default=None)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--log-dir", default="logs")
+    parser.add_argument("--include-random", action="store_true")
     args = parser.parse_args()
     logger, _, _ = setup_experiment_logger(
         component="prefix_online_eval", run_name=args.run_name,
         log_dir=args.log_dir, config={"config": args.config, "seed": args.seed},
     )
-    metrics = evaluate(args.config, args.seed, args.parallel_size)
+    metrics = evaluate(args.config, args.seed, args.parallel_size, args.include_random)
     output = args.output
     if output is None:
         output = f"results/full_seed{args.seed}.json"

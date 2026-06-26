@@ -48,6 +48,7 @@ mil:
     aggregator: attention
     use_position: true
     use_gru: true
+    gated_attention: true
   training:
     instance_loss: pure     # topk | pure | soft_pseudo_label | contrastive
     batch_size: 32
@@ -75,4 +76,3 @@ ppo:
     value_coef: 0.5
     entropy_coef: 0.005
     lr: 1.0e-5
-    shaping_coef: 0.15

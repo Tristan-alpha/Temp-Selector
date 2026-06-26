@@ -1,15 +1,19 @@
 """CPU tests for the complete prefix-value proposal."""
 
+import pytest
 import torch
 
 from features.segmenter import build_masked_concat_segment_obs_from_lp
 from mil.prefix_data import (
     build_ranking_pairs,
+    continuation_collate,
     prefix_segment_specs,
     prefix_segment_counts,
     select_continuation_prefixes,
+    terminal_collate,
 )
 from mil.prefix_value import (
+    PrefixRecurrentState,
     PrefixValueModel,
     binomial_nll,
     paired_ranking_loss,
@@ -68,6 +72,72 @@ def test_prefix_model_batch_matches_streaming_steps():
         logit, _, state = model.step(features[0, index], token_mask[0, index], state)
         streaming.append(logit.squeeze(0))
     assert torch.allclose(batch, torch.stack(streaming), atol=1e-5)
+
+
+def test_prompt_aware_prefix_model_requires_prompt_hidden():
+    model = PrefixValueModel(
+        token_dim=2, segment_size=3, hidden_dim=8, max_segments=8, prompt_dim=5,
+    )
+    features = torch.randn(1, 2, 6)
+    token_mask = torch.ones(1, 2, 3)
+    with pytest.raises(ValueError, match="prompt_hidden"):
+        model(features, token_mask, torch.ones(1, 2))
+
+
+def test_prompt_hidden_changes_prefix_value_output():
+    torch.manual_seed(5)
+    model = PrefixValueModel(
+        token_dim=2, segment_size=3, hidden_dim=8, max_segments=8, prompt_dim=5,
+    )
+    model.eval()
+    features = torch.randn(1, 2, 6)
+    token_mask = torch.ones(1, 2, 3)
+    segment_mask = torch.ones(1, 2)
+    prompt_a = torch.tensor([[0.0, 1.0, 2.0, 3.0, 4.0]])
+    prompt_b = torch.tensor([[4.0, 1.0, 3.0, 0.0, 2.0]])
+    logits_a = model(features, token_mask, segment_mask, prompt_hidden=prompt_a)["terminal_logits"]
+    logits_b = model(features, token_mask, segment_mask, prompt_hidden=prompt_b)["terminal_logits"]
+    assert not torch.allclose(logits_a, logits_b)
+
+
+def test_prompt_aware_batch_matches_streaming_steps():
+    torch.manual_seed(6)
+    model = PrefixValueModel(
+        token_dim=2, segment_size=3, hidden_dim=8, max_segments=8, prompt_dim=5,
+    )
+    model.eval()
+    features = torch.randn(1, 4, 6)
+    token_mask = torch.tensor([[[1, 1, 1], [1, 1, 0], [1, 1, 1], [1, 0, 0]]], dtype=torch.float32)
+    prompt_hidden = torch.randn(1, 5)
+    batch = model(
+        features, token_mask, torch.ones(1, 4), prompt_hidden=prompt_hidden,
+    )["value_logits"][0]
+    state = PrefixRecurrentState(model.initial_hidden(prompt_hidden), 0)
+    streaming = []
+    for index in range(4):
+        logit, _, state = model.step(features[0, index], token_mask[0, index], state)
+        streaming.append(logit.squeeze(0))
+    assert torch.allclose(batch, torch.stack(streaming), atol=1e-5)
+
+
+def test_prefix_collates_preserve_prompt_hidden():
+    entry = {
+        "sample_id": "s1",
+        "features": torch.ones(3, 6, dtype=torch.float16),
+        "token_mask": torch.ones(3, 3, dtype=torch.uint8),
+        "terminal_target": 1.0,
+        "prompt_hidden": torch.arange(5, dtype=torch.float16),
+    }
+    terminal = terminal_collate([entry], [0])
+    assert terminal["prompt_hidden"].shape == (1, 5)
+    assert terminal["prompt_hidden"].dtype == torch.float32
+
+    continuation = continuation_collate(
+        {"s1": entry},
+        [{"source_sample_id": "s1", "prefix_segments": 2, "n_correct": 1, "n_total": 2}],
+        [0],
+    )
+    assert torch.equal(continuation["prompt_hidden"], terminal["prompt_hidden"])
 
 
 def test_binomial_nll_prefers_matching_probability():
@@ -213,6 +283,7 @@ class _FakeRunner:
                 "finish_reason": "stop" if terminal else "length",
                 "logprobs": _lp(len(token_ids)),
                 "hidden_states": None,
+                "prompt_hidden": torch.ones(5) if kwargs.get("return_prompt_hidden") else None,
             })
         return outputs
 
@@ -235,3 +306,26 @@ def test_continuation_value_policy_rollout_smoke():
     assert result.individual_correct == [[1, 1]]
     assert all(len(chain) == 1 for chain in result.transitions[0])
     assert all(chain[0].done for chain in result.transitions[0])
+
+
+def test_prompt_aware_rollout_smoke():
+    torch.manual_seed(7)
+    value_model = PrefixValueModel(
+        token_dim=6, segment_size=4, hidden_dim=8, max_segments=4, prompt_dim=5,
+    )
+    prompt_state = value_model.initial_hidden(torch.ones(1, 5))
+    assert prompt_state is not None
+    assert not torch.allclose(prompt_state, torch.zeros_like(prompt_state))
+    policy = PrefixPolicyValueNet(hidden_dim=8, n_actions=2)
+    engine = PrefixRolloutEngine(
+        runner=_FakeRunner(), value_model=value_model, calibration_temperature=1.0,
+        device=torch.device("cpu"), temp_bins=[0.5, 1.0], segment_size=4,
+        token_dim=6, top_k_logprobs=8, num_votes=2, max_new_tokens=8,
+        gamma=0.99, shaping_coef=0.15, system_prompt="", use_math_chat=True,
+    )
+    result = engine.rollout(
+        [{"question": "1?", "answer": "1"}], policy,
+        stochastic=False, rng=__import__("random").Random(42), generation_seed=42,
+    )
+    assert result.majority_correct == [1]
+    assert all(len(chain) == 1 for chain in result.transitions[0])

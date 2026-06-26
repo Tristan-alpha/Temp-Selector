@@ -23,8 +23,20 @@ class PolicyValueNet(nn.Module):
         self.v = nn.Linear(hidden, 1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass: [B, obs_dim] → logits [B, n_actions], values [B].
+
+        Shape contract: input must be 2D.  A 3D input [B, 1, obs_dim] silently
+        passes through nn.Linear but produces logits [B, 1, n_actions] and
+        values [B, 1], which causes Categorical.log_prob to broadcast incorrectly.
+        """
+        assert x.dim() == 2, \
+            f"PolicyValueNet: expected 2D input [B, obs_dim], got {x.dim()}D {x.shape}"
         h = self.backbone(x)
-        return self.pi(h), self.v(h).squeeze(-1)
+        logits = self.pi(h)
+        values = self.v(h).squeeze(-1)
+        assert logits.dim() == 2, f"PolicyValueNet: expected 2D logits, got {logits.shape}"
+        assert values.dim() == 1, f"PolicyValueNet: expected 1D values, got {values.shape}"
+        return logits, values
 
 
 class PrefixPolicyValueNet(nn.Module):

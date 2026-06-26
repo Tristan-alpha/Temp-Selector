@@ -1,0 +1,33 @@
+{
+  "label_semantics": {
+    "0": "correct trajectory",
+    "1": "wrong trajectory"
+  },
+  "n_selected_problems": 165,
+  "n_selected_traces": 330,
+  "n_skipped_problems": 35,
+  "n_source_problems": 200,
+  "n_source_rows": 24000,
+  "selected_by_split": {
+    "test": 61,
+    "train": 104
+  },
+  "selected_by_subject": {
+    "algebra": 32,
+    "counting_and_probability": 19,
+    "geometry": 19,
+    "intermediate_algebra": 25,
+    "number_theory": 27,
+    "prealgebra": 25,
+    "precalculus": 18
+  },
+  "selected_csv": "/home/data/nas_hdd/dazhou/tf-mil/latent_opportunity_from_confident_decoding_20260625_212613/source_problem_traceback/selected_165_problems_from_all_5_sub_200.csv",
+  "selection_policy": "one label-0 and one label-1 trajectory per problem, preferring temperature closest to 1.0 then lower vote/source order in pvm_value pilot",
+  "skipped_by_reason_label_counts": {
+    "all_correct": 17,
+    "all_wrong": 18
+  },
+  "skipped_csv": "/home/data/nas_hdd/dazhou/tf-mil/latent_opportunity_from_confident_decoding_20260625_212613/source_problem_traceback/skipped_35_problems_from_all_5_sub_200.csv",
+  "source_jsonl": "/home/data/nas_hdd/dazhou/tf-mil/datasets/all_5_sub_200.jsonl",
+  "subset_jsonl": "/home/data/nas_hdd/dazhou/Confident-Decoding/pvm_value/runs/value_lens_pilot_20260625_121044/correct_wrong_reasoning_traces.jsonl"
+}

@@ -89,23 +89,54 @@ def test_segment_pooling_concat():
 
 
 def test_segment_pooling_concat_padding():
-    """concat: segment with < segment_size tokens is dropped; empty → zero vector."""
+    """concat: segment with < segment_size tokens is zero-padded to segment_size."""
     dim = 2
     seg_size = 5
     t = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
     spans = [Segment(start=0, end=1, segment_id=0)]
     out = segment_pooling(t, spans, dim, mode="concat", segment_size=seg_size)
-    assert out.shape == (1, dim)  # dropped, fallback zero
+    # 1 token × 2 dims = 2 real values, padded to 5*2 = 10
+    assert out.shape == (1, seg_size * dim), f"expected (1, {seg_size * dim}), got {out.shape}"
+    # First 2 elements preserve real features
+    assert out[0, 0].item() == 1.0
+    assert out[0, 1].item() == 2.0
+    # Remaining 8 elements are zero-padded
+    assert out[0, 2:].eq(0).all()
+
+def test_segment_pooling_concat_padding_mixed():
+    """concat: shorter-than-segment_size chunks are zero-padded, longer ones kept as-is.
+
+    A bag with spans [0:2] (zero-padded to 5 tokens) and [2:7] (kept, 5 tokens >= seg_size=5)
+    should produce two output segments of shape [seg_size * dim] each."""
+    dim = 3
+    seg_size = 5
+    t = torch.randn(7, dim)
+    spans = [
+        Segment(start=0, end=2, segment_id=0),   # 2 tokens → zero-padded
+        Segment(start=2, end=7, segment_id=1),   # 5 tokens → kept
+    ]
+    out = segment_pooling(t, spans, dim, mode="concat", segment_size=seg_size)
+    assert out.shape == (2, seg_size * dim)
+    # First segment: first 2*t_dim elements = real, rest = zeros
+    assert torch.allclose(out[0, :2*dim], t[0:2].reshape(-1))
+    assert out[0, 2*dim:].eq(0).all()
+    # Second segment: all 5*t_dim elements = real (from first 5 tokens of span)
+    assert torch.allclose(out[1], t[2:7][:seg_size].reshape(-1))
 
 
 def test_segment_pooling_concat_truncation():
-    """concat: 3 tokens >= segment_size=2, kept as-is (no more zero-padding/truncation)."""
+    """concat: 3 tokens >= segment_size=2, truncated to first 2 tokens."""
     dim = 2
     seg_size = 2
     t = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
     spans = [Segment(start=0, end=3, segment_id=0)]
     out = segment_pooling(t, spans, dim, mode="concat", segment_size=seg_size)
-    assert out.shape == (1, 6)  # 3 tokens × 2 dims, no truncation to 4
+    # Truncated to segment_size=2 tokens × 2 dims = 4
+    assert out.shape == (1, 4)
+    assert out[0, 0].item() == 1.0
+    assert out[0, 1].item() == 2.0
+    assert out[0, 2].item() == 3.0
+    assert out[0, 3].item() == 4.0
 
 
 def test_segment_pooling_from_build_segments():
@@ -126,6 +157,60 @@ def test_step_segment_basic():
     assert len(spans) >= 2, f"Expected at least 2 segments, got {len(spans)}"
     assert spans[0].start == 0
     assert spans[-1].end == len(tokens)
+
+
+def test_punctuation_segment_basic():
+    """Segment at punctuation boundaries."""
+    from features.segmenter import _punctuation_segment
+    tokens = ["Hello", ".", " ", "World", "!"]
+    spans = _punctuation_segment(tokens, max_window=64)
+    assert len(spans) == 2, f"Expected 2 segments, got {len(spans)}"
+    assert spans[0].start == 0 and spans[0].end == 2   # "Hello ."
+    assert spans[1].start == 2 and spans[1].end == 5    # " World !"
+
+
+def test_punctuation_segment_newline_token():
+    """Standalone newline token is treated as a boundary, even after strip()."""
+    from features.segmenter import _punctuation_segment
+    tokens = ["Step", " one", ".\n", "\n", "Step", " two", "."]
+    spans = _punctuation_segment(tokens, max_window=64)
+    # ".\n" (period+newline) and "\n" (standalone newline) both trigger breaks
+    assert len(spans) >= 2, f"Expected >=2 segments, got {len(spans)}"
+
+
+def test_concat_with_step_mode_raises():
+    """concat + step/punctuation is forbidden."""
+    import pytest
+    from features.segmenter import build_segment_obs_from_lp
+    lp = torch.randn(5, 5)
+    with pytest.raises(ValueError, match="concat.*incompatible"):
+        build_segment_obs_from_lp(
+            lp, ["a"] * 5, "a a a a a",
+            4, 8, device=torch.device("cpu"),
+            segment_mode="step", pooling_mode="concat",
+        )
+
+
+def test_concat_with_fixed_window_allowed():
+    """concat + fixed_window should work (allowed combination)."""
+    from features.segmenter import build_segment_obs_from_lp
+    lp = torch.randn(4, 5)
+    out = build_segment_obs_from_lp(
+        lp, ["a"] * 4, "a a a a",
+        4, 8, device=torch.device("cpu"),
+        segment_mode="fixed_window", pooling_mode="concat",
+    )
+    assert out.ndim == 2  # [K, seg_size * obs_dim]
+
+
+def test_punctuation_segment_max_window():
+    """max_window forces a break when no punctuation is found."""
+    from features.segmenter import _punctuation_segment
+    tokens = ["a"] * 100
+    spans = _punctuation_segment(tokens, max_window=10)
+    assert len(spans) > 1, f"max_window=10 should split, got {len(spans)}"
+    for sp in spans:
+        assert sp.end - sp.start <= 10, f"segment too long: {sp}"
 
 
 # ── batch_build_segment_obs_from_lp tests ──
@@ -211,3 +296,78 @@ def test_batch_build_obs_empty():
         [], [], [], 4, 8, torch.device("cpu"),
     )
     assert out == []
+
+
+# ── concat fast path pad/truncate tests ──
+
+def test_batch_build_obs_concat_pads_short():
+    """Concat mode: when all n_tok < segment_size, output is zero-padded to segment_size * obs_dim per segment."""
+    seg_size = 8
+    obs_dim = 10
+    N = 3
+    lp_tensors = [_make_lp_tensor(3, top_k=6) for _ in range(N)]
+    tokens_list = [["a"] * 3 for _ in range(N)]
+    texts = ["a a a"] * N
+    device = torch.device("cpu")
+
+    out = batch_build_segment_obs_from_lp(
+        lp_tensors, tokens_list, texts,
+        seg_size, obs_dim, device,
+        include_topk=False, pooling_mode="concat",
+    )
+    # fixed_window: 1 segment per chain. concat output = [1, seg_size * obs_dim].
+    expected_dim = seg_size * obs_dim
+    for o in out:
+        assert o.shape == (1, expected_dim), f"expected (1, {expected_dim}), got {o.shape}"
+        assert not o[0, :3 * obs_dim].eq(0).all(), "first 3*obs_dim should contain real features"
+        assert o[0, 3 * obs_dim:].eq(0).all(), "remainder should be zero-padded"
+
+
+def test_batch_build_obs_concat_output_dim_always_segment_size_times_obs_dim():
+    """Concat output per-segment dim is always segment_size * obs_dim, even with exact or excess tokens."""
+    seg_size = 4
+    obs_dim = 6
+    N = 2
+    # n_tok == segment_size (exact match — the common case)
+    lp_tensors = [_make_lp_tensor(seg_size, top_k=4) for _ in range(N)]
+    tokens_list = [["x"] * seg_size for _ in range(N)]
+    texts = ["x " * seg_size] * N
+    device = torch.device("cpu")
+
+    out = batch_build_segment_obs_from_lp(
+        lp_tensors, tokens_list, texts,
+        seg_size, obs_dim, device,
+        include_topk=False, pooling_mode="concat",
+    )
+    expected_dim = seg_size * obs_dim
+    for o in out:
+        assert o.shape[1] == expected_dim, f"per-segment dim mismatch: expected {expected_dim}, got {o.shape[1]}"
+
+
+def test_batch_build_obs_concat_matches_per_chain_mixed_tokens():
+    """Concat batch output matches per-chain build_segment_obs_from_lp with mixed token counts."""
+    seg_size = 5
+    obs_dim = 8
+    n_toks_list = [2, 5]  # short and exact
+    lp_tensors = [_make_lp_tensor(n, top_k=4) for n in n_toks_list]
+    tokens_list = [["t"] * n for n in n_toks_list]
+    texts = ["t " * n for n in n_toks_list]
+    device = torch.device("cpu")
+
+    batch_out = batch_build_segment_obs_from_lp(
+        lp_tensors, tokens_list, texts,
+        seg_size, obs_dim, device,
+        include_topk=False, pooling_mode="concat",
+    )
+    per_chain = [
+        build_segment_obs_from_lp(
+            lp_tensors[i], tokens_list[i], texts[i],
+            seg_size, obs_dim,
+            include_topk=False, pooling_mode="concat",
+        )
+        for i in range(len(n_toks_list))
+    ]
+    assert len(batch_out) == len(per_chain)
+    for bo, pc in zip(batch_out, per_chain):
+        assert bo.shape == pc.shape, f"shape mismatch: {bo.shape} vs {pc.shape}"
+        assert torch.allclose(bo, pc, atol=1e-5), f"batch vs per-chain mismatch"

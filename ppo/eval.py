@@ -107,7 +107,8 @@ class OnlineTemperatureEvaluator:
         ckpt = torch.load(ppo_ckpt, map_location="cpu", weights_only=False)
         policy_state = ckpt.get("policy_value", ckpt)
         self.policy = PolicyValueNet(obs_dim=self.model_obs_dim, n_actions=self.n_actions, hidden=self.hidden_dim)
-        self.policy.load_state_dict(policy_state, strict=False)
+        self.policy.load_state_dict(policy_state, strict=True)
+        self.policy.to(self.device)
         self.policy.eval()
 
         self._timing: Dict[str, float] = {}  # accumulated seconds per phase
@@ -170,7 +171,9 @@ class OnlineTemperatureEvaluator:
                         if _seg_idx == 0 or segment_obs[i][v] is None:
                             temp = 0.7
                         else:
-                            obs_t = torch.tensor(segment_obs[i][v][-1], dtype=torch.float32).unsqueeze(0)
+                            obs_t = torch.tensor(segment_obs[i][v][-1], dtype=torch.float32).unsqueeze(0).to(self.device)
+                            assert obs_t.dim() == 2 and obs_t.shape[0] == 1, \
+                                f"eval: obs_t must be [1, D], got {obs_t.shape}"
                             with torch.no_grad():
                                 logits, _ = self.policy(obs_t)
                                 action = logits.argmax(dim=-1).item()
@@ -237,7 +240,7 @@ class OnlineTemperatureEvaluator:
                     batch_tokens.append(f["tokens"])
                     batch_texts.append(f["text"])
                     if self.hs_needed:
-                        batch_extra.append(f["hidden_states"] if f["hidden_states"] is not None else torch.zeros(f["logprobs"].shape[0], self.instance_dim))
+                        batch_extra.append(f["hidden_states"])
                     batch_idx.append((i, v))
                 pp_text_r += tb - ta
                 pp_eos_r += tc - tb
@@ -253,6 +256,12 @@ class OnlineTemperatureEvaluator:
                     include_topk=(not self.hs_needed),
                     pooling_mode=self.pooling_mode,
                 )
+                # Shape contract: each obs is [n_segments, obs_dim] (2D).
+                # batch_build_segment_obs_from_lp already asserts this internally;
+                # re-check here as a belt-and-suspenders guard.
+                for idx, o in enumerate(obs_list):
+                    assert o.dim() == 2, \
+                        f"eval: obs_list[{idx}] must be 2D, got {o.shape}"
                 tb1 = time.perf_counter()
                 pp_build_r = tb1 - tb0
 

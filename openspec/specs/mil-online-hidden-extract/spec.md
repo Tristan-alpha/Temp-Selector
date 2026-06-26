@@ -1,4 +1,4 @@
-## ADDED Requirements
+## Requirements
 
 ### Requirement: BagDataset stores metadata only, no extraction in init
 
@@ -66,11 +66,3 @@ MIL training SHALL call `extract_from_ids` only during the pre-computation phase
 - **WHEN** MIL training enters the epoch loop
 - **THEN** no call to `extract_from_ids` SHALL occur during collation
 - **AND** all segment tensors SHALL come from the pre-computed cache
-
-## REMOVED Requirements
-
-### Requirement: Hidden states stored in safetensors sidecar
-
-**Reason**: Hidden state extraction moved from build stage to MIL training stage
-
-**Migration**: No action needed. Existing `.hidden.safetensors` files can be deleted. `BagDataset` constructs segment vectors from on-demand hidden extraction.

@@ -171,6 +171,72 @@ def posterior_mean(record: Dict[str, Any]) -> float:
     return (correct + 0.5) / (total + 1.0)
 
 
+def temperature_key(temperature: float) -> str:
+    return str(float(temperature))
+
+
+def record_per_temperature_stats(record: Dict[str, Any]) -> Dict[str, Dict[str, float | int]]:
+    stats = record.get("per_temperature_stats")
+    if isinstance(stats, dict):
+        return {
+            temperature_key(float(temp)): {
+                "n_correct": int(value.get("n_correct", 0)),
+                "n_total": int(value.get("n_total", 0)),
+                "success_rate": float(value.get("success_rate", 0.0)),
+            }
+            for temp, value in stats.items()
+        }
+    grouped: Dict[float, Dict[str, int]] = {}
+    for item in record.get("continuations", []):
+        temp = float(item["temperature"])
+        entry = grouped.setdefault(temp, {"n_correct": 0, "n_total": 0})
+        entry["n_total"] += 1
+        entry["n_correct"] += int(bool(item.get("correct", False)))
+    result: Dict[str, Dict[str, float | int]] = {}
+    for temp in sorted(grouped):
+        n_total = int(grouped[temp]["n_total"])
+        n_correct = int(grouped[temp]["n_correct"])
+        result[temperature_key(temp)] = {
+            "n_correct": n_correct,
+            "n_total": n_total,
+            "success_rate": n_correct / n_total if n_total else 0.0,
+        }
+    return result
+
+
+def oracle_temperature_stats(record: Dict[str, Any]) -> Dict[str, float | None]:
+    stats = record_per_temperature_stats(record)
+    if not stats:
+        return {
+            "oracle_temperature": None,
+            "oracle_success_rate": None,
+            "mean_success_rate": 0.0,
+            "temperature_success_variance": 0.0,
+        }
+    rates = {
+        float(temp): float(value["success_rate"])
+        for temp, value in stats.items()
+        if int(value.get("n_total", 0)) > 0
+    }
+    if not rates:
+        return {
+            "oracle_temperature": None,
+            "oracle_success_rate": None,
+            "mean_success_rate": 0.0,
+            "temperature_success_variance": 0.0,
+        }
+    best = max(rates.values())
+    oracle_temp = min(temp for temp, rate in rates.items() if rate == best)
+    mean_rate = sum(rates.values()) / len(rates)
+    variance = sum((rate - mean_rate) ** 2 for rate in rates.values()) / len(rates)
+    return {
+        "oracle_temperature": oracle_temp,
+        "oracle_success_rate": best,
+        "mean_success_rate": mean_rate,
+        "temperature_success_variance": variance,
+    }
+
+
 def build_ranking_pairs(records: Sequence[Dict[str, Any]], seed: int = 42,
                         max_pairs_per_problem: int = 64) -> List[Tuple[int, int]]:
     """Create balanced same-trajectory and cross-trajectory pairs per problem."""
@@ -248,10 +314,12 @@ def precompute_feature_cache(
     max_tokens_per_batch: int,
     device: torch.device,
     description: str,
+    prompt_dim: int = 0,
 ) -> List[Dict[str, Any]]:
-    """Extract all response features once and retain them in CPU RAM as float16."""
+    """Extract response features and optional prompt states into CPU float16 cache."""
     pretokenize_rows(rows, extractor.tokenizer)
     cache: List[Dict[str, Any]] = []
+    use_prompt_hidden = int(prompt_dim) > 0
     for indices in tqdm(
         _token_batches(rows, max_tokens_per_batch), desc=description,
     ):
@@ -263,22 +331,33 @@ def precompute_feature_cache(
             top_k=top_k,
             return_logprobs=True,
             return_hidden=False,
+            return_prompt_hidden=use_prompt_hidden,
             device=device,
         )
-        for row, lp in zip(batch_rows, result["logprobs"]):
+        prompt_hiddens = result.get("prompt_hidden", [None] * len(batch_rows))
+        for row, lp, prompt_hidden in zip(batch_rows, result["logprobs"], prompt_hiddens):
             n = len(row.get("token_ids", []))
             masked = build_masked_concat_segment_obs_from_lp(
                 lp[:n], list(row.get("tokens", [])), str(row.get("response", "")),
                 segment_size=segment_size, token_dim=token_dim, device=device,
                 segment_mode="fixed_window",
             )
-            cache.append({
+            entry = {
                 "sample_id": str(row.get("sample_id", "")),
                 "problem_id": problem_id(row),
                 "features": masked.features.detach().cpu().to(torch.float16),
                 "token_mask": masked.token_mask.detach().cpu().to(torch.uint8),
                 "terminal_target": 1.0 - float(row.get("individual_label", 0)),
-            })
+            }
+            if use_prompt_hidden:
+                if prompt_hidden is None:
+                    raise RuntimeError("extractor did not return prompt_hidden for prompt-aware PVM cache")
+                if int(prompt_hidden.shape[-1]) != int(prompt_dim):
+                    raise RuntimeError(
+                        f"expected prompt_hidden dim {prompt_dim}, got {prompt_hidden.shape[-1]}"
+                    )
+                entry["prompt_hidden"] = prompt_hidden.detach().cpu().to(torch.float16)
+            cache.append(entry)
     return cache
 
 
@@ -296,16 +375,26 @@ def pad_prefix_entries(entries: Sequence[Tuple[Dict[str, Any], int | None]]) -> 
     features = torch.zeros(len(entries), max_k, feature_dim, dtype=torch.float32)
     token_mask = torch.zeros(len(entries), max_k, segment_size, dtype=torch.float32)
     segment_mask = torch.zeros(len(entries), max_k, dtype=torch.float32)
+    has_prompt_hidden = "prompt_hidden" in entries[0][0]
+    prompt_hidden = None
+    if has_prompt_hidden:
+        prompt_dim = int(entries[0][0]["prompt_hidden"].shape[-1])
+        prompt_hidden = torch.zeros(len(entries), prompt_dim, dtype=torch.float32)
     for i, ((entry, _), length) in enumerate(zip(entries, lengths)):
         features[i, :length] = entry["features"][:length].float()
         token_mask[i, :length] = entry["token_mask"][:length].float()
         segment_mask[i, :length] = 1.0
-    return {
+        if has_prompt_hidden:
+            prompt_hidden[i] = entry["prompt_hidden"].float()
+    batch = {
         "features": features,
         "token_mask": token_mask,
         "segment_mask": segment_mask,
         "lengths": torch.tensor(lengths, dtype=torch.long),
     }
+    if prompt_hidden is not None:
+        batch["prompt_hidden"] = prompt_hidden
+    return batch
 
 
 class IndexDataset(Dataset):
@@ -329,7 +418,8 @@ def terminal_collate(cache: Sequence[Dict[str, Any]], indices: Sequence[int]) ->
 
 def continuation_collate(cache_by_id: Dict[str, Dict[str, Any]],
                          records: Sequence[Dict[str, Any]],
-                         indices: Sequence[int]) -> Dict[str, torch.Tensor]:
+                         indices: Sequence[int],
+                         temp_bins: Sequence[float] | None = None) -> Dict[str, torch.Tensor]:
     chosen = [records[i] for i in indices]
     batch = pad_prefix_entries([
         (cache_by_id[str(r["source_sample_id"])], int(r["prefix_segments"]))
@@ -338,17 +428,33 @@ def continuation_collate(cache_by_id: Dict[str, Dict[str, Any]],
     batch["n_correct"] = torch.tensor([float(r["n_correct"]) for r in chosen])
     batch["n_total"] = torch.tensor([float(r["n_total"]) for r in chosen])
     batch["target"] = torch.tensor([posterior_mean(r) for r in chosen])
+    if temp_bins is not None:
+        q_n_correct = torch.zeros(len(chosen), len(temp_bins), dtype=torch.float32)
+        q_n_total = torch.zeros(len(chosen), len(temp_bins), dtype=torch.float32)
+        for row_idx, record in enumerate(chosen):
+            stats = record_per_temperature_stats(record)
+            for temp_idx, temp in enumerate(temp_bins):
+                entry = stats.get(temperature_key(float(temp)))
+                if entry is None:
+                    continue
+                q_n_correct[row_idx, temp_idx] = float(entry.get("n_correct", 0))
+                q_n_total[row_idx, temp_idx] = float(entry.get("n_total", 0))
+        batch["q_n_correct"] = q_n_correct
+        batch["q_n_total"] = q_n_total
+        batch["q_target"] = (q_n_correct + 0.5) / (q_n_total + 1.0)
+        batch["q_mask"] = (q_n_total > 0).float()
     return batch
 
 
 def ranking_collate(cache_by_id: Dict[str, Dict[str, Any]],
                     records: Sequence[Dict[str, Any]],
                     pairs: Sequence[Tuple[int, int]],
-                    indices: Sequence[int]) -> Dict[str, Any]:
+                    indices: Sequence[int],
+                    temp_bins: Sequence[float] | None = None) -> Dict[str, Any]:
     selected = [pairs[i] for i in indices]
     rec_a = [records[a] for a, _ in selected]
     rec_b = [records[b] for _, b in selected]
     return {
-        "a": continuation_collate(cache_by_id, rec_a, list(range(len(rec_a)))),
-        "b": continuation_collate(cache_by_id, rec_b, list(range(len(rec_b)))),
+        "a": continuation_collate(cache_by_id, rec_a, list(range(len(rec_a))), temp_bins=temp_bins),
+        "b": continuation_collate(cache_by_id, rec_b, list(range(len(rec_b))), temp_bins=temp_bins),
     }
